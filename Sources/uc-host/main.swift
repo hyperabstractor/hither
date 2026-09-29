@@ -73,6 +73,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var lastEncode: CFTimeInterval = 0
     var codec = "h264"
     var viewerHEVC = false
+    var viewerAudio = false
+    let audioQ = DispatchQueue(label: "audio")
+    var nAudio = 0
+    var audioPeak: Float = 0   // loudest sample in the stats window: 0 = silence
     var lastFrame: CVPixelBuffer?   // re-sent on a codec switch
     var pumpQueued = false
     var visible = true
@@ -97,6 +101,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         case "apps": Task { apps() }
         case "open":
             viewerHEVC = m.caps?.contains("hevc") == true   // older viewers only decode H.264
+            viewerAudio = m.caps?.contains("audio") == true
             Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
         case "ack":
             unacked -= 1
@@ -250,6 +255,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let setup else { log("no display yet, retrying"); return retry() }
             let s = SCStream(filter: setup.0, configuration: setup.1, delegate: self)
             try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: q)
+            if viewerAudio { try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQ) }
             try await s.startCapture()
             q.async {
                 self.stream = s
@@ -296,6 +302,12 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         c.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         c.showsCursor = false
         c.queueDepth = 5
+        if viewerAudio {   // only this window's app(s), per the content filter
+            c.capturesAudio = true
+            c.sampleRate = 48_000
+            c.channelCount = 2
+            c.excludesCurrentProcessAudio = true
+        }
         return c
     }
 
@@ -328,12 +340,12 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             wire.send(m)
         }
         ticks += 1
-        if ticks % 20 == 0 && (nFrames > 0 || nRaises > 0) {
+        if ticks % 20 == 0 && (nFrames > 0 || nRaises > 0 || nAudio > 0) {
             let r = rtts.sorted()
-            log(String(format: "stats %@: %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms delayed=%d raises=%d (%.0fms avg)",
+            log(String(format: "stats %@: %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms delayed=%d raises=%d (%.0fms avg) audio=%d/s peak=%.2f",
                        appName, nFrames / 5, Double(nBytes) * 8 / 5e6, nKeys, nFrames > 0 ? encMs / Double(nFrames) : 0,
-                       r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, nDelayed, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0))
-            nFrames = 0; nBytes = 0; nKeys = 0; nDelayed = 0; nRaises = 0; encMs = 0; raiseMs = 0; rtts = []
+                       r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, nDelayed, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
+            nAudio = 0; audioPeak = 0; nFrames = 0; nBytes = 0; nKeys = 0; nDelayed = 0; nRaises = 0; encMs = 0; raiseMs = 0; rtts = []
         }
         if ticks % 4 == 0 {  // new/closed sibling windows → refresh exclusions ~1/s
             Task {
@@ -370,6 +382,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: capture → encode → send
 
     func stream(_ s: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        if type == .audio { return audio(sb) }
         guard type == .screen, let px = sb.imageBuffer,
               let info = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
               (info[.status] as? Int).flatMap({ SCFrameStatus(rawValue: $0) }) == .complete else { return }
@@ -394,6 +407,37 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         pending = nil
         encode(p)
+    }
+
+    /// App audio → 48 kHz stereo Int16, sent raw (~1.5 Mbps: nothing on a LAN, and no codec delay).
+    func audio(_ sb: CMSampleBuffer) {
+        guard let fd = sb.formatDescription, let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0 else { return }
+        var size = 0
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sb, bufferListSizeNeededOut: &size, bufferListOut: nil, bufferListSize: 0,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: nil)
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 16)
+        defer { raw.deallocate() }
+        let list = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+        var block: CMBlockBuffer?
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sb, bufferListSizeNeededOut: nil, bufferListOut: list, bufferListSize: size,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &block) == noErr else { return }
+        let bufs = UnsafeMutableAudioBufferListPointer(list)
+        let frames = CMSampleBufferGetNumSamples(sb), ch = max(Int(asbd.mChannelsPerFrame), 1)
+        let interleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        var out = [Int16](repeating: 0, count: frames * 2), peak: Float = 0
+        for i in 0..<frames {
+            for c in 0..<2 {
+                let src = min(c, ch - 1)   // mono → both ears
+                let v = interleaved ? bufs[0].mData!.assumingMemoryBound(to: Float.self)[i * ch + src]
+                                    : bufs[src].mData!.assumingMemoryBound(to: Float.self)[i]
+                out[i * 2 + c] = Int16(max(-1, min(1, v)) * 32767)
+                peak = max(peak, abs(v))
+            }
+        }
+        wire.sendAudio(out.withUnsafeBytes { Data($0) })
+        q.async { self.nAudio += 1; self.audioPeak = max(self.audioPeak, peak) }
     }
 
     func stream(_ s: SCStream, didStopWithError error: Error) {

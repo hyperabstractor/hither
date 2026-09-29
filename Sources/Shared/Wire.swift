@@ -71,12 +71,13 @@ public func tcpOptions() -> NWProtocolTCP.Options {
     return tcp
 }
 
-/// Framing: [kind u8][len u32][body]. kind 1 = JSON Msg, 2 = video packet.
+/// Framing: [kind u8][len u32][body]. kind 1 = JSON Msg, 2 = video packet, 3 = audio (48 kHz stereo Int16 PCM).
 public final class Wire {
     public let conn: NWConnection
     public let queue: DispatchQueue
     public var onMsg: (Msg) -> Void = { _ in }
     public var onVideo: (Data) -> Void = { _ in }
+    public var onAudio: (Data) -> Void = { _ in }
     public var onClose: () -> Void = {}
     private var closed = false
 
@@ -114,8 +115,10 @@ public final class Wire {
                 guard let body, body.count == len, err == nil else { self.close(); return }
                 if kind == 1 {
                     if let m = try? JSONDecoder().decode(Msg.self, from: body) { self.onMsg(m) }
-                } else {
+                } else if kind == 2 {
                     self.onVideo(body)
+                } else if kind == 3 {
+                    self.onAudio(body)
                 }
                 self.read()
             }
@@ -124,6 +127,7 @@ public final class Wire {
 
     public func send(_ m: Msg) { frame(1, try! JSONEncoder().encode(m)) }
     public func sendVideo(_ d: Data) { frame(2, d) }
+    public func sendAudio(_ d: Data) { frame(3, d) }
 
     private func frame(_ kind: UInt8, _ body: Data) {
         var d = Data(capacity: body.count + 5)
