@@ -14,7 +14,17 @@ public struct Msg: Codable {
     public var f: UInt64?, seq: UInt32?
     public var down: Bool?, rep: Bool?
     public var items: [Item]?
+    public var path: [Int]?          // menu path: indices from the menu bar down
+    public var menu: [MenuEntry]?
     public init(_ t: String) { self.t = t }
+}
+
+/// One item of a remote menu. Empty title = separator. `mods` uses AX bits: 1 shift, 2 option, 4 control, 8 no-command.
+public struct MenuEntry: Codable {
+    public var title: String, enabled: Bool, checked: Bool, key: String, mods: Int, sub: Bool
+    public init(title: String, enabled: Bool, checked: Bool, key: String, mods: Int, sub: Bool) {
+        self.title = title; self.enabled = enabled; self.checked = checked; self.key = key; self.mods = mods; self.sub = sub
+    }
 }
 
 /// One shareable window in a "windows" list. `icon` (PNG) is sent once per app per connection.

@@ -15,6 +15,9 @@ var lastRaised: CGWindowID = 0   // the window that currently has input focus on
 /// All input injection runs here: it's serialized system-wide anyway, and an app switch (with its wait)
 /// must never stall a session's capture/encode/ack queue.
 let inputQ = DispatchQueue(label: "input")
+/// Menu reads and presses: AX calls into the app can block (a menu item that runs a modal panel), so keep them
+/// off both the session and input queues.
+let menuQ = DispatchQueue(label: "menu")
 var lastInputAt: CFTimeInterval = 0   // while the user is typing/clicking, background windows hold their frames
 
 func axWindow(pid: pid_t, id: CGWindowID) -> AXUIElement? {
@@ -78,6 +81,19 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             if !inflight.isEmpty { rtts.append((CACurrentMediaTime() - inflight.removeFirst()) * 1000) }
             pump()
         case "keyframe": forceKey = true
+        case "menu":
+            let path = m.path ?? [], seq = m.seq
+            menuQ.async {
+                var r = Msg("menu"); r.seq = seq
+                r.menu = self.menuItems(at: path)?.map(describe) ?? []
+                self.wire.send(r)
+            }
+        case "press":
+            let path = m.path ?? []
+            inputQ.async {
+                self.focus(force: false)   // e.g. File › Save acts on the key window, so make it ours
+                menuQ.async { if let e = self.menuItems(at: path.dropLast())?[safe: path.last ?? -1] { AXUIElementPerformAction(e, kAXPressAction as CFString) } }
+            }
         case "visible":   // proxy window fully hidden (minimized, other Space, covered, app hidden) → encode nothing
             visible = m.down ?? true
             log("\(appName) \(visible ? "visible" : "hidden — paused")")
@@ -466,6 +482,21 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    // MARK: menus
+
+    /// Walk the app's menu bar by child indices: [] = bar items, [i] = items of bar item i's menu, [i, j] = submenu of item j…
+    func menuItems(at path: some Collection<Int>) -> [AXUIElement]? {
+        var bar: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXMenuBarAttribute as CFString, &bar) == .success
+        else { return nil }
+        var items = children(bar as! AXUIElement)
+        for i in path {
+            guard let item = items[safe: i], let menu = children(item).first else { return nil }   // an item's one child is its AXMenu
+            items = children(menu)
+        }
+        return items
+    }
+
     func stop() {
         ended = true
         timer?.cancel(); timer = nil
@@ -504,6 +535,25 @@ func packet(_ sb: CMSampleBuffer, _ seq: UInt32) -> Data {
     return d
 }
 
+func children(_ e: AXUIElement) -> [AXUIElement] {
+    var v: CFTypeRef?
+    AXUIElementCopyAttributeValue(e, kAXChildrenAttribute as CFString, &v)
+    return v as? [AXUIElement] ?? []
+}
+
+func describe(_ e: AXUIElement) -> MenuEntry {
+    let keys = [kAXTitleAttribute, kAXEnabledAttribute, kAXMenuItemMarkCharAttribute, kAXMenuItemCmdCharAttribute,
+                kAXMenuItemCmdModifiersAttribute, kAXChildrenAttribute] as [CFString]
+    var vals: CFArray?
+    AXUIElementCopyMultipleAttributeValues(e, keys as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &vals)
+    let a = vals as? [Any] ?? []   // missing attributes come back as AXValue errors, which the casts below skip
+    return MenuEntry(title: a[safe: 0] as? String ?? "", enabled: a[safe: 1] as? Bool ?? false,
+                     checked: !(a[safe: 2] as? String ?? "").isEmpty, key: a[safe: 3] as? String ?? "",
+                     mods: a[safe: 4] as? Int ?? 0, sub: !(a[safe: 5] as? [AXUIElement] ?? []).isEmpty)
+}
+
+extension Array { subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil } }
+
 func isTrue(_ v: Any?) -> Bool { (v as? Bool) ?? ((v as? String).map { $0 == "1" || $0.lowercased() == "yes" || $0.lowercased() == "true" } ?? false) }
 
 func png(_ img: NSImage) -> Data? {
@@ -516,6 +566,7 @@ func png(_ img: NSImage) -> Data? {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)   // a hung app can't stall us for AX's default 6 s
 if !CGPreflightScreenCaptureAccess() { log("requesting Screen Recording permission"); CGRequestScreenCaptureAccess() }
 if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary) {
     log("requesting Accessibility permission")

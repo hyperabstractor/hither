@@ -184,6 +184,8 @@ final class StreamView: NSView {
         switch (cmdOnly, e.charactersIgnoringModifiers) {
         case (true, "h"): NSApp.hide(nil)
         case (true, "m"): window?.miniaturize(nil)
+        case (false, "f") where e.modifierFlags.intersection(.deviceIndependentFlagsMask) == [.control, .command]:
+            window?.toggleFullScreen(nil)   // full screen is about this proxy window, not the host's
         case (true, "`"):   // cycle this proxy app's windows, like any local app
             let ws = NSApp.windows.filter { $0.isVisible && $0.canBecomeMain }
             if let i = ws.firstIndex(where: { $0 === window }) { ws[(i + 1) % ws.count].makeKeyAndOrderFront(nil) }
@@ -224,7 +226,10 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
             w?.send(Msg("ack"))
             DispatchQueue.main.async { view.show(d) }
         }
-        w.onMsg = { [weak self] m in DispatchQueue.main.async { self?.handle(m) } }
+        w.onMsg = { [weak self] m in
+            if m.t == "menu" { return RemoteMenus.shared.deliver(m) }
+            DispatchQueue.main.async { self?.handle(m) }
+        }
         wire = w
         w.start()
         var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID
@@ -257,7 +262,9 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
             remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
             updateTitle()
             windowDidResize(Notification(name: NSWindow.didResizeNotification))
-        case "opened": open(m)
+        case "opened":
+            open(m)
+            RemoteMenus.shared.install()
         case "size":
             remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
             guard let w = window, !w.inLiveResize, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) else { return }
@@ -295,6 +302,19 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         NSApp.activate()
         if size != remoteSize { windowDidResize(Notification(name: NSWindow.didResizeNotification)) }
         if let n = Int(ProcessInfo.processInfo.environment["UC_TEST_TYPE"] ?? "") { selfTest(n) }
+        if ProcessInfo.processInfo.environment["UC_TEST_MENU"] != nil {   // test hook: dump the first few remote menus
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let bar = RemoteMenus.shared.fetch([]) ?? []
+                log("menu bar: " + bar.map(\.title).joined(separator: " | "))
+                for i in 1..<min(bar.count, 4) {
+                    let t = CACurrentMediaTime(), items = RemoteMenus.shared.fetch([i]) ?? []
+                    log("\(bar[i].title) (\(Int((CACurrentMediaTime() - t) * 1000)) ms): " + items.map {
+                        $0.title.isEmpty ? "—" : $0.title + ($0.key.isEmpty ? "" : " [\($0.mods)+\($0.key)]") + ($0.enabled ? "" : " (off)")
+                            + ($0.checked ? " ✓" : "") + ($0.sub ? " ▸" : "")
+                    }.joined(separator: ", "))
+                }
+            }
+        }
         if let n = Double(ProcessInfo.processInfo.environment["UC_TEST_HIDE"] ?? "") {   // test hook: hide app for n s
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { NSApp.hide(nil) }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3 + n) { NSApp.unhide(nil); NSApp.activate(); w.makeKeyAndOrderFront(nil) }
@@ -368,6 +388,105 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         window = nil
         proxies.removeAll { $0 === self }
         if proxies.isEmpty && role != "launcher" { NSApp.terminate(nil) }
+    }
+}
+
+// MARK: - the remote app's menu bar
+
+final class RemoteMenu: NSMenu { var path: [Int] = [] }
+
+/// Mirrors the host app's menu bar into this proxy app's own. Each menu is fetched when it opens, so enabled
+/// states / checkmarks / Open Recent are current; choosing an item presses the real one on the host.
+final class RemoteMenus: NSObject, NSMenuDelegate {
+    static let shared = RemoteMenus()
+    let lock = NSLock()
+
+    override init() {
+        super.init()
+        // apps change their top-level menus now and then; refresh whenever this proxy comes forward
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.install()
+        }
+    }
+    var waiting: [UInt32: DispatchSemaphore] = [:], replies: [UInt32: [MenuEntry]] = [:]
+    var nextSeq: UInt32 = 0
+
+    /// The proxy window whose connection carries menu traffic: the key one, so presses act on the window you're in.
+    var link: ProxyWindow? { proxies.first { $0.window?.isKeyWindow == true } ?? proxies.first { $0.window != nil } }
+
+    /// Blocking round trip (menus must be filled before they show). Replies arrive on the wire queue via deliver().
+    func fetch(_ path: [Int]) -> [MenuEntry]? {
+        guard let wire = link?.wire else { return nil }
+        let sem = DispatchSemaphore(value: 0)
+        lock.lock(); nextSeq += 1; let seq = nextSeq; waiting[seq] = sem; lock.unlock()
+        var m = Msg("menu"); m.path = path; m.seq = seq
+        wire.send(m)
+        let ok = sem.wait(timeout: .now() + 0.5) == .success
+        lock.lock(); defer { lock.unlock() }
+        waiting[seq] = nil
+        return ok ? replies.removeValue(forKey: seq) : nil
+    }
+
+    func deliver(_ m: Msg) {
+        lock.lock(); defer { lock.unlock() }
+        guard let seq = m.seq, let sem = waiting[seq] else { return }
+        replies[seq] = m.menu ?? []
+        sem.signal()
+    }
+
+    /// Top level: the host's bar minus its Apple menu. The first item becomes our app menu (shown as "Cursor · mini").
+    func install() {
+        guard let bar = fetch([]), bar.count > 1 else { return }
+        let main = NSMenu()
+        for (i, e) in bar.enumerated() where i > 0 {
+            let item = main.addItem(withTitle: e.title, action: nil, keyEquivalent: "")
+            item.submenu = submenu(e.title, [i])
+        }
+        NSApp.mainMenu = main
+    }
+
+    func submenu(_ title: String, _ path: [Int]) -> RemoteMenu {
+        let m = RemoteMenu(title: title)
+        m.path = path
+        m.delegate = self
+        m.autoenablesItems = false
+        return m
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard let menu = menu as? RemoteMenu, let entries = fetch(menu.path) else { return }
+        menu.removeAllItems()
+        for (j, e) in entries.enumerated() {
+            if e.title.isEmpty { menu.addItem(.separator()); continue }
+            // shortcuts are shown for reference; the key press itself still goes straight to the remote app
+            // (chords like "⌃K ⌃O" can't be shown as a single key equivalent, so they're left off)
+            let item = menu.addItem(withTitle: e.title, action: e.sub ? nil : #selector(pick(_:)),
+                                    keyEquivalent: e.key.count == 1 ? e.key.lowercased() : "")
+            item.target = self
+            item.keyEquivalentModifierMask = [e.mods & 8 == 0 ? .command : [], e.mods & 1 != 0 ? .shift : [],
+                                              e.mods & 2 != 0 ? .option : [], e.mods & 4 != 0 ? .control : [],
+                                              e.mods & 16 != 0 ? .function : []]
+            item.isEnabled = e.enabled
+            item.state = e.checked ? .on : .off
+            item.representedObject = menu.path + [j]
+            if e.sub { item.submenu = submenu(e.title, menu.path + [j]) }
+        }
+    }
+
+    @objc func pick(_ sender: NSMenuItem) {
+        let win = NSApp.keyWindow
+        // window-management items are about this proxy window, not the host's
+        switch sender.title {
+        case "Minimize": win?.miniaturize(nil)
+        case "Zoom": win?.zoom(nil)
+        case "Enter Full Screen", "Exit Full Screen", "Toggle Full Screen": win?.toggleFullScreen(nil)
+        case "Hide Others": NSApp.hideOtherApplications(nil)
+        case "Show All": NSApp.unhideAllApplications(nil)
+        case "Hide \(link?.appName ?? "")": NSApp.hide(nil)
+        default:
+            var m = Msg("press"); m.path = sender.representedObject as? [Int]
+            link?.wire?.send(m)
+        }
     }
 }
 
