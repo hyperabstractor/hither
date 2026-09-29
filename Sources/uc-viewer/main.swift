@@ -611,6 +611,8 @@ final class Launcher: NSObject, NSMenuDelegate {
         for r in recent { add(r.app, r, indent: 0, to: sub).image = icon(r.bundle) }
         recentItem.submenu = sub
         recentItem.isEnabled = !recent.isEmpty
+        // whole desktop: Apple's Screen Sharing does that job best, so just hand off to it
+        menu.addItem(withTitle: "Screen Share \(short(host))…", action: #selector(screenShare), keyEquivalent: "").target = self
         menu.addItem(.separator())
         let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
@@ -710,6 +712,8 @@ final class Launcher: NSObject, NSMenuDelegate {
         LSRegisterURL(url as CFURL, true)
         return (url, id, true)
     }
+
+    @objc func screenShare() { NSWorkspace.shared.open(URL(string: "vnc://\(host)")!) }
 
     @objc func quit() {
         DistributedNotificationCenter.default().postNotificationName(quitNote, object: nil, userInfo: nil, deliverImmediately: true)
