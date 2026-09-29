@@ -253,6 +253,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         case "opened" where window != nil:   // reconnected: same local window, re-sync its size to the host
             retries = 0
             if window?.isKeyWindow == true { wire?.send(Msg("focus")) }
+            sendVisibility()
             remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
             updateTitle()
             windowDidResize(Notification(name: NSWindow.didResizeNotification))
@@ -294,6 +295,10 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         NSApp.activate()
         if size != remoteSize { windowDidResize(Notification(name: NSWindow.didResizeNotification)) }
         if let n = Int(ProcessInfo.processInfo.environment["UC_TEST_TYPE"] ?? "") { selfTest(n) }
+        if let n = Double(ProcessInfo.processInfo.environment["UC_TEST_HIDE"] ?? "") {   // test hook: hide app for n s
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { NSApp.hide(nil) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3 + n) { NSApp.unhide(nil); NSApp.activate(); w.makeKeyAndOrderFront(nil) }
+        }
         if let s = ProcessInfo.processInfo.environment["UC_TEST_SIZE"]?.split(separator: "x").compactMap({ Double($0) }), s.count == 2 {
             w.setContentSize(CGSize(width: s[0], height: s[1]))  // test hook: resize without touching the mouse
         }
@@ -343,6 +348,15 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     /// Opened, Cmd-Tab, Dock click, Space swipe… whenever this proxy becomes key here, bring the real window
     /// forward on the host, so hover and the first keystroke already land in the right place.
     func windowDidBecomeKey(_ n: Notification) { wire?.send(Msg("focus")) }
+
+    /// Fully hidden (minimized, another Space, covered, app hidden) → host stops encoding this window.
+    func windowDidChangeOcclusionState(_ n: Notification) { sendVisibility() }
+
+    func sendVisibility() {
+        var m = Msg("visible"); m.down = window?.occlusionState.contains(.visible) ?? true
+        if ProcessInfo.processInfo.environment["UC_TEST_HIDE"] != nil { log("visible=\(m.down!)") }
+        wire?.send(m)
+    }
 
     func windowWillClose(_ n: Notification) { window = nil; finish() }
 

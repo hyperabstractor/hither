@@ -57,6 +57,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var encMs = 0.0, raiseMs = 0.0, rtts: [Double] = []
     var lastEncode: CFTimeInterval = 0
     var pumpQueued = false
+    var visible = true
 
     init(_ conn: NWConnection) {
         wire = Wire(conn, queue: q)
@@ -76,6 +77,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             if !inflight.isEmpty { rtts.append((CACurrentMediaTime() - inflight.removeFirst()) * 1000) }
             pump()
         case "keyframe": forceKey = true
+        case "visible":   // proxy window fully hidden (minimized, other Space, covered, app hidden) → encode nothing
+            visible = m.down ?? true
+            log("\(appName) \(visible ? "visible" : "hidden — paused")")
+            pump()   // newly visible: send whatever changed while hidden
         case "focus": if pid != 0 { inputQ.async { self.focus(force: false) } }   // proxy became the active window on the client
         case "resize": resize(m.w ?? frame.width, m.h ?? frame.height)
         default:
@@ -120,7 +125,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             let owner = win.owningApplication!
             q.sync {
                 pid = owner.processID
-                appName = owner.applicationName
+                if case .hostPort(_, let port) = wire.conn.endpoint { appName = "\(owner.applicationName):\(port)" }
+                else { appName = owner.applicationName }
                 windowID = win.windowID
                 ax = axWindow(pid: pid, id: windowID)
                 frame = win.frame
@@ -286,10 +292,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         pump()
     }
 
-    /// Encode the newest captured frame once the viewer has caught up (≤2 frames in flight) and, for windows
-    /// that don't have focus, at most 10 fps: the Mac has one hardware encoder and the window you type in goes first.
+    /// Encode the newest captured frame once the viewer has caught up (≤2 frames in flight). The Mac has one
+    /// hardware encoder, so: focused window full rate; visible background ≤10 fps (2 while you type); hidden paused.
     func pump() {
-        guard let p = pending, unacked < 2 else { return }
+        guard visible, let p = pending, unacked < 2 else { return }
         let busy = CACurrentMediaTime() - lastInputAt < 0.5
         let gap = windowID == lastRaised ? 0 : busy ? 0.5 : 0.1
         let wait = lastEncode + gap - CACurrentMediaTime()
