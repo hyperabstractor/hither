@@ -382,6 +382,7 @@ final class Launcher: NSObject, NSMenuDelegate {
     var icons: [String: Data] = [:]
     var state = "connecting…"
     var relay: NWListener?
+    let buildQ = DispatchQueue(label: "proxies")   // all proxy-bundle writes, in order
 
     func start() {
         status.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Unified Control")
@@ -424,10 +425,25 @@ final class Launcher: NSObject, NSMenuDelegate {
     func refresh() {
         if wire == nil {
             let w = dial(host)
-            w.onClose = { [weak self] in onMain { self?.wire = nil; self?.state = "can't reach \(self?.host ?? "")"; self?.rebuild() } }
-            w.onMsg = { [weak self] m in if m.t == "windows" { onMain { self?.update(m.items ?? []) } } }
+            w.onClose = { [weak self] in
+                onMain {
+                    self?.wire = nil
+                    self?.state = "can't reach \(self?.host ?? "")"
+                    self?.rebuild()
+                    // keep trying: the first connect after install/login can hit the Local Network race
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if self?.wire == nil { self?.refresh() } }
+                }
+            }
+            w.onMsg = { [weak self] m in
+                switch m.t {
+                case "windows": onMain { self?.update(m.items ?? []) }
+                case "apps": onMain { self?.makeProxies(m.items ?? []) }
+                default: break
+                }
+            }
             wire = w
             w.start()
+            w.send(Msg("apps"))   // every (re)connect: a proxy per installed app, so Spotlight finds "Xcode · mini"
         }
         wire?.send(Msg("list"))
     }
@@ -439,6 +455,15 @@ final class Launcher: NSObject, NSMenuDelegate {
         rebuild()
     }
 
+    func makeProxies(_ apps: [Item]) {
+        for a in apps { if let icon = a.icon { icons[a.bundle] = icon } }
+        buildQ.async {
+            let made = apps.filter { (try? self.ensureProxy($0, icon: $0.icon))?.2 == true }.count
+            log("proxies: \(apps.count) apps on \(self.host), \(made) created/updated")
+        }
+        rebuild()
+    }
+
     func rebuild() {
         menu.removeAllItems()
         menu.addItem(withTitle: state.isEmpty ? "On \(short(host))" : "\(short(host)): \(state)", action: nil, keyEquivalent: "").isEnabled = false
@@ -446,12 +471,25 @@ final class Launcher: NSObject, NSMenuDelegate {
         for i in items where !apps.contains(i.bundle) { apps.append(i.bundle) }
         for b in apps {
             let wins = items.filter { $0.bundle == b }
-            // app row opens its main window, like launching the app; window rows open that exact window
-            add(wins[0].app, Item(id: 0, app: wins[0].app, bundle: b, title: ""), indent: 0).image = icons[b].flatMap(NSImage.init(data:)).map {
-                $0.size = NSSize(width: 16, height: 16); return $0
+            if wins.count == 1 {   // one row: "App  window title"
+                let w = wins[0], mi = add(w.app, w, indent: 0)
+                mi.image = icon(b)
+                if !w.title.isEmpty && w.title != w.app {
+                    let t = NSMutableAttributedString(string: w.app + "  ")
+                    t.append(NSAttributedString(string: w.title, attributes: [.foregroundColor: NSColor.secondaryLabelColor]))
+                    mi.attributedTitle = t
+                }
+            } else {   // app row opens its main window; window rows open that exact window
+                add(wins[0].app, Item(id: 0, app: wins[0].app, bundle: b, title: ""), indent: 0).image = icon(b)
+                for w in wins { add(w.title.isEmpty ? "Untitled" : w.title, w, indent: 1) }
             }
-            for w in wins { add(w.title.isEmpty ? "Untitled" : w.title, w, indent: 1) }
         }
+        menu.addItem(.separator())
+        let recentItem = menu.addItem(withTitle: "Recent", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for r in recent { add(r.app, r, indent: 0, to: sub).image = icon(r.bundle) }
+        recentItem.submenu = sub
+        recentItem.isEnabled = !recent.isEmpty
         menu.addItem(.separator())
         let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
@@ -459,59 +497,86 @@ final class Launcher: NSObject, NSMenuDelegate {
         menu.addItem(withTitle: "Quit Unified Control", action: #selector(quit), keyEquivalent: "q").target = self
     }
 
-    @discardableResult func add(_ title: String, _ item: Item, indent: Int) -> NSMenuItem {
-        let mi = menu.addItem(withTitle: title, action: #selector(open(_:)), keyEquivalent: "")
+    func icon(_ bundle: String) -> NSImage? {
+        icons[bundle].flatMap(NSImage.init(data:)).map { $0.size = NSSize(width: 16, height: 16); return $0 }
+    }
+
+    @discardableResult func add(_ title: String, _ item: Item, indent: Int, to m: NSMenu? = nil) -> NSMenuItem {
+        let mi = (m ?? menu).addItem(withTitle: title, action: #selector(open(_:)), keyEquivalent: "")
         mi.target = self
         mi.representedObject = item
         mi.indentationLevel = indent
         return mi
     }
 
-    @objc func open(_ sender: NSMenuItem) {
-        guard let w = sender.representedObject as? Item else { return }
-        do {
-            let (url, id) = try ensureProxy(w)
-            if let running = NSRunningApplication.runningApplications(withBundleIdentifier: id).first {
-                NSApp.yieldActivation(to: running)
-                DistributedNotificationCenter.default().postNotificationName(openNote, object: id, userInfo: ["window": w.id], deliverImmediately: true)
-            } else {
-                let cfg = NSWorkspace.OpenConfiguration()
-                cfg.arguments = ["--window", String(w.id)]
-                NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, e in if let e { log("launch \(url.lastPathComponent): \(e)") } }
-            }
-        } catch {
-            log("proxy for \(w.app): \(error)")
+    /// Apps opened through Unified Control, newest first (launching one that isn't running starts it on the host).
+    var recent: [Item] {
+        (UserDefaults.standard.array(forKey: "recent") as? [[String: String]] ?? []).compactMap { d in
+            d["bundle"].map { Item(id: 0, app: d["app"] ?? $0, bundle: $0, title: "") }
         }
     }
 
-    /// ~/Applications/Unified Control/<App> · <host>.app — a tiny bundle around this same binary, so the
-    /// remote app gets its own name + icon in the Dock, Cmd-Tab and Spotlight. Rebuilt when this binary changes.
-    func ensureProxy(_ w: Item) throws -> (URL, String) {
+    func remember(_ w: Item) {
+        let r = ([Item(id: 0, app: w.app, bundle: w.bundle, title: "")] + recent.filter { $0.bundle != w.bundle }).prefix(10)
+        UserDefaults.standard.set(r.map { ["bundle": $0.bundle, "app": $0.app] }, forKey: "recent")
+    }
+
+    @objc func open(_ sender: NSMenuItem) {
+        guard let w = sender.representedObject as? Item else { return }
+        remember(w)
+        let icon = icons[w.bundle]
+        buildQ.async {   // same queue as the bulk proxy build, so they never write one bundle at once
+            do {
+                let (url, id, _) = try self.ensureProxy(w, icon: icon)
+                DispatchQueue.main.async {
+                    if let running = NSRunningApplication.runningApplications(withBundleIdentifier: id).first {
+                        NSApp.yieldActivation(to: running)
+                        DistributedNotificationCenter.default().postNotificationName(openNote, object: id, userInfo: ["window": w.id], deliverImmediately: true)
+                    } else {
+                        let cfg = NSWorkspace.OpenConfiguration()
+                        cfg.arguments = ["--window", String(w.id)]
+                        NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, e in if let e { log("launch \(url.lastPathComponent): \(e)") } }
+                    }
+                }
+            } catch {
+                log("proxy for \(w.app): \(error)")
+            }
+        }
+        rebuild()
+    }
+
+    /// ~/Applications/Unified Control/<App> · <host>.app — a tiny bundle around this same binary, so the remote app
+    /// gets its own name + icon in the Dock, Cmd-Tab and Spotlight. Rebuilt when this binary changes (unless running).
+    /// Returns (bundle URL, bundle id, whether it was (re)built). Runs on buildQ.
+    func ensureProxy(_ w: Item, icon: Data?) throws -> (URL, String, Bool) {
         let fm = FileManager.default
         let id = "dev.unified-control.proxy.\(short(host)).\(w.bundle)".filter { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
         let name = "\(w.app) · \(short(host))"
-        let url = fm.homeDirectoryForCurrentUser.appending(path: "Applications/Unified Control/\(name.replacingOccurrences(of: "/", with: "-")).app")
+        let dir = fm.homeDirectoryForCurrentUser.appending(path: "Applications/Unified Control")
+        // reuse an existing bundle for this id even if the app's display name differs between sources
+        let url = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: id).first { $0.path.hasPrefix(dir.path) }
+            ?? dir.appending(path: "\(name.replacingOccurrences(of: "/", with: "-")).app")
         let exe = url.appending(path: "Contents/MacOS/uc-viewer")
-        let me = Bundle.main.executableURL!
         let mtime = { (u: URL) in try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
-        if let theirs = mtime(exe), let mine = mtime(me), theirs >= mine { return (url, id) }
+        if let theirs = mtime(exe), let mine = mtime(Bundle.main.executableURL!),
+           theirs >= mine || !NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty { return (url, id, false) }
 
         try? fm.removeItem(at: url)
         try fm.createDirectory(at: exe.deletingLastPathComponent(), withIntermediateDirectories: true)
         try fm.createDirectory(at: url.appending(path: "Contents/Resources"), withIntermediateDirectories: true)
-        try fm.copyItem(at: me, to: exe)
+        try fm.copyItem(at: Bundle.main.executableURL!, to: exe)   // APFS clone: ~no disk space per proxy
         var plist: [String: Any] = [
             "CFBundleIdentifier": id, "CFBundleName": name, "CFBundleDisplayName": name,
             "CFBundleExecutable": "uc-viewer", "CFBundlePackageType": "APPL", "NSHighResolutionCapable": true,
             "UCRole": "proxy", "UCHost": host, "UCApp": w.bundle,
         ]
-        if let png = icons[w.bundle], writeICNS(png, to: url.appending(path: "Contents/Resources/AppIcon.icns")) {
+        if let icon, writeICNS(icon, to: url.appending(path: "Contents/Resources/AppIcon.icns")) {
             plist["CFBundleIconFile"] = "AppIcon"
         }
         try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: url.appending(path: "Contents/Info.plist"))
-        sign(url)
+        run("/usr/bin/codesign", ["--force", "--sign", "-", url.path])   // ad-hoc: proxies need no permissions of their own
         LSRegisterURL(url as CFURL, true)
-        return (url, id)
+        return (url, id, true)
     }
 
     @objc func quit() {
@@ -540,16 +605,6 @@ func writeICNS(_ png: Data, to url: URL) -> Bool {
           let dst = CGImageDestinationCreateWithURL(url as CFURL, UTType.icns.identifier as CFString, 1, nil) else { return false }
     CGImageDestinationAddImage(dst, img, nil)
     return CGImageDestinationFinalize(dst)
-}
-
-/// Stable dev identity when its keychain exists (keeps the Local Network approval across updates), else ad-hoc.
-func sign(_ url: URL) {
-    let kc = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Keychains/uc-signing.keychain-db").path
-    let hasKC = FileManager.default.fileExists(atPath: kc)
-    if hasKC { run("/usr/bin/security", ["unlock-keychain", "-p", "uc", kc]) }  // throwaway keychain, see scripts/common.sh
-    if !(hasKC && run("/usr/bin/codesign", ["--force", "--sign", "Unified Control Dev", "--keychain", kc, url.path])) {
-        run("/usr/bin/codesign", ["--force", "--sign", "-", url.path])
-    }
 }
 
 @discardableResult func run(_ tool: String, _ args: [String]) -> Bool {

@@ -71,6 +71,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     func handle(_ m: Msg) {
         switch m.t {
         case "list": Task { await list() }
+        case "apps": Task { apps() }
         case "open": Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
         case "ack":
             unacked -= 1
@@ -111,17 +112,54 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         wire.send(m)
     }
 
+    /// Installed apps here, so the client can make a proxy for each (Spotlight there finds "Xcode · mini").
+    func apps() {
+        let fm = FileManager.default
+        let dirs = ["/Applications", "/Applications/Utilities", "/System/Applications", "/System/Applications/Utilities",
+                    fm.homeDirectoryForCurrentUser.appending(path: "Applications").path]
+        var seen = Set<String>(), items: [Item] = []
+        for d in dirs {
+            for name in ((try? fm.contentsOfDirectory(atPath: d)) ?? []).sorted() where name.hasSuffix(".app") {
+                let path = "\(d)/\(name)"
+                guard let b = Bundle(path: path), let id = b.bundleIdentifier, id != Bundle.main.bundleIdentifier,
+                      !["LSUIElement", "LSBackgroundOnly"].contains(where: { isTrue(b.object(forInfoDictionaryKey: $0)) }),  // menu-bar/agent apps
+                      seen.insert(id).inserted else { continue }
+                let label = fm.displayName(atPath: path)
+                items.append(Item(id: 0, app: label.hasSuffix(".app") ? String(label.dropLast(4)) : label, bundle: id, title: "",
+                                  icon: png(NSWorkspace.shared.icon(forFile: path))))
+            }
+        }
+        var m = Msg("apps"); m.items = items
+        wire.send(m)
+        log("sent \(items.count) installed apps")
+    }
+
+    func pick(_ c: SCShareableContent, _ app: String, _ title: String?, _ id: CGWindowID) -> SCWindow? {
+        let a = app.lowercased()
+        return candidates(c).first(where: { $0.windowID == id }) ?? candidates(c).filter({
+            let o = $0.owningApplication!
+            return (o.applicationName.lowercased().contains(a) || o.bundleIdentifier.lowercased() == a)
+                && (title == nil || ($0.title ?? "").localizedCaseInsensitiveContains(title!))
+        }).max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+    }
+
     func open(_ app: String, _ title: String?, id: CGWindowID) async {
         do {
-            let c = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-            let a = app.lowercased()
-            guard let win = candidates(c).first(where: { $0.windowID == id }) ?? candidates(c).filter({
-                let o = $0.owningApplication!
-                return (o.applicationName.lowercased().contains(a) || o.bundleIdentifier.lowercased() == a)
-                    && (title == nil || ($0.title ?? "").localizedCaseInsensitiveContains(title!))
-            }).max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else {
-                return fail("no window matching '\(app)'\(title.map { " / '\($0)'" } ?? "")")
+            var win: SCWindow?, launched = false
+            for _ in 0..<60 {   // a cold-launched app gets up to ~30 s to show its first window
+                let c = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+                win = pick(c, app, title, id)
+                if win != nil || title != nil || id != 0 { break }
+                if !launched {
+                    // not running, or running without a window: launch / reopen it, like clicking its Dock icon
+                    guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app) else { break }
+                    launched = true
+                    log("launching \(url.lastPathComponent)")
+                    _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+                }
+                try await Task.sleep(for: .milliseconds(500))
             }
+            guard let win else { return fail("no window matching '\(app)'\(title.map { " / '\($0)'" } ?? "")") }
             let owner = win.owningApplication!
             q.sync {
                 pid = owner.processID
@@ -465,6 +503,8 @@ func packet(_ sb: CMSampleBuffer, _ seq: UInt32) -> Data {
     }
     return d
 }
+
+func isTrue(_ v: Any?) -> Bool { (v as? Bool) ?? ((v as? String).map { $0 == "1" || $0.lowercased() == "yes" || $0.lowercased() == "true" } ?? false) }
 
 func png(_ img: NSImage) -> Data? {
     var r = NSRect(x: 0, y: 0, width: 256, height: 256)
