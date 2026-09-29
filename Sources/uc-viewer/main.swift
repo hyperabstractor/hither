@@ -557,12 +557,14 @@ final class Launcher: NSObject, NSMenuDelegate {
                 switch m.t {
                 case "windows": onMain { self?.update(m.items ?? []) }
                 case "apps": onMain { self?.makeProxies(m.items ?? []) }
+                case "appeared": onMain { self?.appeared(m.items ?? []) }
                 default: break
                 }
             }
             wire = w
             w.start()
             w.send(Msg("apps"))   // every (re)connect: a proxy per installed app, so Spotlight finds "Xcode · mini"
+            w.send(Msg("watch"))  // …and new windows over there (Cmd-N, launched apps) open here by themselves
         }
         wire?.send(Msg("list"))
     }
@@ -640,8 +642,19 @@ final class Launcher: NSObject, NSMenuDelegate {
         UserDefaults.standard.set(r.map { ["bundle": $0.bundle, "app": $0.app] }, forKey: "recent")
     }
 
+    /// A new window appeared on the host because of something done through a proxy: open it like a local app would.
+    func appeared(_ new: [Item]) {
+        for i in new {
+            if let icon = i.icon { icons[i.bundle] = icon }
+            openItem(i)
+        }
+    }
+
     @objc func open(_ sender: NSMenuItem) {
-        guard let w = sender.representedObject as? Item else { return }
+        if let w = sender.representedObject as? Item { openItem(w) }
+    }
+
+    func openItem(_ w: Item) {
         remember(w)
         let icon = icons[w.bundle]
         buildQ.async {   // same queue as the bulk proxy build, so they never write one bundle at once

@@ -18,7 +18,12 @@ let inputQ = DispatchQueue(label: "input")
 /// Menu reads and presses: AX calls into the app can block (a menu item that runs a modal panel), so keep them
 /// off both the session and input queues.
 let menuQ = DispatchQueue(label: "menu")
-var lastInputAt: CFTimeInterval = 0   // while the user is typing/clicking, background windows hold their frames
+var lastInputAt: CFTimeInterval = 0
+// new-window following (all on the main queue)
+var watchers: [ObjectIdentifier: Session] = [:]   // launcher connections that receive "appeared"
+var knownWindows: Set<CGWindowID> = []            // every window seen so far
+var watchPrimed = false
+var launchingApps: Set<String> = []                // bundles a proxy is launching: their first window is already spoken for   // while the user is typing/clicking, background windows hold their frames
 
 func axWindow(pid: pid_t, id: CGWindowID) -> AXUIElement? {
     var v: CFTypeRef?
@@ -74,6 +79,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     func handle(_ m: Msg) {
         switch m.t {
         case "list": Task { await list() }
+        case "watch": DispatchQueue.main.async { watchers[ObjectIdentifier(self)] = self }
         case "apps": Task { apps() }
         case "open": Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
         case "ack":
@@ -91,6 +97,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         case "press":
             let path = m.path ?? []
             inputQ.async {
+                lastInputAt = CACurrentMediaTime()   // File › New Window etc. count as the user's doing
                 self.focus(force: false)   // e.g. File › Save acts on the key window, so make it ours
                 menuQ.async { if let e = self.menuItems(at: path.dropLast())?[safe: path.last ?? -1] { AXUIElementPerformAction(e, kAXPressAction as CFString) } }
             }
@@ -170,10 +177,16 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                     // not running, or running without a window: launch / reopen it, like clicking its Dock icon
                     guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app) else { break }
                     launched = true
+                    await MainActor.run { _ = launchingApps.insert(app) }
                     log("launching \(url.lastPathComponent)")
                     _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
                 }
                 try await Task.sleep(for: .milliseconds(500))
+            }
+            let picked = win?.windowID
+            DispatchQueue.main.async {
+                if let picked { knownWindows.insert(picked) }   // ours now: the watcher mustn't announce it too
+                if launched { launchingApps.remove(app) }
             }
             guard let win else { return fail("no window matching '\(app)'\(title.map { " / '\($0)'" } ?? "")") }
             let owner = win.owningApplication!
@@ -497,8 +510,25 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         return items
     }
 
+    /// Tell a watching launcher about new windows (icons once per app per connection, like the list).
+    func announce(_ items: [Item]) {
+        q.async {
+            var m = Msg("appeared")
+            m.items = items.map { i in
+                var i = i
+                if self.sentIcons.insert(i.bundle).inserted {
+                    i.icon = NSRunningApplication.runningApplications(withBundleIdentifier: i.bundle).first?.icon.flatMap(png)
+                }
+                return i
+            }
+            self.wire.send(m)
+        }
+    }
+
     func stop() {
         ended = true
+        let id = ObjectIdentifier(self)
+        DispatchQueue.main.async { watchers[id] = nil }
         timer?.cancel(); timer = nil
         stream?.stopCapture { _ in }; stream = nil
         if let e = encoder { VTCompressionSessionInvalidate(e) }; encoder = nil
@@ -582,4 +612,51 @@ listener.newConnectionHandler = { conn in
 }
 listener.stateUpdateHandler = { log("listener: \($0)") }
 listener.start(queue: .main)
+
+/// New windows here show up on the client by themselves when they're plausibly the user's: they appeared within
+/// 15 s of input through a proxy (Cmd-N, File › New Window, opening a project, launching an app), or their app is
+/// already being streamed. Anything else (someone using this Mac directly, random popups) stays put.
+func watchWindows() {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    else { return }
+    var fresh: [Item] = []
+    for w in list where (w[kCGWindowLayer as String] as? Int) == 0 {
+        guard let id = w[kCGWindowNumber as String] as? CGWindowID, !knownWindows.contains(id) else { continue }
+        guard watchPrimed else { knownWindows.insert(id); continue }
+        let pid = w[kCGWindowOwnerPID as String] as? pid_t ?? 0
+        let f = (w[kCGWindowBounds as String]).flatMap { CGRect(dictionaryRepresentation: $0 as! CFDictionary) } ?? .zero
+        guard f.width > 100, f.height > 100,
+              CACurrentMediaTime() - lastInputAt < 15 || sessions.values.contains(where: { $0.pid == pid }),
+              let app = NSRunningApplication(processIdentifier: pid), app.activationPolicy == .regular,
+              let bundle = app.bundleIdentifier, !launchingApps.contains(bundle)
+        else { knownWindows.insert(id); continue }
+        // only real windows: sheets and dialogs already show inside their parent's stream
+        guard let standard = isStandardWindow(pid: pid, id: id) else {
+            // brand-new windows can take a moment to appear to Accessibility; give it ~3 s
+            axTries[id, default: 0] += 1
+            if axTries[id]! >= 6 { knownWindows.insert(id); axTries[id] = nil }
+            continue
+        }
+        knownWindows.insert(id)
+        axTries[id] = nil
+        if standard {
+            fresh.append(Item(id: Int(id), app: app.localizedName ?? "", bundle: bundle, title: w[kCGWindowName as String] as? String ?? ""))
+        }
+    }
+    watchPrimed = true
+    guard !fresh.isEmpty else { return }
+    log("new windows: \(fresh.map { "\($0.app) '\($0.title)'" }.joined(separator: ", "))")
+    watchers.values.forEach { $0.announce(fresh) }
+}
+var axTries: [CGWindowID: Int] = [:]
+
+/// nil = Accessibility doesn't list this window (yet).
+func isStandardWindow(pid: pid_t, id: CGWindowID) -> Bool? {
+    guard let w = axWindow(pid: pid, id: id) else { return nil }
+    var v: CFTypeRef?
+    AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &v)
+    return (v as? String) == kAXStandardWindowSubrole
+}
+Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in watchWindows() }
+
 app.run()
