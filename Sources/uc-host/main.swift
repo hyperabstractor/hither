@@ -11,6 +11,13 @@ func _AXUIElementGetWindow(_ el: AXUIElement, _ id: UnsafeMutablePointer<CGWindo
 
 let panelService = "com.apple.appkit.xpc.openAndSavePanelService"  // Open/Save dialogs live in this process
 let bitrate = Int(ProcessInfo.processInfo.environment["UC_BITRATE"] ?? "") ?? 40_000_000
+/// ~/.unified-control/codec: h264 (default) | hevc | hevc422. Chosen from the launcher's Video Codec menu.
+let codecURL = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".unified-control/codec")
+let codecs = ["h264", "hevc", "hevc422"]
+func currentCodec() -> String {
+    let c = (try? String(contentsOf: codecURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return codecs.contains(c) ? c : "h264"
+}
 var lastRaised: CGWindowID = 0   // the window that currently has input focus on this Mac
 /// All input injection runs here: it's serialized system-wide anyway, and an app switch (with its wait)
 /// must never stall a session's capture/encode/ack queue.
@@ -64,6 +71,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var nFrames = 0, nBytes = 0, nKeys = 0, nDelayed = 0, nRaises = 0
     var encMs = 0.0, raiseMs = 0.0, rtts: [Double] = []
     var lastEncode: CFTimeInterval = 0
+    var codec = "h264"
+    var viewerHEVC = false
+    var lastFrame: CVPixelBuffer?   // re-sent on a codec switch
     var pumpQueued = false
     var visible = true
 
@@ -80,8 +90,14 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         switch m.t {
         case "list": Task { await list() }
         case "watch": DispatchQueue.main.async { watchers[ObjectIdentifier(self)] = self }
+        case "codec":
+            try? (codecs.contains(m.codec ?? "") ? m.codec! : "h264").write(to: codecURL, atomically: true, encoding: .utf8)
+            DispatchQueue.main.async { sessions.values.forEach { $0.applyCodec() } }
+            Task { await list() }   // reply with the new state
         case "apps": Task { apps() }
-        case "open": Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
+        case "open":
+            viewerHEVC = m.caps?.contains("hevc") == true   // older viewers only decode H.264
+            Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
         case "ack":
             unacked -= 1
             if !inflight.isEmpty { rtts.append((CACurrentMediaTime() - inflight.removeFirst()) * 1000) }
@@ -124,6 +140,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         let c: SCShareableContent
         do { c = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true) } catch { return fail("\(error)") }
         var m = Msg("windows")
+        m.codec = currentCodec()
         m.items = q.sync {
             candidates(c).map { w in
                 let o = w.owningApplication!
@@ -192,6 +209,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             let owner = win.owningApplication!
             q.sync {
                 pid = owner.processID
+                codec = viewerHEVC ? currentCodec() : "h264"
                 if case .hostPort(_, let port) = wire.conn.endpoint { appName = "\(owner.applicationName):\(port)" }
                 else { appName = owner.applicationName }
                 windowID = win.windowID
@@ -273,7 +291,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         c.sourceRect = frame.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY)
         c.width = Int(frame.width * scale) & ~1
         c.height = Int(frame.height * scale) & ~1
-        c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        // 4:2:2 needs more color than 4:2:0 capture carries: hand the encoder full RGB and let it subsample
+        c.pixelFormat = codec == "hevc422" ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         c.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         c.showsCursor = false
         c.queueDepth = 5
@@ -385,7 +404,23 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Codec changed from the launcher: new encoder now, and re-send the current picture so the switch shows at once.
+    func applyCodec() {
+        q.async {
+            let c = self.viewerHEVC ? currentCodec() : "h264"
+            guard c != self.codec, self.pid != 0 else { return }
+            let recapture = (c == "hevc422") != (self.codec == "hevc422")   // capture pixel format differs
+            self.codec = c
+            if recapture { self.stream?.updateConfiguration(self.config()) { if let e = $0 { log("updateConfiguration: \(e)") } } }
+            if let e = self.encoder { VTCompressionSessionInvalidate(e) }
+            self.encoder = nil
+            if self.pending == nil { self.pending = self.lastFrame }
+            self.pump()
+        }
+    }
+
     func encode(_ px: CVPixelBuffer) {
+        lastFrame = px
         let size = (CVPixelBufferGetWidth(px), CVPixelBufferGetHeight(px))
         if encoder == nil || encSize != size { makeEncoder(size) }
         guard let encoder else { return }
@@ -401,7 +436,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             guard status == noErr, let sb else { self.q.async { self.unacked -= 1; _ = self.inflight.popLast() }; return }
             let p = packet(sb, seq), ms = (CACurrentMediaTime() - t0) * 1000
             self.wire.sendVideo(p)
-            self.q.async { self.nFrames += 1; self.nBytes += p.count; self.encMs += ms; if p[4] != 0 { self.nKeys += 1 } }
+            self.q.async { self.nFrames += 1; self.nBytes += p.count; self.encMs += ms; if p[4] & 0x7f != 0 { self.nKeys += 1 } }
         }
     }
 
@@ -409,13 +444,29 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         if let e = encoder { VTCompressionSessionInvalidate(e) }
         encoder = nil
         var s: VTCompressionSession?
-        let spec = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true] as CFDictionary
-        let st = VTCompressionSessionCreate(allocator: nil, width: Int32(size.0), height: Int32(size.1), codecType: kCMVideoCodecType_H264,
-                                            encoderSpecification: spec, imageBufferAttributes: nil, compressedDataAllocator: nil,
-                                            outputCallback: nil, refcon: nil, compressionSessionOut: &s)
-        guard st == noErr, let s else { return log("encoder create failed: \(st)") }
+        let type = codec == "h264" ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC
+        func create(_ spec: [CFString: Any]) -> OSStatus {
+            VTCompressionSessionCreate(allocator: nil, width: Int32(size.0), height: Int32(size.1), codecType: type,
+                                       encoderSpecification: spec as CFDictionary, imageBufferAttributes: nil, compressedDataAllocator: nil,
+                                       outputCallback: nil, refcon: nil, compressionSessionOut: &s)
+        }
+        // hardware is required (creation fails rather than silently falling back to software), low-latency
+        // rate control where the encoder offers it, otherwise plain real-time mode
+        let hwOnly: [CFString: Any] = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true]
+        let lowLatency = create(hwOnly.merging([kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true]) { $1 }) == noErr
+        if !lowLatency && create(hwOnly) != noErr { log("no hardware \(codec) encoder, using software"); _ = create([:]) }
+        guard let s else { return log("encoder create failed for \(codec)") }
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_ConstrainedHigh_AutoLevel)
+        if !lowLatency { VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber) }
+        let profile = [
+            "h264": kVTProfileLevel_H264_ConstrainedHigh_AutoLevel, "hevc": kVTProfileLevel_HEVC_Main_AutoLevel,
+            "hevc422": kVTProfileLevel_HEVC_Main42210_AutoLevel,
+        ][codec]!
+        let pst = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
+        var hw: CFTypeRef?
+        let hst = VTSessionCopyProperty(s, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, allocator: nil, valueOut: &hw)
+        log("encoder \(codec) \(size.0)×\(size.1): lowLatency=\(lowLatency) profile=\(pst == noErr ? "ok" : "rejected (\(pst))") "
+            + "usingHardware=\(hst == noErr ? "\(hw as? Bool ?? false)" : "not reported (\(hst))")")
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
@@ -536,14 +587,25 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
-/// Video packet: [inputSeq u32][paramCount u8]([len u16][SPS/PPS])*[AVCC sample data]
+/// Video packet: [inputSeq u32][paramCount u8, bit 7 = HEVC]([len u16][parameter set])*[length-prefixed NAL units]
 func packet(_ sb: CMSampleBuffer, _ seq: UInt32) -> Data {
     var d = Data()
     d.put(seq)
     let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[CFString: Any]]
     let isKey = !((atts?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false)
     var params: [Data] = []
-    if isKey, let fd = sb.formatDescription {
+    let hevc = sb.formatDescription.map { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_HEVC } ?? false
+    if isKey, let fd = sb.formatDescription, hevc {
+        var n = 0
+        CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: 0, parameterSetPointerOut: nil,
+                                                           parameterSetSizeOut: nil, parameterSetCountOut: &n, nalUnitHeaderLengthOut: nil)
+        for i in 0..<n {
+            var p: UnsafePointer<UInt8>?, len = 0
+            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: i, parameterSetPointerOut: &p,
+                                                               parameterSetSizeOut: &len, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+            if let p { params.append(Data(bytes: p, count: len)) }
+        }
+    } else if isKey, let fd = sb.formatDescription {
         var n = 0
         CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, parameterSetIndex: 0, parameterSetPointerOut: nil,
                                                            parameterSetSizeOut: nil, parameterSetCountOut: &n, nalUnitHeaderLengthOut: nil)
@@ -554,7 +616,7 @@ func packet(_ sb: CMSampleBuffer, _ seq: UInt32) -> Data {
             if let p { params.append(Data(bytes: p, count: len)) }
         }
     }
-    d.put(UInt8(params.count))
+    d.put(UInt8(params.count) | (hevc ? 0x80 : 0))   // high bit: HEVC parameter sets (VPS/SPS/PPS)
     for p in params { d.put(UInt16(p.count)); d.append(p) }
     if let bb = sb.dataBuffer {
         let len = CMBlockBufferGetDataLength(bb)

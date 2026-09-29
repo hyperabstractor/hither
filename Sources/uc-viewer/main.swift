@@ -64,7 +64,8 @@ final class StreamView: NSView {
     func show(_ packet: Data) {
         var r = Reader(packet)
         let seq = r.u32()
-        let params = (0..<Int(r.u8())).map { _ in r.bytes(Int(r.u16())) }
+        let pc = r.u8(), hevc = pc & 0x80 != 0
+        let params = (0..<Int(pc & 0x7f)).map { _ in r.bytes(Int(r.u16())) }
         let body = r.rest()
 
         if !params.isEmpty {
@@ -75,9 +76,14 @@ final class StreamView: NSView {
             }
             defer { bufs.forEach { $0.deallocate() } }
             var fd: CMFormatDescription?
-            CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil, parameterSetCount: params.count,
-                parameterSetPointers: bufs.map { UnsafePointer($0) }, parameterSetSizes: params.map(\.count),
-                nalUnitHeaderLength: 4, formatDescriptionOut: &fd)
+            let ptrs = bufs.map { UnsafePointer($0) }, sizes = params.map(\.count)
+            if hevc {
+                CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: nil, parameterSetCount: params.count, parameterSetPointers: ptrs,
+                    parameterSetSizes: sizes, nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &fd)
+            } else {
+                CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil, parameterSetCount: params.count, parameterSetPointers: ptrs,
+                    parameterSetSizes: sizes, nalUnitHeaderLength: 4, formatDescriptionOut: &fd)
+            }
             if let fd { format = fd }
         }
         guard let format else { return }
@@ -232,7 +238,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         }
         wire = w
         w.start()
-        var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID
+        var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc"]
         w.send(m)
     }
 
@@ -501,6 +507,7 @@ final class Launcher: NSObject, NSMenuDelegate {
     var icons: [String: Data] = [:]
     var state = "connecting…"
     var relay: NWListener?
+    var codec = "h264"   // host's current video codec (from its "windows" replies)
     let buildQ = DispatchQueue(label: "proxies")   // all proxy-bundle writes, in order
 
     func start() {
@@ -555,7 +562,7 @@ final class Launcher: NSObject, NSMenuDelegate {
             }
             w.onMsg = { [weak self] m in
                 switch m.t {
-                case "windows": onMain { self?.update(m.items ?? []) }
+                case "windows": onMain { self?.codec = m.codec ?? "h264"; self?.update(m.items ?? []) }
                 case "apps": onMain { self?.makeProxies(m.items ?? []) }
                 case "appeared": onMain { self?.appeared(m.items ?? []) }
                 default: break
@@ -611,6 +618,15 @@ final class Launcher: NSObject, NSMenuDelegate {
         for r in recent { add(r.app, r, indent: 0, to: sub).image = icon(r.bundle) }
         recentItem.submenu = sub
         recentItem.isEnabled = !recent.isEmpty
+        let codecItem = menu.addItem(withTitle: "Video Codec", action: nil, keyEquivalent: "")
+        let codecs = NSMenu()
+        for (name, id) in [("H.264", "h264"), ("HEVC", "hevc"), ("HEVC 4:2:2 (sharpest color)", "hevc422")] {
+            let mi = codecs.addItem(withTitle: name, action: #selector(setCodec(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = id
+            mi.state = codec == id ? .on : .off
+        }
+        codecItem.submenu = codecs
         // whole desktop: Apple's Screen Sharing does that job best, so just hand off to it
         menu.addItem(withTitle: "Screen Share \(short(host))…", action: #selector(screenShare), keyEquivalent: "").target = self
         menu.addItem(.separator())
@@ -713,6 +729,16 @@ final class Launcher: NSObject, NSMenuDelegate {
         return (url, id, true)
     }
 
+    /// Applies to every open window at once (the host swaps encoders); remembered on the host for new ones.
+    @objc func setCodec(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        codec = id
+        rebuild()
+        refresh()
+        var m = Msg("codec"); m.codec = id
+        wire?.send(m)
+    }
+
     @objc func screenShare() { NSWorkspace.shared.open(URL(string: "vnc://\(host)")!) }
 
     @objc func quit() {
@@ -779,10 +805,18 @@ case "proxy":
 default:
     let args = CommandLine.arguments
     guard args.count >= 3 else {
-        print("usage: uc-viewer <host> <app> [window-title-substring]\n       uc-viewer <host> --list")
+        print("usage: uc-viewer <host> <app> [window-title-substring]\n       uc-viewer <host> --list\n       uc-viewer <host> --codec h264|hevc|hevc422")
         exit(1)
     }
-    if args[2] == "--list" {
+    if args[2] == "--codec", args.count > 3 {   // same as the launcher's Video Codec menu
+        let w = dial(args[1])
+        listWire = w
+        w.onMsg = { m in print("codec: \(m.codec ?? "?")"); exit(0) }
+        w.onClose = { exit(1) }
+        w.start()
+        var m = Msg("codec"); m.codec = args[3]
+        w.send(m)
+    } else if args[2] == "--list" {
         let w = dial(args[1])
         listWire = w
         w.onMsg = { m in

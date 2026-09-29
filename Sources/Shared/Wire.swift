@@ -16,6 +16,8 @@ public struct Msg: Codable {
     public var items: [Item]?
     public var path: [Int]?          // menu path: indices from the menu bar down
     public var menu: [MenuEntry]?
+    public var caps: [String]?       // viewer → host on "open": decoders it has beyond H.264 (e.g. "hevc")
+    public var codec: String?        // "h264" | "hevc" | "hevc422": host's current choice (in "windows"), or a new one ("codec")
     public init(_ t: String) { self.t = t }
 }
 
