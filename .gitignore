@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Local app bundles (scripts/deploy-host.sh, scripts/install-air.sh)
+build/
+
+# Xcode
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.dSYM
+*.dSYM.zip
