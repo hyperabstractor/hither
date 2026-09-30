@@ -822,6 +822,9 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func footer() {
         menu.addItem(.separator())
+        let share = menu.addItem(withTitle: "Share This Mac", action: #selector(toggleSharing), keyEquivalent: "")
+        share.target = self
+        share.state = sharing ? .on : .off
         let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -938,6 +941,13 @@ final class Launcher: NSObject, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
+    /// Off: this Mac's windows aren't offered (the host isn't running); the other Mac's are still shown here.
+    @objc func toggleSharing() {
+        sharing.toggle()
+        sharing ? startHost() : stopHost()
+        rebuild()
+    }
+
     @objc func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() } else { try SMAppService.mainApp.register() }
@@ -972,18 +982,32 @@ func writeICNS(_ png: Data, to url: URL) -> Bool {
 
 /// This Mac's own host (sharing its windows) runs as a helper inside our bundle. Started by us it gets our Screen
 /// Recording/Accessibility grants, a crash in capture/encode can't take the menu or relay down, and we restart it.
-/// It exits when we do.
+/// It exits when we do. "Share This Mac" off: not running at all.
 var hostProcess: Process?
-func startHost(_ out: FileHandle?) {
+var hostLog: FileHandle?
+var sharing = UserDefaults.standard.object(forKey: "sharing") as? Bool ?? true {
+    didSet { UserDefaults.standard.set(sharing, forKey: "sharing") }
+}
+func startHost() {
+    guard sharing, hostProcess == nil else { return }
     let p = Process()
     hostProcess = p
     p.executableURL = Bundle.main.bundleURL.appending(path: "Contents/Helpers/Hither Host.app/Contents/MacOS/hither-host")
-    p.standardError = out
+    p.standardError = hostLog
     p.terminationHandler = { p in
-        out?.write(Data("[hither] host exited (\(p.terminationStatus)), restarting\n".utf8))
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startHost(out) }
+        DispatchQueue.main.async {
+            guard hostProcess === p else { hostLog?.write(Data("[hither] host stopped\n".utf8)); return }   // stopped on purpose
+            hostProcess = nil
+            hostLog?.write(Data("[hither] host exited (\(p.terminationStatus)), restarting\n".utf8))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startHost() }
+        }
     }
-    do { try p.run() } catch { log("host: \(error)") }
+    do { try p.run() } catch { log("host: \(error)"); hostProcess = nil }
+}
+func stopHost() {
+    let p = hostProcess
+    hostProcess = nil
+    p?.terminate()
 }
 func restartHost() { hostProcess?.terminate() }   // its termination handler starts a fresh one
 
@@ -998,7 +1022,8 @@ case "launcher":
     app.setActivationPolicy(.accessory)
     _ = Pairings.load()   // create this Mac's ID before the host reads it
     FileManager.default.createFile(atPath: "/tmp/hither-host.log", contents: nil)
-    startHost(FileHandle(forWritingAtPath: "/tmp/hither-host.log"))
+    hostLog = FileHandle(forWritingAtPath: "/tmp/hither-host.log")
+    startHost()
     launcher = Launcher()
     launcher?.start()
 case "proxy":
