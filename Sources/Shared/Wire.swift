@@ -1,9 +1,12 @@
 import Foundation
 import Network
 import Security
+import SystemConfiguration
 
 public let port: NWEndpoint.Port = 7420
 public let relayPort: NWEndpoint.Port = 7421   // launcher's loopback relay on the client Mac
+public let pairPort: NWEndpoint.Port = 7422    // pairing, plain TCP; advertised over Bonjour
+public let serviceType = "_hither._tcp"
 
 /// Every control/input message. One loose struct beats a dozen types for a wire this small.
 public struct Msg: Codable {
@@ -18,6 +21,7 @@ public struct Msg: Codable {
     public var menu: [MenuEntry]?
     public var caps: [String]?       // viewer → host on "open": decoders it has beyond H.264 (e.g. "hevc")
     public var codec: String?        // "h264" | "hevc" | "hevc422": host's current choice (in "windows"), or a new one ("codec")
+    public var peer: String?, name: String?, key: Data?, nonce: Data?, commit: Data?   // pairing
     public init(_ t: String) { self.t = t }
 }
 
@@ -37,23 +41,58 @@ public struct Item: Codable {
     }
 }
 
-public func log(_ s: String) { FileHandle.standardError.write(Data("[uc] \(s)\n".utf8)) }
+public func log(_ s: String) { FileHandle.standardError.write(Data("[hither] \(s)\n".utf8)) }
 
-/// Pre-shared key both Macs hold in ~/.unified-control/psk (deploy script creates + copies it).
-public func loadKey() -> Data {
-    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".unified-control/psk")
-    guard let d = try? Data(contentsOf: url), d.count >= 32 else {
-        log("missing \(url.path) — run scripts/install.sh"); exit(1)
-    }
+/// ~/.hither: pairings and settings, readable by you only.
+public let configDir: URL = {
+    let d = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".hither")
+    try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     return d
+}()
+
+/// This Mac's short network name ("mini" for mini.local): Bonjour name, proxy suffix ("Cursor · mini"), and how the
+/// other Mac reaches this one.
+public func localName() -> String {
+    SCDynamicStoreCopyLocalHostName(nil) as String? ?? ProcessInfo.processInfo.hostName
 }
 
-/// TLS-PSK over TCP: encrypted, and only holders of the key can connect (it injects input, so this matters).
-public func tlsParams(key: Data) -> NWParameters {
+/// A Mac this one is paired with. Pairing is mutual: each can open the other's windows.
+public struct Peer: Codable {
+    public var id: String, name: String, token: Data
+    public init(id: String, name: String, token: Data) { self.id = id; self.name = name; self.token = token }
+}
+
+/// This Mac's ID and its pairings, in ~/.hither/pairings.json.
+public struct Pairings: Codable {
+    public var id: String
+    public var peers: [Peer]
+    static let url = configDir.appending(path: "pairings.json")
+
+    public static func load() -> Pairings {
+        if let d = try? Data(contentsOf: url), let p = try? JSONDecoder().decode(Pairings.self, from: d) { return p }
+        let p = Pairings(id: UUID().uuidString, peers: [])
+        p.save()
+        return p
+    }
+
+    public func save() {
+        try? JSONEncoder().encode(self).write(to: Self.url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.url.path)
+    }
+
+    /// Client side of a connection to `host` ("mini.local" or "mini"): our ID with that pair's key.
+    public func tls(to host: String) -> NWParameters {
+        let peer = peers.first { $0.name == host || "\($0.name).local" == host }
+        return tlsParams(psks: [(id, peer?.token ?? Data(count: 32))])   // unpaired: fails the handshake
+    }
+}
+
+/// TLS-PSK over TCP: encrypted, and only paired Macs get in (it injects input, so this matters). The client offers
+/// its ID with the pair's key; the server holds every paired Mac's key and picks by that ID.
+public func tlsParams(psks: [(id: String, key: Data)]) -> NWParameters {
     let tls = NWProtocolTLS.Options()
-    let k = key.withUnsafeBytes { DispatchData(bytes: $0) }
-    let id = Data("uc".utf8).withUnsafeBytes { DispatchData(bytes: $0) }
-    sec_protocol_options_add_pre_shared_key(tls.securityProtocolOptions, k as __DispatchData, id as __DispatchData)
+    let dd = { (d: Data) in d.withUnsafeBytes { DispatchData(bytes: $0) } as __DispatchData }
+    for (id, key) in psks { sec_protocol_options_add_pre_shared_key(tls.securityProtocolOptions, dd(key), dd(Data(id.utf8))) }
     sec_protocol_options_append_tls_ciphersuite(tls.securityProtocolOptions,
         tls_ciphersuite_t(rawValue: UInt16(TLS_PSK_WITH_AES_128_GCM_SHA256))!)
     return NWParameters(tls: tls, tcp: tcpOptions())
@@ -79,6 +118,7 @@ public final class Wire {
     public var onVideo: (Data) -> Void = { _ in }
     public var onAudio: (Data) -> Void = { _ in }
     public var onClose: () -> Void = {}
+    public var maxLen = Int.max   // cap it where the peer isn't authenticated yet (pairing)
     private var closed = false
 
     public init(_ conn: NWConnection, queue: DispatchQueue) { self.conn = conn; self.queue = queue }
@@ -111,6 +151,7 @@ public final class Wire {
             }
             var r = Reader(h)
             let kind = r.u8(), len = Int(r.u32())
+            guard len <= self.maxLen else { log("oversized message"); self.close(); return }
             self.conn.receive(minimumIncompleteLength: len, maximumLength: len) { body, _, _, err in
                 guard let body, body.count == len, err == nil else { self.close(); return }
                 if kind == 1 {

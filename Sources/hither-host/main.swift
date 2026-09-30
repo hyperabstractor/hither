@@ -11,9 +11,9 @@ import Shared
 func _AXUIElementGetWindow(_ el: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 let panelService = "com.apple.appkit.xpc.openAndSavePanelService"  // Open/Save dialogs live in this process
-let bitrate = Int(ProcessInfo.processInfo.environment["UC_BITRATE"] ?? "") ?? 40_000_000
-/// ~/.unified-control/codec: h264 (default) | hevc | hevc422. Chosen from the launcher's Video Codec menu.
-let codecURL = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".unified-control/codec")
+let bitrate = Int(ProcessInfo.processInfo.environment["HITHER_BITRATE"] ?? "") ?? 40_000_000
+/// ~/.hither/codec: h264 (default) | hevc | hevc422. Chosen from the app's Video Codec menu.
+let codecURL = configDir.appending(path: "codec")
 let codecs = ["h264", "hevc", "hevc422"]
 func currentCodec() -> String {
     let c = (try? String(contentsOf: codecURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -33,7 +33,7 @@ var wakeID: IOPMAssertionID = 0, lastWake: CFTimeInterval = 0
 func wake() {
     guard CACurrentMediaTime() - lastWake > 1 else { return }
     lastWake = CACurrentMediaTime()
-    IOPMAssertionDeclareUserActivity("Unified Control input" as CFString, kIOPMUserActiveLocal, &wakeID)
+    IOPMAssertionDeclareUserActivity("Hither input" as CFString, kIOPMUserActiveLocal, &wakeID)
 }
 // new-window following (all on the main queue)
 var watchers: [ObjectIdentifier: Session] = [:]   // launcher connections that receive "appeared"
@@ -701,9 +701,9 @@ func describe(_ e: AXUIElement) -> MenuEntry {
 
 extension Array { subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil } }
 
-/// Unified Control's own apps (host, launcher, "Cursor · mini" proxies) are never offered: with both Macs hosting,
+/// Hither's own apps (host, launcher, "Cursor · mini" proxies) are never offered: with both Macs hosting,
 /// the Air would otherwise stream its proxies of the Mini back to the Mini.
-func isOurs(_ bundle: String) -> Bool { bundle.hasPrefix("dev.unified-control.") }
+func isOurs(_ bundle: String) -> Bool { bundle.hasPrefix("dev.hither.") }
 
 func isTrue(_ v: Any?) -> Bool { (v as? Bool) ?? ((v as? String).map { $0 == "1" || $0.lowercased() == "yes" || $0.lowercased() == "true" } ?? false) }
 
@@ -717,7 +717,7 @@ func png(_ img: NSImage) -> Data? {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-// Started by the Unified Control menu bar app, which restarts us if we die: go when it goes.
+// Started by the Hither menu bar app, which restarts us if we die: go when it goes.
 let parentWatch = DispatchSource.makeProcessSource(identifier: getppid(), eventMask: .exit, queue: .main)
 parentWatch.setEventHandler { exit(0) }
 parentWatch.resume()
@@ -728,7 +728,10 @@ if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedVal
 }
 
 var sessions: [ObjectIdentifier: Session] = [:]
-let listener = try! NWListener(using: tlsParams(key: loadKey()), on: port)
+// Only paired Macs get in. The app restarts us when pairings change.
+let peers = Pairings.load().peers
+if peers.isEmpty { log("not paired with any Mac yet") }
+let listener = try! NWListener(using: tlsParams(psks: peers.map { ($0.id, $0.token) }), on: port)
 listener.newConnectionHandler = { conn in
     let s = Session(conn)
     let id = ObjectIdentifier(s)

@@ -1,29 +1,30 @@
 import AppKit
 import AVFoundation
 import Network
+import os
 import ServiceManagement
 import UniformTypeIdentifiers
 import Shared
 
 // One binary, three roles, picked by the bundle it runs from:
-//   cli       uc-viewer <host> <app> [title-substring]  |  uc-viewer <host> --list      (dev)
-//   launcher  "Unified Control.app": menu-bar list of the host's windows, creates proxy apps on demand
+//   cli       hither <host> <app> [title-substring]  |  hither <host> --list      (dev)
+//   launcher  "Hither.app": menu-bar list of the host's windows, creates proxy apps on demand
 //   proxy     "Cursor · mini.app": its own Dock/Cmd-Tab identity; one local window per remote window
 
-let key = loadKey()
 let info = Bundle.main.infoDictionary ?? [:]
-let role = info["UCRole"] as? String ?? "cli"
-let openNote = Notification.Name("dev.unified-control.open")
-let launcherID = "dev.unified-control.launcher"
-let quitNote = Notification.Name("dev.unified-control.quit")   // launcher quitting → proxies go too (they need its relay)
+let role = info["HitherRole"] as? String ?? "cli"
+let openNote = Notification.Name("dev.hither.open")
+let launcherID = "dev.hither.app"
+let quitNote = Notification.Name("dev.hither.quit")   // launcher quitting → proxies go too (they need its relay)
 
 func short(_ host: String) -> String { host.split(separator: ".").first.map(String.init) ?? host }
 /// Proxies go through the launcher's loopback relay (only the launcher needs Local Network access);
 /// TLS still runs end to end with the host, so the relay only ever sees ciphertext.
 func dial(_ host: String) -> Wire {
+    let tls = Pairings.load().tls(to: host)
     let c = role == "proxy"
-        ? NWConnection(host: "127.0.0.1", port: relayPort, using: tlsParams(key: key))
-        : NWConnection(host: NWEndpoint.Host(host), port: port, using: tlsParams(key: key))
+        ? NWConnection(host: "127.0.0.1", port: relayPort, using: tls)
+        : NWConnection(host: NWEndpoint.Host(host), port: port, using: tls)
     return Wire(c, queue: DispatchQueue(label: "wire"))
 }
 /// Runs on the main thread even while a menu is open (plain main-queue blocks wait for tracking to end).
@@ -166,7 +167,7 @@ final class StreamView: NSView {
         send(m)
     }
 
-    /// Synthetic keystroke for the latency self-test (UC_TEST_TYPE).
+    /// Synthetic keystroke for the latency self-test (HITHER_TEST_TYPE).
     func tap(_ code: Int) {
         keySeq += 1
         sentAt[keySeq] = CACurrentMediaTime()
@@ -310,8 +311,8 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         if let icon = m.icon.flatMap(NSImage.init(data:)) { NSApp.applicationIconImage = icon }
         NSApp.activate()
         if size != remoteSize { windowDidResize(Notification(name: NSWindow.didResizeNotification)) }
-        if let n = Int(ProcessInfo.processInfo.environment["UC_TEST_TYPE"] ?? "") { selfTest(n) }
-        if ProcessInfo.processInfo.environment["UC_TEST_MENU"] != nil {   // test hook: dump the first few remote menus
+        if let n = Int(ProcessInfo.processInfo.environment["HITHER_TEST_TYPE"] ?? "") { selfTest(n) }
+        if ProcessInfo.processInfo.environment["HITHER_TEST_MENU"] != nil {   // test hook: dump the first few remote menus
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 let bar = RemoteMenus.shared.fetch([]) ?? []
                 log("menu bar: " + bar.map(\.title).joined(separator: " | "))
@@ -324,16 +325,16 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
                 }
             }
         }
-        if let n = Double(ProcessInfo.processInfo.environment["UC_TEST_HIDE"] ?? "") {   // test hook: hide app for n s
+        if let n = Double(ProcessInfo.processInfo.environment["HITHER_TEST_HIDE"] ?? "") {   // test hook: hide app for n s
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { NSApp.hide(nil) }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3 + n) { NSApp.unhide(nil); NSApp.activate(); w.makeKeyAndOrderFront(nil) }
         }
-        if let s = ProcessInfo.processInfo.environment["UC_TEST_SIZE"]?.split(separator: "x").compactMap({ Double($0) }), s.count == 2 {
+        if let s = ProcessInfo.processInfo.environment["HITHER_TEST_SIZE"]?.split(separator: "x").compactMap({ Double($0) }), s.count == 2 {
             w.setContentSize(CGSize(width: s[0], height: s[1]))  // test hook: resize without touching the mouse
         }
     }
 
-    /// UC_TEST_TYPE=n: type n × ("a", Backspace) — document ends unchanged — then log key→frame latency.
+    /// HITHER_TEST_TYPE=n: type n × ("a", Backspace) — document ends unchanged — then log key→frame latency.
     func selfTest(_ n: Int) {
         var i = 0
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] t in
@@ -383,7 +384,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
 
     func sendVisibility() {
         var m = Msg("visible"); m.down = window?.occlusionState.contains(.visible) ?? true
-        if ProcessInfo.processInfo.environment["UC_TEST_HIDE"] != nil { log("visible=\(m.down!)") }
+        if ProcessInfo.processInfo.environment["HITHER_TEST_HIDE"] != nil { log("visible=\(m.down!)") }
         wire?.send(m)
     }
 
@@ -416,7 +417,7 @@ final class AudioOut {
     init() {
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: format)
-        if ProcessInfo.processInfo.environment["UC_TEST_AUDIO"] != nil {   // test hook: buffer depth + device delay
+        if ProcessInfo.processInfo.environment["HITHER_TEST_AUDIO"] != nil {   // test hook: buffer depth + device delay
             Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [self] _ in
                 lock.lock(); let q = queued; lock.unlock()
                 log("audio: buffered \(q * 1000 / 48_000) ms, output device \(Int(engine.outputNode.presentationLatency * 1000)) ms")
@@ -555,7 +556,15 @@ final class RemoteMenus: NSObject, NSMenuDelegate {
 // MARK: - launcher (menu bar)
 
 final class Launcher: NSObject, NSMenuDelegate {
-    let host = info["UCHost"] as? String ?? "mini.local"
+    /// The Mac whose windows this menu shows (the first one paired). nil until paired.
+    var peer: Peer? { didSet { relayHost.withLock { $0 = peer == nil ? nil : host } } }
+    var host: String { "\(peer?.name ?? "").local" }
+    let relayHost = OSAllocatedUnfairLock<String?>(initialState: nil)   // read on the relay queue
+    var nearby: [(name: String, endpoint: NWEndpoint)] = []   // other Macs running Hither (Bonjour)
+    var pairListener: NWListener?
+    var browser: NWBrowser?
+    var pairing: PairSession?
+    var asking = false   // a pairing code alert is up
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let menu = NSMenu()
     var wire: Wire?
@@ -567,12 +576,120 @@ final class Launcher: NSObject, NSMenuDelegate {
     let buildQ = DispatchQueue(label: "proxies")   // all proxy-bundle writes, in order
 
     func start() {
-        status.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Unified Control")
+        status.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Hither")
         menu.delegate = self
         status.menu = menu
+        peer = Pairings.load().peers.first
         rebuild()
         refresh()
         startRelay()
+        startPairing()
+    }
+
+    // MARK: pairing
+
+    /// Always listening (and advertised) so the other Mac can start pairing; nothing is stored until you click Pair here.
+    func startPairing() {
+        if let l = try? NWListener(using: NWParameters(tls: nil, tcp: tcpOptions()), on: pairPort) {
+            l.service = NWListener.Service(name: localName(), type: serviceType, txtRecord: NWTXTRecord(["id": Pairings.load().id]))
+            l.newConnectionHandler = { [weak self] c in
+                guard let self, pairing == nil else { return c.cancel() }   // one at a time
+                begin(PairSession(c, initiator: false))
+            }
+            l.stateUpdateHandler = { if case .failed(let e) = $0 { log("pairing: \(e)") } }
+            l.start(queue: .main)
+            pairListener = l
+        } else {
+            log("pairing: port \(pairPort) busy")
+        }
+        let b = NWBrowser(for: .bonjourWithTXTRecord(type: serviceType, domain: nil), using: NWParameters())
+        b.browseResultsChangedHandler = { [weak self] results, _ in
+            let me = Pairings.load().id
+            var seen = Set<String>()
+            self?.nearby = results.compactMap { r in
+                guard case .service(let name, _, _, _) = r.endpoint, case .bonjour(let txt) = r.metadata,
+                      let id = txt["id"], id != me, seen.insert(id).inserted else { return nil }
+                return (name, r.endpoint)
+            }.sorted { $0.name < $1.name }
+            self?.rebuild()
+        }
+        b.start(queue: .main)
+        browser = b
+    }
+
+    @objc func pairWith(_ sender: NSMenuItem) {
+        guard pairing == nil, nearby.indices.contains(sender.tag) else { return }
+        let c = NWConnection(to: nearby[sender.tag].endpoint, using: NWParameters(tls: nil, tcp: tcpOptions()))
+        begin(PairSession(c, initiator: true))
+    }
+
+    func begin(_ s: PairSession) {
+        pairing = s
+        s.confirm = { [weak self] code, name, answer in self?.confirmCode(code, name, answer) }
+        s.onDone = { [weak self] p in self?.paired(p, s) }
+        s.start()
+    }
+
+    func confirmCode(_ code: String, _ name: String, _ answer: @escaping (Bool) -> Void) {
+        DispatchQueue.main.async {   // after any open menu closes
+            let a = NSAlert()
+            a.messageText = "Pair with \(name)?"
+            a.informativeText = "Check that \(name) shows the same code, then click Pair on both Macs. "
+                + "Paired Macs can open and control each other's apps."
+            let label = NSTextField(labelWithString: code)
+            label.font = .monospacedDigitSystemFont(ofSize: 34, weight: .semibold)
+            label.sizeToFit()
+            a.accessoryView = label
+            a.addButton(withTitle: "Pair")
+            a.addButton(withTitle: "Cancel")
+            NSApp.activate()
+            self.asking = true
+            let r = a.runModal()
+            self.asking = false
+            answer(r == .alertFirstButtonReturn)
+        }
+    }
+
+    func paired(_ p: Peer?, _ s: PairSession) {
+        pairing = nil
+        if asking { NSApp.abortModal() }   // the other side cancelled or went away
+        guard let p else {
+            if s.initiator, let why = s.failure {
+                let a = NSAlert()
+                a.messageText = "Couldn't pair"
+                a.informativeText = why
+                NSApp.activate()
+                a.runModal()
+            }
+            return
+        }
+        var all = Pairings.load()
+        all.peers.removeAll { $0.id == p.id || $0.name == p.name }
+        all.peers.append(p)
+        all.save()
+        log("paired with \(p.name)")
+        restartHost()   // it only lets in Macs it knew about when it started
+        if peer == nil || peer?.id == p.id || peer?.name == p.name {
+            peer = p
+            wire?.close()
+            wire = nil
+        }
+        rebuild()
+        refresh()
+    }
+
+    @objc func unpair() {
+        guard let p = peer else { return }
+        var all = Pairings.load()
+        all.peers.removeAll { $0.id == p.id }
+        all.save()
+        restartHost()
+        peer = all.peers.first
+        items = []
+        wire?.close()
+        wire = nil
+        rebuild()
+        refresh()
     }
 
     /// Loopback-only byte pipe: proxy ⇄ launcher ⇄ host. Keeps the per-app Local Network prompt away.
@@ -582,7 +699,8 @@ final class Launcher: NSObject, NSMenuDelegate {
         let params = NWParameters(tls: nil, tcp: tcpOptions())
         params.requiredInterfaceType = .loopback
         guard let l = try? NWListener(using: params, on: relayPort) else { return log("relay: port \(relayPort) busy") }
-        l.newConnectionHandler = { [host] local in
+        l.newConnectionHandler = { [relayHost] local in
+            guard let host = relayHost.withLock({ $0 }) else { return local.cancel() }
             let remote = NWConnection(host: NWEndpoint.Host(host), port: port, using: NWParameters(tls: nil, tcp: tcpOptions()))
             for c in [local, remote] {
                 c.stateUpdateHandler = { s in
@@ -605,10 +723,12 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     /// One long-lived control connection; each menu open asks for a fresh window list.
     func refresh() {
+        guard peer != nil else { return }
         if wire == nil {
-            let w = dial(host)
+            let w = dial(host), me = ObjectIdentifier(w)
             w.onClose = { [weak self] in
                 onMain {
+                    guard let cur = self?.wire, ObjectIdentifier(cur) == me else { return }   // already replaced (re-paired)
                     self?.wire = nil
                     self?.state = "can't reach \(self?.host ?? "")"
                     self?.rebuild()
@@ -641,15 +761,26 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func makeProxies(_ apps: [Item]) {
         for a in apps { if let icon = a.icon { icons[a.bundle] = icon } }
+        let host = host
         buildQ.async {
-            let made = apps.filter { (try? self.ensureProxy($0, icon: $0.icon))?.2 == true }.count
-            log("proxies: \(apps.count) apps on \(self.host), \(made) created/updated")
+            let made = apps.filter { (try? self.ensureProxy($0, icon: $0.icon, host: host))?.2 == true }.count
+            log("proxies: \(apps.count) apps on \(host), \(made) created/updated")
         }
         rebuild()
     }
 
     func rebuild() {
         menu.removeAllItems()
+        guard let peer else {   // not paired: offer the Macs we can see
+            menu.addItem(withTitle: "Not paired", action: nil, keyEquivalent: "").isEnabled = false
+            if nearby.isEmpty { menu.addItem(withTitle: "Looking for Macs running Hither…", action: nil, keyEquivalent: "").isEnabled = false }
+            for (i, n) in nearby.enumerated() {
+                let mi = menu.addItem(withTitle: "Pair with \(n.name)…", action: #selector(pairWith(_:)), keyEquivalent: "")
+                mi.target = self
+                mi.tag = i
+            }
+            return footer()
+        }
         menu.addItem(withTitle: state.isEmpty ? "On \(short(host))" : "\(short(host)): \(state)", action: nil, keyEquivalent: "").isEnabled = false
         var apps: [String] = []
         for i in items where !apps.contains(i.bundle) { apps.append(i.bundle) }
@@ -684,12 +815,17 @@ final class Launcher: NSObject, NSMenuDelegate {
         }
         codecItem.submenu = codecs
         // whole desktop: Apple's Screen Sharing does that job best, so just hand off to it
-        menu.addItem(withTitle: "Screen Share \(short(host))…", action: #selector(screenShare), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Screen Share \(peer.name)…", action: #selector(screenShare), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Unpair \(peer.name)", action: #selector(unpair), keyEquivalent: "").target = self
+        footer()
+    }
+
+    func footer() {
         menu.addItem(.separator())
         let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(withTitle: "Quit Unified Control", action: #selector(quit), keyEquivalent: "q").target = self
+        menu.addItem(withTitle: "Quit Hither", action: #selector(quit), keyEquivalent: "q").target = self
     }
 
     func icon(_ bundle: String) -> NSImage? {
@@ -704,7 +840,7 @@ final class Launcher: NSObject, NSMenuDelegate {
         return mi
     }
 
-    /// Apps opened through Unified Control, newest first (launching one that isn't running starts it on the host).
+    /// Apps opened through Hither, newest first (launching one that isn't running starts it on the host).
     var recent: [Item] {
         (UserDefaults.standard.array(forKey: "recent") as? [[String: String]] ?? []).compactMap { d in
             d["bundle"].map { Item(id: 0, app: d["app"] ?? $0, bundle: $0, title: "") }
@@ -730,10 +866,10 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func openItem(_ w: Item) {
         remember(w)
-        let icon = icons[w.bundle]
+        let icon = icons[w.bundle], host = host
         buildQ.async {   // same queue as the bulk proxy build, so they never write one bundle at once
             do {
-                let (url, id, _) = try self.ensureProxy(w, icon: icon)
+                let (url, id, _) = try self.ensureProxy(w, icon: icon, host: host)
                 DispatchQueue.main.async {
                     if let running = NSRunningApplication.runningApplications(withBundleIdentifier: id).first {
                         NSApp.yieldActivation(to: running)
@@ -751,18 +887,18 @@ final class Launcher: NSObject, NSMenuDelegate {
         rebuild()
     }
 
-    /// ~/Applications/Unified Control/<App> · <host>.app — a tiny bundle around this same binary, so the remote app
+    /// ~/Applications/Hither/<App> · <host>.app — a tiny bundle around this same binary, so the remote app
     /// gets its own name + icon in the Dock, Cmd-Tab and Spotlight. Rebuilt when this binary changes (unless running).
     /// Returns (bundle URL, bundle id, whether it was (re)built). Runs on buildQ.
-    func ensureProxy(_ w: Item, icon: Data?) throws -> (URL, String, Bool) {
+    func ensureProxy(_ w: Item, icon: Data?, host: String) throws -> (URL, String, Bool) {
         let fm = FileManager.default
-        let id = "dev.unified-control.proxy.\(short(host)).\(w.bundle)".filter { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
+        let id = "dev.hither.proxy.\(short(host)).\(w.bundle)".filter { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
         let name = "\(w.app) · \(short(host))"
-        let dir = fm.homeDirectoryForCurrentUser.appending(path: "Applications/Unified Control")
+        let dir = fm.homeDirectoryForCurrentUser.appending(path: "Applications/Hither")
         // reuse an existing bundle for this id even if the app's display name differs between sources
         let url = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: id).first { $0.path.hasPrefix(dir.path) }
             ?? dir.appending(path: "\(name.replacingOccurrences(of: "/", with: "-")).app")
-        let exe = url.appending(path: "Contents/MacOS/uc-viewer")
+        let exe = url.appending(path: "Contents/MacOS/hither")
         let mtime = { (u: URL) in try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
         if let theirs = mtime(exe), let mine = mtime(Bundle.main.executableURL!),
            theirs >= mine || !NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty { return (url, id, false) }
@@ -773,8 +909,8 @@ final class Launcher: NSObject, NSMenuDelegate {
         try fm.copyItem(at: Bundle.main.executableURL!, to: exe)   // APFS clone: ~no disk space per proxy
         var plist: [String: Any] = [
             "CFBundleIdentifier": id, "CFBundleName": name, "CFBundleDisplayName": name,
-            "CFBundleExecutable": "uc-viewer", "CFBundlePackageType": "APPL", "NSHighResolutionCapable": true,
-            "UCRole": "proxy", "UCHost": host, "UCApp": w.bundle,
+            "CFBundleExecutable": "hither", "CFBundlePackageType": "APPL", "NSHighResolutionCapable": true,
+            "HitherRole": "proxy", "HitherHost": host, "HitherApp": w.bundle,
         ]
         if let icon, writeICNS(icon, to: url.appending(path: "Contents/Resources/AppIcon.icns")) {
             plist["CFBundleIconFile"] = "AppIcon"
@@ -837,16 +973,19 @@ func writeICNS(_ png: Data, to url: URL) -> Bool {
 /// This Mac's own host (sharing its windows) runs as a helper inside our bundle. Started by us it gets our Screen
 /// Recording/Accessibility grants, a crash in capture/encode can't take the menu or relay down, and we restart it.
 /// It exits when we do.
+var hostProcess: Process?
 func startHost(_ out: FileHandle?) {
     let p = Process()
-    p.executableURL = Bundle.main.bundleURL.appending(path: "Contents/Helpers/Unified Control Host.app/Contents/MacOS/uc-host")
+    hostProcess = p
+    p.executableURL = Bundle.main.bundleURL.appending(path: "Contents/Helpers/Hither Host.app/Contents/MacOS/hither-host")
     p.standardError = out
     p.terminationHandler = { p in
-        out?.write(Data("[uc] host exited (\(p.terminationStatus)), restarting\n".utf8))
+        out?.write(Data("[hither] host exited (\(p.terminationStatus)), restarting\n".utf8))
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startHost(out) }
     }
     do { try p.run() } catch { log("host: \(error)") }
 }
+func restartHost() { hostProcess?.terminate() }   // its termination handler starts a fresh one
 
 // MARK: - main
 
@@ -857,12 +996,13 @@ var listWire: Wire?   // must outlive the `if` below
 switch role {
 case "launcher":
     app.setActivationPolicy(.accessory)
-    FileManager.default.createFile(atPath: "/tmp/uc-host.log", contents: nil)
-    startHost(FileHandle(forWritingAtPath: "/tmp/uc-host.log"))
+    _ = Pairings.load()   // create this Mac's ID before the host reads it
+    FileManager.default.createFile(atPath: "/tmp/hither-host.log", contents: nil)
+    startHost(FileHandle(forWritingAtPath: "/tmp/hither-host.log"))
     launcher = Launcher()
     launcher?.start()
 case "proxy":
-    let host = info["UCHost"] as! String, remoteApp = info["UCApp"] as! String
+    let host = info["HitherHost"] as! String, remoteApp = info["HitherApp"] as! String
     app.setActivationPolicy(.regular)
     let args = CommandLine.arguments
     let first = args.firstIndex(of: "--window").flatMap { args.indices.contains($0 + 1) ? Int(args[$0 + 1]) : nil } ?? 0
@@ -876,8 +1016,9 @@ case "proxy":
     }
 default:
     let args = CommandLine.arguments
+    if args.dropFirst().first == "--selftest" { pairSelfTest() }
     guard args.count >= 3 else {
-        print("usage: uc-viewer <host> <app> [window-title-substring]\n       uc-viewer <host> --list\n       uc-viewer <host> --codec h264|hevc|hevc422")
+        print("usage: hither <host> <app> [window-title-substring]\n       hither <host> --list\n       hither <host> --codec h264|hevc|hevc422")
         exit(1)
     }
     if args[2] == "--codec", args.count > 3 {   // same as the launcher's Video Codec menu

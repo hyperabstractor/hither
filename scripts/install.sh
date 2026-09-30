@@ -1,34 +1,30 @@
 #!/bin/bash
-# Build "Unified Control.app" and install it on a Mac. It shares that Mac's windows (its host runs as a helper
-# inside the app) and shows <peer>'s windows in its menu bar. Proxy apps ("Cursor · mini.app") are made on demand.
-# usage: scripts/install.sh [peer] [install-on]      (defaults: mini.local, this Mac)
-#   scripts/install.sh                          → this Mac shows the Mini's apps
-#   scripts/install.sh air.local mini.local     → the Mini shows the Air's apps
+# Build Hither.app and install it in ~/Applications, on this Mac or on another one over SSH.
+# Hither shares its Mac's windows (the host runs as a helper inside the app) and, once paired, shows the other
+# Mac's windows from its menu bar. Proxy apps ("Cursor · mini.app") are made on demand in ~/Applications/Hither.
+# usage: scripts/install.sh              → this Mac
+#        scripts/install.sh mini.local   → another Mac, over SSH
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/common.sh
-PEER=${1:-mini.local}
-ON=${2:-$(scutil --get LocalHostName).local}
-APP="build/Unified Control.app"
-# Restart on the new copy (open proxies relaunch the app the moment it dies, so the new one must already be in
-# place). The standalone host app this replaces goes too.
-RESTART='pkill -f "Unified Control.app/Contents/MacOS/uc-viewer"; pkill -x uc-host; rm -rf ~/Applications/UnifiedControlHost.app
-  sleep 1; open --stderr /tmp/uc-launcher.log ~/Applications/Unified\ Control.app'
+ON=${1:-}
+APP=build/Hither.app
+# Restart on the new copy (open proxies relaunch the app the moment it dies, so the new one must already be there).
+RESTART='pkill -f "Hither.app/Contents/MacOS/hither"; pkill -x hither-host; sleep 1; open --stderr /tmp/hither.log ~/Applications/Hither.app'
 
 swift build -c release
-bundle "$APP" dev.unified-control.launcher "Unified Control" uc-viewer \
-  "<key>UCRole</key><string>launcher</string><key>UCHost</key><string>$PEER</string>"
-bundle "$APP/Contents/Helpers/Unified Control Host.app" dev.unified-control.host "Unified Control Host" uc-host
+bundle "$APP" dev.hither.app Hither hither "<key>HitherRole</key><string>launcher</string>
+  <key>NSBonjourServices</key><array><string>_hither._tcp</string></array>
+  <key>NSLocalNetworkUsageDescription</key><string>Hither connects to your other Mac to show its windows.</string>"
+bundle "$APP/Contents/Helpers/Hither Host.app" dev.hither.host "Hither Host" hither-host
 sign "$APP"   # again, now that it holds the helper
 
-if [ "$ON" = "$(scutil --get LocalHostName).local" ]; then
+if [ -z "$ON" ] || [ "$ON" = "$(scutil --get LocalHostName).local" ]; then
   mkdir -p ~/Applications && rsync -a --delete "$APP" ~/Applications/
   eval "$RESTART" || true
 else
-  ssh "$ON" 'mkdir -p ~/Applications ~/.unified-control && chmod 700 ~/.unified-control'
-  scp -q ~/.unified-control/psk "$ON":.unified-control/psk
-  ssh "$ON" 'chmod 600 ~/.unified-control/psk'
+  ssh "$ON" 'mkdir -p ~/Applications'
   rsync -a --delete "$APP" "$ON":Applications/
   ssh "$ON" "$RESTART"
 fi
-echo "installed on $ON, showing $PEER's apps (host log: $ON:/tmp/uc-host.log)"
+echo "installed on ${ON:-this Mac}: pair from its menu bar icon (host log: /tmp/hither-host.log)"

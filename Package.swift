@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "unified-control",
+    name: "Hither",
     platforms: [.macOS(.v14)],
     targets: [
         .target(name: "Shared"),
-        .executableTarget(name: "uc-host", dependencies: ["Shared"]),
-        .executableTarget(name: "uc-viewer", dependencies: ["Shared"]),
+        .executableTarget(name: "hither-host", dependencies: ["Shared"]),
+        .executableTarget(name: "hither", dependencies: ["Shared"]),
     ]
 )
