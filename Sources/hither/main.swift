@@ -47,6 +47,7 @@ final class StreamView: NSView {
     var allSamples: [Double] = []
     var onLatency: (Int) -> Void = { _ in }
     var send: (Msg) -> Void = { _ in }
+    var remoteSize = CGSize.zero   // the host window's size in points
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -132,8 +133,18 @@ final class StreamView: NSView {
 
     func flags(_ e: NSEvent) -> UInt64 { UInt64(e.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue) }
 
+    /// A point in this view → the same spot in the host window. The video is aspect-fit, so when the sizes differ
+    /// (full screen here is taller than the host's display allows, or the app refused to shrink) it's scaled and
+    /// letterboxed, and input has to follow.
+    func remote(_ e: NSEvent) -> CGPoint {
+        let p = convert(e.locationInWindow, from: nil), r = remoteSize
+        guard r.width > 0, r.height > 0, bounds.width > 0, bounds.height > 0 else { return p }
+        let s = min(bounds.width / r.width, bounds.height / r.height)
+        return CGPoint(x: (p.x - (bounds.width - r.width * s) / 2) / s, y: (p.y - (bounds.height - r.height * s) / 2) / s)
+    }
+
     func mouse(_ e: NSEvent, _ kind: Int, _ button: Int) {
-        let p = convert(e.locationInWindow, from: nil)
+        let p = remote(e)
         var m = Msg("mouse")
         m.x = p.x; m.y = p.y; m.k = kind; m.b = button; m.f = flags(e)
         if kind == 1 || kind == 2 { m.c = e.clickCount }
@@ -152,7 +163,7 @@ final class StreamView: NSView {
     override func otherMouseDragged(with e: NSEvent) { mouse(e, 3, 2) }
 
     override func scrollWheel(with e: NSEvent) {
-        let p = convert(e.locationInWindow, from: nil)
+        let p = remote(e)
         var m = Msg("scroll")
         m.x = p.x; m.y = p.y; m.dx = e.scrollingDeltaX; m.dy = e.scrollingDeltaY; m.f = flags(e)
         m.p = cgPhase(e.phase); m.mp = cgMomentum(e.momentumPhase)
@@ -213,7 +224,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     var window: NSWindow?
     var wire: Wire?
     var appName = "", remoteTitle = "", latency = ""
-    var remoteSize = CGSize.zero
+    var remoteSize = CGSize.zero { didSet { view.remoteSize = remoteSize } }
     var retries = 0
     var done = false
 
