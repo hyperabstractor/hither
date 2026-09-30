@@ -1,6 +1,7 @@
 import AppKit
 import ScreenCaptureKit
 import VideoToolbox
+import IOKit.pwr_mgt
 import Network
 import Shared
 
@@ -26,6 +27,14 @@ let inputQ = DispatchQueue(label: "input")
 /// off both the session and input queues.
 let menuQ = DispatchQueue(label: "menu")
 var lastInputAt: CFTimeInterval = 0
+var wakeID: IOPMAssertionID = 0, lastWake: CFTimeInterval = 0
+/// Runs on inputQ. Remote use counts as someone at this Mac: wakes a sleeping display (capture needs it) and
+/// resets the idle timer, exactly like touching its own keyboard.
+func wake() {
+    guard CACurrentMediaTime() - lastWake > 1 else { return }
+    lastWake = CACurrentMediaTime()
+    IOPMAssertionDeclareUserActivity("Unified Control input" as CFString, kIOPMUserActiveLocal, &wakeID)
+}
 // new-window following (all on the main queue)
 var watchers: [ObjectIdentifier: Session] = [:]   // launcher connections that receive "appeared"
 var knownWindows: Set<CGWindowID> = []            // every window seen so far
@@ -102,6 +111,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         case "open":
             viewerHEVC = m.caps?.contains("hevc") == true   // older viewers only decode H.264
             viewerAudio = m.caps?.contains("audio") == true
+            inputQ.async { wake() }   // a sleeping display may give the new window no frames
             Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
         case "ack":
             unacked -= 1
@@ -119,6 +129,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             let path = m.path ?? []
             inputQ.async {
                 lastInputAt = CACurrentMediaTime()   // File › New Window etc. count as the user's doing
+                wake()
                 self.focus(force: false)   // e.g. File › Save acts on the key window, so make it ours
                 menuQ.async { if let e = self.menuItems(at: path.dropLast())?[safe: path.last ?? -1] { AXUIElementPerformAction(e, kAXPressAction as CFString) } }
             }
@@ -138,7 +149,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func candidates(_ c: SCShareableContent) -> [SCWindow] {
         c.windows.filter { $0.windowLayer == 0 && $0.frame.width > 100 && $0.owningApplication != nil
-            && $0.owningApplication!.bundleIdentifier != Bundle.main.bundleIdentifier }
+            && !isOurs($0.owningApplication!.bundleIdentifier) }
     }
 
     func list() async {
@@ -166,7 +177,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         for d in dirs {
             for name in ((try? fm.contentsOfDirectory(atPath: d)) ?? []).sorted() where name.hasSuffix(".app") {
                 let path = "\(d)/\(name)"
-                guard let b = Bundle(path: path), let id = b.bundleIdentifier, id != Bundle.main.bundleIdentifier,
+                guard let b = Bundle(path: path), let id = b.bundleIdentifier, !isOurs(id),
                       !["LSUIElement", "LSBackgroundOnly"].contains(where: { isTrue(b.object(forInfoDictionaryKey: $0)) }),  // menu-bar/agent apps
                       seen.insert(id).inserted else { continue }
                 let label = fm.displayName(atPath: path)
@@ -540,7 +551,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Runs on inputQ. `frame` is a snapshot taken on the session queue.
     func input(_ m: Msg, frame: CGRect) {
         guard pid != 0 else { return }
-        if m.t != "mouse" || m.k != 0 { lastInputAt = CACurrentMediaTime() }   // hover doesn't count
+        if m.t != "mouse" || m.k != 0 { lastInputAt = CACurrentMediaTime(); wake() }   // hover doesn't count
         let pt = CGPoint(x: frame.minX + (m.x ?? 0), y: frame.minY + (m.y ?? 0))
         let flags = CGEventFlags(rawValue: m.f ?? 0)
         switch m.t {
@@ -690,6 +701,10 @@ func describe(_ e: AXUIElement) -> MenuEntry {
 
 extension Array { subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil } }
 
+/// Unified Control's own apps (host, launcher, "Cursor · mini" proxies) are never offered: with both Macs hosting,
+/// the Air would otherwise stream its proxies of the Mini back to the Mini.
+func isOurs(_ bundle: String) -> Bool { bundle.hasPrefix("dev.unified-control.") }
+
 func isTrue(_ v: Any?) -> Bool { (v as? Bool) ?? ((v as? String).map { $0 == "1" || $0.lowercased() == "yes" || $0.lowercased() == "true" } ?? false) }
 
 func png(_ img: NSImage) -> Data? {
@@ -702,6 +717,10 @@ func png(_ img: NSImage) -> Data? {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+// Started by the Unified Control menu bar app, which restarts us if we die: go when it goes.
+let parentWatch = DispatchSource.makeProcessSource(identifier: getppid(), eventMask: .exit, queue: .main)
+parentWatch.setEventHandler { exit(0) }
+parentWatch.resume()
 AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)   // a hung app can't stall us for AX's default 6 s
 if !CGPreflightScreenCaptureAccess() { log("requesting Screen Recording permission"); CGRequestScreenCaptureAccess() }
 if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary) {
@@ -734,7 +753,7 @@ func watchWindows() {
         guard f.width > 100, f.height > 100,
               CACurrentMediaTime() - lastInputAt < 15 || sessions.values.contains(where: { $0.pid == pid }),
               let app = NSRunningApplication(processIdentifier: pid), app.activationPolicy == .regular,
-              let bundle = app.bundleIdentifier, !launchingApps.contains(bundle)
+              let bundle = app.bundleIdentifier, !isOurs(bundle), !launchingApps.contains(bundle)
         else { knownWindows.insert(id); continue }
         // only real windows: sheets and dialogs already show inside their parent's stream
         guard let standard = isStandardWindow(pid: pid, id: id) else {

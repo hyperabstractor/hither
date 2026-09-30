@@ -5,7 +5,7 @@
 .build/
 .swiftpm/
 
-# Local app bundles (scripts/deploy-host.sh, scripts/install-air.sh)
+# Local app bundles (scripts/install.sh)
 build/
 
 # Xcode

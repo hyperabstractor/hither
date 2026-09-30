@@ -43,7 +43,7 @@ public func log(_ s: String) { FileHandle.standardError.write(Data("[uc] \(s)\n"
 public func loadKey() -> Data {
     let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".unified-control/psk")
     guard let d = try? Data(contentsOf: url), d.count >= 32 else {
-        log("missing \(url.path) — run scripts/deploy-host.sh"); exit(1)
+        log("missing \(url.path) — run scripts/install.sh"); exit(1)
     }
     return d
 }

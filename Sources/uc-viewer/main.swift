@@ -834,6 +834,20 @@ func writeICNS(_ png: Data, to url: URL) -> Bool {
     do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
 }
 
+/// This Mac's own host (sharing its windows) runs as a helper inside our bundle. Started by us it gets our Screen
+/// Recording/Accessibility grants, a crash in capture/encode can't take the menu or relay down, and we restart it.
+/// It exits when we do.
+func startHost(_ out: FileHandle?) {
+    let p = Process()
+    p.executableURL = Bundle.main.bundleURL.appending(path: "Contents/Helpers/Unified Control Host.app/Contents/MacOS/uc-host")
+    p.standardError = out
+    p.terminationHandler = { p in
+        out?.write(Data("[uc] host exited (\(p.terminationStatus)), restarting\n".utf8))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startHost(out) }
+    }
+    do { try p.run() } catch { log("host: \(error)") }
+}
+
 // MARK: - main
 
 let app = NSApplication.shared
@@ -843,6 +857,8 @@ var listWire: Wire?   // must outlive the `if` below
 switch role {
 case "launcher":
     app.setActivationPolicy(.accessory)
+    FileManager.default.createFile(atPath: "/tmp/uc-host.log", contents: nil)
+    startHost(FileHandle(forWritingAtPath: "/tmp/uc-host.log"))
     launcher = Launcher()
     launcher?.start()
 case "proxy":
