@@ -148,8 +148,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: window selection
 
     func candidates(_ c: SCShareableContent) -> [SCWindow] {
-        c.windows.filter { $0.windowLayer == 0 && $0.frame.width > 100 && $0.owningApplication != nil
-            && !isOurs($0.owningApplication!.bundleIdentifier) }
+        c.windows.filter { w in
+            guard w.windowLayer == 0, w.frame.width > 100, let owner = w.owningApplication,
+                  !isOurs(owner.bundleIdentifier) else { return false }
+            let contained = c.windows.contains { other in
+                other.windowID != w.windowID && other.windowLayer == 0
+                    && other.owningApplication?.processID == owner.processID && other.frame.contains(w.frame)
+            }
+            return isIndependentWindow(pid: owner.processID, id: w.windowID, hasContainingWindow: contained) != false
+        }
     }
 
     func list() async {
@@ -191,12 +198,13 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func pick(_ c: SCShareableContent, _ app: String, _ title: String?, _ id: CGWindowID) -> SCWindow? {
-        let a = app.lowercased()
-        return candidates(c).first(where: { $0.windowID == id }) ?? candidates(c).filter({
-            let o = $0.owningApplication!
-            return (o.applicationName.lowercased().contains(a) || o.bundleIdentifier.lowercased() == a)
-                && (title == nil || ($0.title ?? "").localizedCaseInsensitiveContains(title!))
-        }).max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+        let windows = candidates(c)
+        let selected = WindowCandidate.select(from: windows.map { w in
+            let owner = w.owningApplication!
+            return WindowCandidate(id: Int(w.windowID), app: owner.applicationName, bundle: owner.bundleIdentifier,
+                                   title: w.title ?? "", area: w.frame.width * w.frame.height)
+        }, app: app, title: title, id: Int(id))
+        return windows.first { Int($0.windowID) == selected }
     }
 
     func open(_ app: String, _ title: String?, id: CGWindowID) async {
@@ -250,7 +258,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     /// (Screen Sharing connects/disconnects, monitor sleeps), so a stopped stream retries instead of dying.
     func capture() async {
         guard !ended else { return }
-        guard q.sync(execute: readFrame) != nil else { fail("window closed"); return q.async { self.wire.close() } }
+        guard q.sync(execute: readFrame) != nil else { return fail("window closed") }
         do {
             let c = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
             let setup: (SCContentFilter, SCStreamConfiguration)? = q.sync {
@@ -269,6 +277,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             if viewerAudio { try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQ) }
             try await s.startCapture()
             q.async {
+                guard !self.ended else { s.stopCapture { _ in }; return }
                 self.stream = s
                 self.forceKey = true
                 if self.timer == nil { self.startPolling() }
@@ -287,9 +296,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func fail(_ why: String) {
-        log(why)
-        var m = Msg("closed"); m.title = why
-        wire.send(m)
+        q.async {
+            guard !self.ended else { return }
+            self.ended = true
+            self.timer?.cancel(); self.timer = nil
+            log(why)
+            var m = Msg("closed"); m.title = why
+            // Let the terminal message drain before closing; otherwise the viewer mistakes closure for a network drop.
+            self.wire.sendAndClose(m)
+        }
     }
 
     /// Capture the whole app on the display (so menus, sheets, popovers, Open/Save panels come along),
@@ -343,7 +358,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func poll() {
-        guard let r = readFrame() else { fail("window closed"); return wire.close() }
+        guard !ended else { return }
+        guard let r = readFrame() else { return fail("window closed") }
         if r != frame {
             frame = r
             stream?.updateConfiguration(config()) { if let e = $0 { log("updateConfiguration: \(e)") } }
@@ -405,7 +421,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Encode the newest captured frame once the viewer has caught up (≤2 frames in flight). The Mac has one
     /// hardware encoder, so: focused window full rate; visible background ≤10 fps (2 while you type); hidden paused.
     func pump() {
-        guard visible, let p = pending, unacked < 2 else { return }
+        guard !ended, visible, let p = pending, unacked < 2 else { return }
         let busy = CACurrentMediaTime() - lastInputAt < 0.5
         let gap = windowID == lastRaised ? 0 : busy ? 0.5 : 0.1
         let wait = lastEncode + gap - CACurrentMediaTime()
@@ -759,7 +775,15 @@ func watchWindows() {
               let bundle = app.bundleIdentifier, !isOurs(bundle), !launchingApps.contains(bundle)
         else { knownWindows.insert(id); continue }
         // only real windows: sheets and dialogs already show inside their parent's stream
-        guard let standard = isStandardWindow(pid: pid, id: id) else {
+        let contained = list.contains { other in
+            guard (other[kCGWindowNumber as String] as? CGWindowID) != id,
+                  (other[kCGWindowOwnerPID as String] as? pid_t) == pid,
+                  (other[kCGWindowLayer as String] as? Int) == 0,
+                  let bounds = other[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+            return rect.contains(f)
+        }
+        guard let independent = isIndependentWindow(pid: pid, id: id, hasContainingWindow: contained) else {
             // brand-new windows can take a moment to appear to Accessibility; give it ~3 s
             axTries[id, default: 0] += 1
             if axTries[id]! >= 6 { knownWindows.insert(id); axTries[id] = nil }
@@ -767,7 +791,7 @@ func watchWindows() {
         }
         knownWindows.insert(id)
         axTries[id] = nil
-        if standard {
+        if independent {
             fresh.append(Item(id: Int(id), app: app.localizedName ?? "", bundle: bundle, title: w[kCGWindowName as String] as? String ?? ""))
         }
     }
@@ -779,11 +803,33 @@ func watchWindows() {
 var axTries: [CGWindowID: Int] = [:]
 
 /// nil = Accessibility doesn't list this window (yet).
-func isStandardWindow(pid: pid_t, id: CGWindowID) -> Bool? {
+func isIndependentWindow(pid: pid_t, id: CGWindowID, hasContainingWindow: Bool) -> Bool? {
     guard let w = axWindow(pid: pid, id: id) else { return nil }
     var v: CFTypeRef?
-    AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &v)
-    return (v as? String) == kAXStandardWindowSubrole
+    guard AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &v) == .success else { return nil }
+    guard (v as? String) == kAXStandardWindowSubrole else { return false }
+
+    var parentIsWindow = false
+    if AXUIElementCopyAttributeValue(w, kAXParentAttribute as CFString, &v) == .success,
+       let parent = v, CFGetTypeID(parent) == AXUIElementGetTypeID() {
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(parent as! AXUIElement, kAXRoleAttribute as CFString, &role)
+        parentIsWindow = (role as? String) == kAXWindowRole
+    }
+    let controls: [Bool?] = [kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute].map { key in
+        var value: CFTypeRef?
+        switch AXUIElementCopyAttributeValue(w, key as CFString, &value) {
+        case .success: return value != nil
+        case .attributeUnsupported, .noValue: return false
+        default: return nil
+        }
+    }
+    let hasControls: Bool? = controls.contains(true) ? true : controls.contains(where: { $0 == nil }) ? nil : false
+    var settable = DarwinBoolean(false)
+    let sizeResult = AXUIElementIsAttributeSettable(w, kAXSizeAttribute as CFString, &settable)
+    let traits = WindowTraits(standard: true, parentIsWindow: parentIsWindow, hasWindowControls: hasControls,
+                              resizable: sizeResult == .success ? settable.boolValue : nil, hasContainingWindow: hasContainingWindow)
+    return traits.isIndependent
 }
 Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in watchWindows() }
 

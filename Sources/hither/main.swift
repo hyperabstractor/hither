@@ -223,6 +223,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     let view = StreamView(frame: .zero)
     var window: NSWindow?
     var wire: Wire?
+    let activeWire = OSAllocatedUnfairLock<ObjectIdentifier?>(initialState: nil)
     var appName = "", remoteTitle = "", latency = ""
     var remoteSize = CGSize.zero { didSet { view.remoteSize = remoteSize } }
     var retries = 0
@@ -238,19 +239,39 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     }
 
     func connect() {
+        guard !done, wire == nil else { return }
         let w = dial(host)
-        w.onClose = { [weak self] in DispatchQueue.main.async { self?.lost() } }
-        w.onVideo = { [view, weak w] d in
-            w?.send(Msg("ack"))
-            DispatchQueue.main.async { view.show(d) }
+        w.onClose = { [weak self, weak w] in
+            DispatchQueue.main.async {
+                guard let self, let w, self.wire === w else { return }
+                self.activeWire.withLock { $0 = nil }
+                self.wire = nil
+                self.lost()
+            }
+        }
+        w.onVideo = { [weak self, weak w] d in
+            guard let self, let w, self.activeWire.withLock({ $0 == ObjectIdentifier(w) }) else { return }
+            w.send(Msg("ack"))
+            DispatchQueue.main.async { [weak self, weak w] in
+                guard let self, let w, self.wire === w, !self.done else { return }
+                self.view.show(d)
+            }
         }
         let me = ObjectIdentifier(self)
-        w.onAudio = { AudioOut.shared.play($0, from: me) }
-        w.onMsg = { [weak self] m in
+        w.onAudio = { [weak self, weak w] data in
+            guard let self, let w, self.activeWire.withLock({ $0 == ObjectIdentifier(w) }) else { return }
+            AudioOut.shared.play(data, from: me)
+        }
+        w.onMsg = { [weak self, weak w] m in
+            guard let self, let w, self.activeWire.withLock({ $0 == ObjectIdentifier(w) }) else { return }
             if m.t == "menu" { return RemoteMenus.shared.deliver(m) }
-            DispatchQueue.main.async { self?.handle(m) }
+            DispatchQueue.main.async { [weak self, weak w] in
+                guard let self, let w, self.wire === w, !self.done else { return }
+                self.handle(m)
+            }
         }
         wire = w
+        activeWire.withLock { $0 = ObjectIdentifier(w) }
         w.start()
         var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "audio"]
         w.send(m)
@@ -275,16 +296,33 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         switch m.t {
         case "closed": log(m.title ?? "closed"); finish()
         case "title": remoteTitle = m.title ?? ""; updateTitle()
-        case "opened" where window != nil:   // reconnected: same local window, re-sync its size to the host
-            retries = 0
-            if window?.isKeyWindow == true { wire?.send(Msg("focus")) }
-            sendVisibility()
-            remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
-            updateTitle()
-            windowDidResize(Notification(name: NSWindow.didResizeNotification))
         case "opened":
-            open(m)
-            RemoteMenus.shared.install()
+            let receivedID = m.k ?? 0
+            guard receivedID > 0, windowID == 0 || receivedID == windowID else {
+                log("rejected window \(receivedID) from \(host); expected \(windowID)")
+                return finish()
+            }
+            // A second launch or reconnect can target an already visible window on this host.
+            if let other = proxies.first(where: { $0 !== self && $0.host == host && $0.window != nil && $0.windowID == receivedID }) {
+                other.window?.makeKeyAndOrderFront(nil)
+                NSApp.activate()
+                return finish()
+            }
+            windowID = receivedID
+            if window != nil {   // reconnected: keep the local window, refresh metadata and size
+                retries = 0
+                appName = m.app ?? app
+                remoteTitle = m.title ?? ""
+                if let icon = m.icon.flatMap(NSImage.init(data:)) { NSApp.applicationIconImage = icon }
+                if window?.isKeyWindow == true { wire?.send(Msg("focus")) }
+                sendVisibility()
+                remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
+                updateTitle()
+                windowDidResize(Notification(name: NSWindow.didResizeNotification))
+            } else {
+                open(m)
+                RemoteMenus.shared.install()
+            }
         case "size":
             remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
             guard let w = window, !w.inLiveResize, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) else { return }
@@ -294,12 +332,6 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     }
 
     func open(_ m: Msg) {
-        // already showing that remote window (e.g. picked twice from the menu)? just bring it forward
-        if let other = proxies.first(where: { $0 !== self && $0.window != nil && $0.windowID == m.k }) {
-            other.window?.makeKeyAndOrderFront(nil)
-            NSApp.activate()
-            return finish()
-        }
         windowID = m.k ?? 0
         appName = m.app ?? app
         remoteTitle = m.title ?? ""
@@ -403,6 +435,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
 
     func finish() {
         done = true
+        activeWire.withLock { $0 = nil }
         wire?.close()
         window?.delegate = nil
         window?.close()
@@ -713,6 +746,13 @@ final class Launcher: NSObject, NSMenuDelegate {
         l.newConnectionHandler = { [relayHost] local in
             guard let host = relayHost.withLock({ $0 }) else { return local.cancel() }
             let remote = NWConnection(host: NWEndpoint.Host(host), port: port, using: NWParameters(tls: nil, tcp: tcpOptions()))
+            var finishedDirections = 0   // both pipe callbacks run on q
+            let finished: () -> Void = {
+                finishedDirections += 1
+                if finishedDirections == 2 {
+                    q.asyncAfter(deadline: .now() + 2) { local.cancel(); remote.cancel() }
+                }
+            }
             for c in [local, remote] {
                 c.stateUpdateHandler = { s in
                     switch s {
@@ -722,8 +762,8 @@ final class Launcher: NSObject, NSMenuDelegate {
                 }
                 c.start(queue: q)
             }
-            pipe(local, remote)
-            pipe(remote, local)
+            pipe(local, remote, onEOF: finished)
+            pipe(remote, local, onEOF: finished)
         }
         l.stateUpdateHandler = { if case .failed(let e) = $0 { log("relay: \(e)") } }
         l.start(queue: q)
@@ -967,11 +1007,19 @@ final class Launcher: NSObject, NSMenuDelegate {
     }
 }
 
-func pipe(_ from: NWConnection, _ to: NWConnection) {
+func pipe(_ from: NWConnection, _ to: NWConnection, onEOF: @escaping () -> Void) {
     from.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, eof, err in
+        if err != nil { from.cancel(); to.cancel(); return }
+        if eof {
+            // A read can contain the final ciphertext and EOF together. Forward both before cleanup.
+            to.send(content: data, contentContext: .finalMessage, isComplete: true,
+                    completion: .contentProcessed { error in
+                if error != nil { from.cancel(); to.cancel() } else { onEOF() }
+            })
+            return
+        }
         if let data, !data.isEmpty { to.send(content: data, completion: .idempotent) }
-        if eof || err != nil { from.cancel(); to.cancel(); return }
-        pipe(from, to)
+        pipe(from, to, onEOF: onEOF)
     }
 }
 

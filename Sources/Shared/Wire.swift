@@ -119,7 +119,9 @@ public final class Wire {
     public var onAudio: (Data) -> Void = { _ in }
     public var onClose: () -> Void = {}
     public var maxLen = Int.max   // cap it where the peer isn't authenticated yet (pairing)
+    private let sendLock = NSLock()  // audio, encoder and control messages arrive from different queues
     private var closed = false
+    private var closing = false
 
     public init(_ conn: NWConnection, queue: DispatchQueue) { self.conn = conn; self.queue = queue }
 
@@ -137,8 +139,10 @@ public final class Wire {
     }
 
     public func close() {
-        guard !closed else { return }
+        sendLock.lock()
+        guard !closed else { sendLock.unlock(); return }
         closed = true
+        sendLock.unlock()
         conn.cancel()
         onClose()
     }
@@ -170,10 +174,36 @@ public final class Wire {
     public func sendVideo(_ d: Data) { frame(2, d) }
     public func sendAudio(_ d: Data) { frame(3, d) }
 
+    /// Send the last control message and a TCP/TLS finish. Keep receiving until the peer closes,
+    /// with a bounded fallback for peers that never acknowledge the end of the stream.
+    public func sendAndClose(_ m: Msg) {
+        let d = framed(1, try! JSONEncoder().encode(m))
+        sendLock.lock()
+        guard !closed, !closing else { sendLock.unlock(); return }
+        closing = true
+        conn.send(content: d, contentContext: .finalMessage, isComplete: true,
+                  completion: .contentProcessed { [weak self] error in
+            if let error {
+                log("final send failed: \(error)")
+                self?.queue.async { self?.close() }
+            }
+        })
+        sendLock.unlock()
+        queue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.close() }
+    }
+
     private func frame(_ kind: UInt8, _ body: Data) {
+        let d = framed(kind, body)
+        sendLock.lock()
+        guard !closed, !closing else { sendLock.unlock(); return }
+        conn.send(content: d, completion: .idempotent)
+        sendLock.unlock()
+    }
+
+    private func framed(_ kind: UInt8, _ body: Data) -> Data {
         var d = Data(capacity: body.count + 5)
         d.put(kind); d.put(UInt32(body.count)); d.append(body)
-        conn.send(content: d, completion: .idempotent)
+        return d
     }
 }
 

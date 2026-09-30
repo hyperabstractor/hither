@@ -97,9 +97,12 @@ the menu bar app, so only Hither itself needs Local Network access.
 
 ```bash
 swift build
+swift run hither-tests                   # window lifecycle and transport regression checks (no Xcode needed)
 .build/debug/hither --selftest            # pairs with itself over loopback
 .build/debug/hither mini.local --list     # a paired Mac's windows
 .build/debug/hither mini.local Safari     # stream one window without the menu bar app
+# Optional: leave an app window open on the paired host; checks missing IDs directly and through Hither's relay.
+swift run hither-tests --remote mini.local com.apple.finder
 ```
 
 Logs: `/tmp/hither.log` (menu bar app) and `/tmp/hither-host.log` (host). `HITHER_BITRATE` sets the video bitrate
