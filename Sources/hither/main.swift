@@ -597,6 +597,74 @@ final class RemoteMenus: NSObject, NSMenuDelegate {
     }
 }
 
+/// One window row in the menu bar list: looks like a normal item, with an X that closes that remote window.
+final class CloseRow: NSView {
+    var hot = false
+    var lit = false
+    override var isOpaque: Bool { false }
+    override var allowsVibrancy: Bool { true }
+    var closeRect: NSRect { NSRect(x: bounds.width - 34, y: 0, width: 34, height: bounds.height) }
+    var glyphRect: NSRect { NSRect(x: bounds.width - 26, y: (bounds.height - 11) / 2, width: 11, height: 11) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let item = enclosingMenuItem else { return }
+        let on = item.isHighlighted
+        if on {
+            NSColor.selectedContentBackgroundColor.setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 5, dy: 1), xRadius: 5, yRadius: 5).fill()
+        }
+        let font = NSFont.menuFont(ofSize: 0)
+        var x = 14 + CGFloat(item.indentationLevel) * 12
+        if let image = item.image {
+            image.draw(in: NSRect(x: x, y: (bounds.height - 16) / 2, width: 16, height: 16))
+            x += 22
+        }
+        let shown = NSMutableAttributedString(attributedString: item.attributedTitle ?? NSAttributedString(string: item.title))
+        let full = NSRange(location: 0, length: shown.length)
+        if full.length > 0 {
+            shown.addAttribute(.font, value: font, range: full)
+            if on {
+                shown.addAttribute(.foregroundColor, value: NSColor.selectedMenuItemTextColor, range: full)
+            } else {
+                var bare: [NSRange] = []
+                shown.enumerateAttribute(.foregroundColor, in: full) { value, range, _ in if value == nil { bare.append(range) } }
+                for range in bare { shown.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range) }
+            }
+            let style = NSMutableParagraphStyle()
+            style.lineBreakMode = .byTruncatingTail
+            shown.addAttribute(.paragraphStyle, value: style, range: full)
+            shown.draw(with: NSRect(x: x, y: 3, width: max(0, glyphRect.minX - 8 - x), height: 18),
+                       options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+        }
+        let tint: NSColor = hot ? .systemRed : (on ? .selectedMenuItemTextColor : .secondaryLabelColor)
+        let mark = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close")!
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))!
+        (mark.withSymbolConfiguration(.init(paletteColors: [tint])) ?? mark).draw(in: glyphRect)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+    override func mouseMoved(with event: NSEvent) {
+        let on = closeRect.contains(convert(event.locationInWindow, from: nil))
+        let hi = enclosingMenuItem?.isHighlighted == true
+        if on != hot || hi != lit { hot = on; lit = hi; needsDisplay = true }
+    }
+    override func mouseExited(with event: NSEvent) { if hot { hot = false; needsDisplay = true } }
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        guard let item = enclosingMenuItem, let launcher = item.target as? Launcher else { return }
+        if closeRect.contains(convert(event.locationInWindow, from: nil)) {
+            DispatchQueue.main.async { [weak launcher] in launcher?.closeWindow(item) }   // hide after this click finishes
+            return
+        }
+        item.menu?.cancelTracking()
+        if let w = item.representedObject as? Item { launcher.openItem(w) }
+    }
+}
+
 // MARK: - launcher (menu bar)
 
 final class Launcher: NSObject, NSMenuDelegate {
@@ -772,6 +840,10 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func menuWillOpen(_ m: NSMenu) { refresh() }
 
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        menu.items.forEach { $0.view?.needsDisplay = true }
+    }
+
     /// One long-lived control connection; each menu open asks for a fresh window list.
     func refresh() {
         guard peer != nil else { return }
@@ -845,9 +917,10 @@ final class Launcher: NSObject, NSMenuDelegate {
                     t.append(NSAttributedString(string: w.title, attributes: [.foregroundColor: NSColor.secondaryLabelColor]))
                     mi.attributedTitle = t
                 }
+                pinClose(mi)
             } else {   // app row opens its main window; window rows open that exact window
                 add(wins[0].app, Item(id: 0, app: wins[0].app, bundle: b, title: ""), indent: 0).image = icon(b)
-                for w in wins { add(w.title.isEmpty ? "Untitled" : w.title, w, indent: 1) }
+                for w in wins { pinClose(add(w.title.isEmpty ? "Untitled" : w.title, w, indent: 1)) }
             }
         }
         menu.addItem(.separator())
@@ -892,6 +965,30 @@ final class Launcher: NSObject, NSMenuDelegate {
         mi.representedObject = item
         mi.indentationLevel = indent
         return mi
+    }
+
+    /// X on a real window (not the app header, which has no single window, and not Recent). Clicking the row still opens it.
+    func pinClose(_ mi: NSMenuItem) {
+        guard (mi.representedObject as? Item)?.id != 0 else { return }
+        let font = NSFont.menuFont(ofSize: 0)
+        let text = mi.attributedTitle?.string ?? mi.title
+        let textW = (text as NSString).size(withAttributes: [.font: font]).width
+        let width = 14 + CGFloat(mi.indentationLevel) * 12 + (mi.image == nil ? 0 : 22) + textW + 40
+        let view = CloseRow(frame: NSRect(x: 0, y: 0, width: width, height: 24))
+        view.autoresizingMask = [.width]
+        mi.view = view
+    }
+
+    /// Close that window on the host and drop the row. The menu stays open so several can go in one pass.
+    /// A window that refuses (a save sheet) is still there the next time the menu opens.
+    @objc func closeWindow(_ sender: NSMenuItem) {
+        guard let w = sender.representedObject as? Item, w.id != 0, let wire else { return }
+        var m = Msg("close"); m.k = w.id
+        wire.send(m)
+        items.removeAll { $0.id == w.id }
+        sender.isHidden = true
+        guard !items.contains(where: { $0.bundle == w.bundle && $0.id != 0 }), let menu = sender.menu else { return }
+        for item in menu.items where (item.representedObject as? Item)?.bundle == w.bundle { item.isHidden = true }
     }
 
     /// Apps opened through Hither, newest first (launching one that isn't running starts it on the host).

@@ -47,6 +47,20 @@ func axWindow(pid: pid_t, id: CGWindowID) -> AXUIElement? {
     return (v as? [AXUIElement])?.first { var w: CGWindowID = 0; return _AXUIElementGetWindow($0, &w) == .success && w == id }
 }
 
+/// Press this window's close button in place. Raising it first would steal the Mac's focus; a save sheet stays
+/// on the window, so a window that doesn't actually close remains in the next list.
+func pressClose(_ id: CGWindowID) {
+    guard id != 0,
+          let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]])?.first,
+          let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+          let win = axWindow(pid: pid, id: id) else { return log("close: window \(id) not found") }
+    var btn: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(win, kAXCloseButtonAttribute as CFString, &btn) == .success,
+          let btn, CFGetTypeID(btn) == AXUIElementGetTypeID() else { return log("close: window \(id) has no close button") }
+    let err = AXUIElementPerformAction(btn as! AXUIElement, kAXPressAction as CFString)
+    if err != .success { log("close: window \(id) press \(err.rawValue)") }
+}
+
 final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     let q = DispatchQueue(label: "session")
     let wire: Wire
@@ -139,6 +153,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             pump()   // newly visible: send whatever changed while hidden
         case "focus": if pid != 0 { inputQ.async { self.focus(force: false) } }   // proxy became the active window on the client
         case "resize": resize(m.w ?? frame.width, m.h ?? frame.height)
+        case "close": menuQ.async { pressClose(CGWindowID(m.k ?? 0)) }   // launcher menu's X; AX can block on a modal
         default:
             let f = frame
             inputQ.async { self.input(m, frame: f) }
