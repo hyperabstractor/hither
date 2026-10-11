@@ -62,6 +62,20 @@ Pairing is mutual, so both Macs can open each other's windows. Tick **Open at Lo
   goes to the app.
 - **Video Codec** in the menu switches every window between H.264, HEVC and HEVC 4:2:2.
 
+## iPhone
+
+`iOS/Hither.xcodeproj` is a viewer for iPhone and iPad. It shares nothing; it opens your Mac's windows one at a
+time, full screen. The Mac sizes the window to fit the phone and puts it back when you leave.
+
+- Build it with Xcode (sign in under Settings › Accounts and pick your team) and run it on your phone.
+- **Pair:** the Mac shows up under Nearby Macs. Tap it, check both screens show the same code, and click Pair on
+  the Mac too. Paired iPhones get their own **Unpair** item in the Mac's menu.
+- **Touch:** tap to click (tap again quickly for a double click), two-finger tap to right-click, drag to scroll,
+  touch and hold then drag to select or move things.
+- **Typing:** the keyboard button types into the window. The bar above the keyboard has esc, tab, arrows and
+  ⌃ ⌥ ⌘ ⇧, which apply to the next key or tap (⌘ then S saves).
+- **Window size:** Actual Size shows Mac points at iPhone size. More Space fits more in with smaller text.
+
 ## How it works
 
 The host side captures each window with ScreenCaptureKit and encodes it with VideoToolbox on the media engine. The
