@@ -40,7 +40,7 @@ func cgMomentum(_ p: NSEvent.Phase) -> Int {
 
 final class StreamView: NSView {
     let video = AVSampleBufferDisplayLayer()
-    var format: CMVideoFormatDescription?
+    var depacketizer = Depacketizer()
     var keySeq: UInt32 = 0
     var sentAt: [UInt32: CFTimeInterval] = [:]
     var samples: [Double] = []
@@ -64,47 +64,7 @@ final class StreamView: NSView {
     // MARK: video
 
     func show(_ packet: Data) {
-        var r = Reader(packet)
-        let seq = r.u32()
-        let pc = r.u8(), hevc = pc & 0x80 != 0
-        let params = (0..<Int(pc & 0x7f)).map { _ in r.bytes(Int(r.u16())) }
-        let body = r.rest()
-
-        if !params.isEmpty {
-            let bufs = params.map { p -> UnsafeMutablePointer<UInt8> in
-                let m = UnsafeMutablePointer<UInt8>.allocate(capacity: p.count)
-                p.copyBytes(to: m, count: p.count)
-                return m
-            }
-            defer { bufs.forEach { $0.deallocate() } }
-            var fd: CMFormatDescription?
-            let ptrs = bufs.map { UnsafePointer($0) }, sizes = params.map(\.count)
-            if hevc {
-                CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: nil, parameterSetCount: params.count, parameterSetPointers: ptrs,
-                    parameterSetSizes: sizes, nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &fd)
-            } else {
-                CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil, parameterSetCount: params.count, parameterSetPointers: ptrs,
-                    parameterSetSizes: sizes, nalUnitHeaderLength: 4, formatDescriptionOut: &fd)
-            }
-            if let fd { format = fd }
-        }
-        guard let format else { return }
-
-        var bb: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: body.count, blockAllocator: nil,
-            customBlockSource: nil, offsetToData: 0, dataLength: body.count, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &bb)
-        guard let bb else { return }
-        body.withUnsafeBytes { _ = CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: bb, offsetIntoDestination: 0, dataLength: body.count) }
-        var sb: CMSampleBuffer?
-        var size = body.count
-        CMSampleBufferCreateReady(allocator: nil, dataBuffer: bb, formatDescription: format, sampleCount: 1,
-            sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sb)
-        guard let sb else { return }
-        if let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) {
-            let dict = unsafeBitCast(CFArrayGetValueAtIndex(atts, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
+        guard let (seq, sb) = depacketizer.sampleBuffer(packet) else { return }
         let renderer = video.sampleBufferRenderer
         if renderer.status == .failed {
             log("decoder failed: \(renderer.error?.localizedDescription ?? "?") — asking for keyframe")
@@ -133,14 +93,10 @@ final class StreamView: NSView {
 
     func flags(_ e: NSEvent) -> UInt64 { UInt64(e.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue) }
 
-    /// A point in this view → the same spot in the host window. The video is aspect-fit, so when the sizes differ
-    /// (full screen here is taller than the host's display allows, or the app refused to shrink) it's scaled and
-    /// letterboxed, and input has to follow.
+    /// A point in this view → the same spot in the host window (full screen here is taller than the host's display
+    /// allows, so the video can be letterboxed).
     func remote(_ e: NSEvent) -> CGPoint {
-        let p = convert(e.locationInWindow, from: nil), r = remoteSize
-        guard r.width > 0, r.height > 0, bounds.width > 0, bounds.height > 0 else { return p }
-        let s = min(bounds.width / r.width, bounds.height / r.height)
-        return CGPoint(x: (p.x - (bounds.width - r.width * s) / 2) / s, y: (p.y - (bounds.height - r.height * s) / 2) / s)
+        remotePoint(convert(e.locationInWindow, from: nil), view: bounds.size, remote: remoteSize)
     }
 
     func mouse(_ e: NSEvent, _ kind: Int, _ button: Int) {
@@ -273,7 +229,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         wire = w
         activeWire.withLock { $0 = ObjectIdentifier(w) }
         w.start()
-        var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "audio"]
+        var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "hevc422", "audio"]
         w.send(m)
     }
 
@@ -443,58 +399,6 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         proxies.removeAll { $0 === self }
         AudioOut.shared.release(ObjectIdentifier(self), next: proxies.first { $0.window != nil }.map(ObjectIdentifier.init))
         if proxies.isEmpty && role != "launcher" { NSApp.terminate(nil) }
-    }
-}
-
-// MARK: - sound
-
-/// Plays the remote app's audio. Every window of the app receives it; only the owner (first open window) plays,
-/// so two Cursor windows don't sound twice, and another takes over when the owner closes.
-final class AudioOut {
-    static let shared = AudioOut()
-    let engine = AVAudioEngine(), node = AVAudioPlayerNode()
-    let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: false)!
-    let lock = NSLock()
-    var owner: ObjectIdentifier?
-    var queued = 0   // frames scheduled, not yet played
-
-    init() {
-        engine.attach(node)
-        engine.connect(node, to: engine.mainMixerNode, format: format)
-        if ProcessInfo.processInfo.environment["HITHER_TEST_AUDIO"] != nil {   // test hook: buffer depth + device delay
-            Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [self] _ in
-                lock.lock(); let q = queued; lock.unlock()
-                log("audio: buffered \(q * 1000 / 48_000) ms, output device \(Int(engine.outputNode.presentationLatency * 1000)) ms")
-            }
-        }
-    }
-
-    func claim(_ id: ObjectIdentifier) { lock.lock(); if owner == nil { owner = id }; lock.unlock() }
-    func release(_ id: ObjectIdentifier, next: ObjectIdentifier?) { lock.lock(); if owner == id { owner = next }; lock.unlock() }
-
-    /// Int16 interleaved stereo in. Start once ~30 ms is buffered (absorbs Wi-Fi jitter). Sound arrives and plays in
-    /// real time, so any surplus (a burst at start, the two Macs' clocks drifting) would never drain: past ~70 ms
-    /// buffered, drop the incoming ~20 ms chunk to stay in step with the video.
-    func play(_ pcm: Data, from id: ObjectIdentifier) {
-        lock.lock(); defer { lock.unlock() }
-        guard owner == id, queued < 3_360 else { return }
-        let frames = pcm.count / 4
-        guard frames > 0, let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)) else { return }
-        buf.frameLength = AVAudioFrameCount(frames)
-        pcm.withUnsafeBytes { raw in
-            let s = raw.bindMemory(to: Int16.self), l = buf.floatChannelData![0], r = buf.floatChannelData![1]
-            for i in 0..<frames { l[i] = Float(s[2 * i]) / 32768; r[i] = Float(s[2 * i + 1]) / 32768 }
-        }
-        if !engine.isRunning { try? engine.start() }
-        queued += frames
-        node.scheduleBuffer(buf) { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            self.queued -= frames
-            if self.queued == 0 { self.node.pause() }   // ran dry: re-buffer before resuming
-            self.lock.unlock()
-        }
-        if !node.isPlaying && queued >= 1_440 { node.play() }
     }
 }
 
@@ -668,7 +572,7 @@ final class CloseRow: NSView {
 // MARK: - launcher (menu bar)
 
 final class Launcher: NSObject, NSMenuDelegate {
-    /// The Mac whose windows this menu shows (the first one paired). nil until paired.
+    /// The Mac whose windows this menu shows (the first one paired; iPhones only view). nil until paired.
     var peer: Peer? { didSet { relayHost.withLock { $0 = peer == nil ? nil : host } } }
     var host: String { "\(peer?.name ?? "").local" }
     let relayHost = OSAllocatedUnfairLock<String?>(initialState: nil)   // read on the relay queue
@@ -691,7 +595,7 @@ final class Launcher: NSObject, NSMenuDelegate {
         status.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Hither")
         menu.delegate = self
         status.menu = menu
-        peer = Pairings.load().peers.first
+        peer = Pairings.load().peers.first { $0.viewer != true }
         rebuild()
         refresh()
         startRelay()
@@ -703,7 +607,7 @@ final class Launcher: NSObject, NSMenuDelegate {
     /// Always listening (and advertised) so the other Mac can start pairing; nothing is stored until you click Pair here.
     func startPairing() {
         if let l = try? NWListener(using: NWParameters(tls: nil, tcp: tcpOptions()), on: pairPort) {
-            l.service = NWListener.Service(name: localName(), type: serviceType, txtRecord: NWTXTRecord(["id": Pairings.load().id]))
+            l.service = service()
             l.newConnectionHandler = { [weak self] c in
                 guard let self, pairing == nil else { return c.cancel() }   // one at a time
                 begin(PairSession(c, initiator: false))
@@ -729,6 +633,11 @@ final class Launcher: NSObject, NSMenuDelegate {
         browser = b
     }
 
+    /// Bonjour: who this Mac is, and whether it shares its windows (an iPhone only offers Macs that do).
+    func service() -> NWListener.Service {
+        NWListener.Service(name: localName(), type: serviceType, txtRecord: NWTXTRecord(["id": Pairings.load().id, "shares": sharing ? "1" : "0"]))
+    }
+
     @objc func pairWith(_ sender: NSMenuItem) {
         guard pairing == nil, nearby.indices.contains(sender.tag) else { return }
         let c = NWConnection(to: nearby[sender.tag].endpoint, using: NWParameters(tls: nil, tcp: tcpOptions()))
@@ -743,11 +652,15 @@ final class Launcher: NSObject, NSMenuDelegate {
     }
 
     func confirmCode(_ code: String, _ name: String, _ answer: @escaping (Bool) -> Void) {
+        let viewer = pairing?.theyView == true
         DispatchQueue.main.async {   // after any open menu closes
             let a = NSAlert()
             a.messageText = "Pair with \(name)?"
-            a.informativeText = "Check that \(name) shows the same code, then click Pair on both Macs. "
-                + "Paired Macs can open and control each other's apps."
+            a.informativeText = viewer
+                ? "Check that \(name) shows the same code, then click Pair here and tap Pair on \(name). "
+                    + "\(name) will be able to open and control this Mac's apps."
+                : "Check that \(name) shows the same code, then click Pair on both Macs. "
+                    + "Paired Macs can open and control each other's apps."
             let label = NSTextField(labelWithString: code)
             label.font = .monospacedDigitSystemFont(ofSize: 34, weight: .semibold)
             label.sizeToFit()
@@ -780,8 +693,8 @@ final class Launcher: NSObject, NSMenuDelegate {
         all.peers.append(p)
         all.save()
         log("paired with \(p.name)")
-        restartHost()   // it only lets in Macs it knew about when it started
-        if peer == nil || peer?.id == p.id || peer?.name == p.name {
+        restartHost()   // it only lets in devices it knew about when it started
+        if p.viewer != true, peer == nil || peer?.id == p.id || peer?.name == p.name {
             peer = p
             wire?.close()
             wire = nil
@@ -796,7 +709,7 @@ final class Launcher: NSObject, NSMenuDelegate {
         all.peers.removeAll { $0.id == p.id }
         all.save()
         restartHost()
-        peer = all.peers.first
+        peer = all.peers.first { $0.viewer != true }
         items = []
         wire?.close()
         wire = nil
@@ -946,6 +859,11 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func footer() {
         menu.addItem(.separator())
+        for v in Pairings.load().peers where v.viewer == true {
+            let mi = menu.addItem(withTitle: "Unpair \(v.name)", action: #selector(unpairViewer(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = v.id
+        }
         let share = menu.addItem(withTitle: "Share This Mac", action: #selector(toggleSharing), keyEquivalent: "")
         share.target = self
         share.state = sharing ? .on : .off
@@ -953,6 +871,15 @@ final class Launcher: NSObject, NSMenuDelegate {
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(withTitle: "Quit Hither", action: #selector(quit), keyEquivalent: "q").target = self
+    }
+
+    /// An iPhone: it can no longer connect once the host restarts without its key.
+    @objc func unpairViewer(_ sender: NSMenuItem) {
+        var all = Pairings.load()
+        all.peers.removeAll { $0.id == sender.representedObject as? String }
+        all.save()
+        restartHost()
+        rebuild()
     }
 
     func icon(_ bundle: String) -> NSImage? {
@@ -1093,6 +1020,7 @@ final class Launcher: NSObject, NSMenuDelegate {
     @objc func toggleSharing() {
         sharing.toggle()
         sharing ? startHost() : stopHost()
+        pairListener?.service = service()
         rebuild()
     }
 

@@ -96,7 +96,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var lastEncode: CFTimeInterval = 0
     var codec = "h264"
     var viewerHEVC = false
+    var viewer422 = false
     var viewerAudio = false
+    var original: CGRect?            // the window's frame before a viewer that asked for "restore" resized it
     let audioQ = DispatchQueue(label: "audio")
     var nAudio = 0
     var audioPeak: Float = 0   // loudest sample in the stats window: 0 = silence
@@ -124,7 +126,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         case "apps": Task { apps() }
         case "open":
             viewerHEVC = m.caps?.contains("hevc") == true   // older viewers only decode H.264
+            viewer422 = m.caps?.contains("hevc422") == true   // an iPhone may not decode 4:2:2
             viewerAudio = m.caps?.contains("audio") == true
+            if m.caps?.contains("restore") == true { original = .zero }   // filled in once the window is known
             inputQ.async { wake() }   // a sleeping display may give the new window no frames
             Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
         case "ack":
@@ -248,12 +252,13 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             let owner = win.owningApplication!
             q.sync {
                 pid = owner.processID
-                codec = viewerHEVC ? currentCodec() : "h264"
+                codec = viewerCodec()
                 if case .hostPort(_, let port) = wire.conn.endpoint { appName = "\(owner.applicationName):\(port)" }
                 else { appName = owner.applicationName }
                 windowID = win.windowID
                 ax = axWindow(pid: pid, id: windowID)
                 frame = win.frame
+                if original != nil { original = win.frame }
             }
             var m = Msg("opened")
             m.app = owner.applicationName
@@ -377,7 +382,18 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let r = readFrame() else { return fail("window closed") }
         if r != frame {
             frame = r
-            stream?.updateConfiguration(config()) { if let e = $0 { log("updateConfiguration: \(e)") } }
+            // Moved where capture can't follow (partly off its display, onto another): the stream would keep the old
+            // rect, now empty, and the viewer would see black. Set up capture again, which brings the window back.
+            stream?.updateConfiguration(config()) { [weak self] e in
+                guard let self, let e else { return }
+                log("updateConfiguration for \(r): \(e.localizedDescription), reattaching")
+                q.async {
+                    guard let s = self.stream else { return }
+                    self.stream = nil
+                    s.stopCapture { _ in }
+                    self.retry()
+                }
+            }
             var m = Msg("size"); m.w = r.width; m.h = r.height
             wire.send(m)
         }
@@ -403,11 +419,18 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func resize(_ w: Double, _ h: Double) {
         guard let ax else { return log("resize: no AX handle for window \(windowID)") }
-        var size = CGSize(width: w, height: h)
+        let size = CGSize(width: w, height: h)
         var pos = frame.origin
         if let d = display?.frame, !d.contains(CGRect(origin: pos, size: size)) { pos = d.origin }  // AX clamps below the menu bar
-        // Chromium/Electron apps ignore AX resizes while AXEnhancedUserInterface is on; switch it off around
-        // the resize, and do size→position→size like Rectangle (a move can be refused until the size fits).
+        place(ax, size, pos)
+        if stream != nil { poll() } else { frame = readFrame() ?? frame }
+    }
+
+    /// Chromium/Electron apps ignore AX resizes while AXEnhancedUserInterface is on; switch it off around
+    /// the resize, and do size→position→size like Rectangle (a move can be refused until the size fits).
+    func place(_ ax: AXUIElement, _ size: CGSize, _ pos: CGPoint) {
+        var size = size, pos = pos
+        let (w, h) = (size.width, size.height)
         let app = AXUIElementCreateApplication(pid), enhanced = "AXEnhancedUserInterface" as CFString
         var was: CFTypeRef?
         AXUIElementCopyAttributeValue(app, enhanced, &was)
@@ -418,7 +441,6 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         if (was as? Bool) == true { AXUIElementSetAttributeValue(app, enhanced, kCFBooleanTrue) }
         if err != .success { log("resize to \(Int(w))×\(Int(h)) failed: \(err.rawValue)") }
         q.asyncAfter(deadline: .now() + 0.5) { log("resize \(Int(w))×\(Int(h)) (enhanced=\(was.map { "\($0)" } ?? "nil")) → \(self.readFrame().map { "\($0.size)" } ?? "nil")") }
-        if stream != nil { poll() } else { frame = readFrame() ?? frame }
     }
 
     // MARK: capture → encode → send
@@ -493,7 +515,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Codec changed from the launcher: new encoder now, and re-send the current picture so the switch shows at once.
     func applyCodec() {
         q.async {
-            let c = self.viewerHEVC ? currentCodec() : "h264"
+            let c = self.viewerCodec()
             guard c != self.codec, self.pid != 0 else { return }
             let recapture = (c == "hevc422") != (self.codec == "hevc422")   // capture pixel format differs
             self.codec = c
@@ -503,6 +525,12 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             if self.pending == nil { self.pending = self.lastFrame }
             self.pump()
         }
+    }
+
+    /// The chosen codec, stepped down to what this viewer decodes.
+    func viewerCodec() -> String {
+        let c = currentCodec()
+        return !viewerHEVC ? "h264" : c == "hevc422" && !viewer422 ? "hevc" : c
     }
 
     func encode(_ px: CVPixelBuffer) {
@@ -593,6 +621,19 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             if m.rep == true { e.setIntegerValueField(.keyboardEventAutorepeat, value: 1) }
             e.post(tap: .cghidEventTap)
             if let s = m.seq { q.async { self.inputSeq = s } }
+        case "text":
+            focus(force: false)
+            // one key event per character carrying the character itself, so the layout and key codes don't matter
+            for ch in m.text ?? "" {
+                let units = Array(String(ch).utf16)
+                for down in [true, false] {
+                    guard let e = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) else { continue }
+                    e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+                    e.flags = []
+                    e.post(tap: .cghidEventTap)
+                }
+            }
+            if let s = m.seq { q.async { self.inputSeq = s } }
         case "flags":
             guard let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(m.k ?? 0), keyDown: true) else { return }
             e.type = .flagsChanged
@@ -664,6 +705,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         ended = true
+        if let o = original, o != .zero, let ax, readFrame()?.size != o.size { place(ax, o.size, o.origin) }   // the phone let go
         let id = ObjectIdentifier(self)
         DispatchQueue.main.async { watchers[id] = nil }
         timer?.cancel(); timer = nil
@@ -671,46 +713,6 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         if let e = encoder { VTCompressionSessionInvalidate(e) }; encoder = nil
         onEnd()
     }
-}
-
-/// Video packet: [inputSeq u32][paramCount u8, bit 7 = HEVC]([len u16][parameter set])*[length-prefixed NAL units]
-func packet(_ sb: CMSampleBuffer, _ seq: UInt32) -> Data {
-    var d = Data()
-    d.put(seq)
-    let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[CFString: Any]]
-    let isKey = !((atts?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false)
-    var params: [Data] = []
-    let hevc = sb.formatDescription.map { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_HEVC } ?? false
-    if isKey, let fd = sb.formatDescription, hevc {
-        var n = 0
-        CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: 0, parameterSetPointerOut: nil,
-                                                           parameterSetSizeOut: nil, parameterSetCountOut: &n, nalUnitHeaderLengthOut: nil)
-        for i in 0..<n {
-            var p: UnsafePointer<UInt8>?, len = 0
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: i, parameterSetPointerOut: &p,
-                                                               parameterSetSizeOut: &len, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
-            if let p { params.append(Data(bytes: p, count: len)) }
-        }
-    } else if isKey, let fd = sb.formatDescription {
-        var n = 0
-        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, parameterSetIndex: 0, parameterSetPointerOut: nil,
-                                                           parameterSetSizeOut: nil, parameterSetCountOut: &n, nalUnitHeaderLengthOut: nil)
-        for i in 0..<n {
-            var p: UnsafePointer<UInt8>?, len = 0
-            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, parameterSetIndex: i, parameterSetPointerOut: &p,
-                                                               parameterSetSizeOut: &len, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
-            if let p { params.append(Data(bytes: p, count: len)) }
-        }
-    }
-    d.put(UInt8(params.count) | (hevc ? 0x80 : 0))   // high bit: HEVC parameter sets (VPS/SPS/PPS)
-    for p in params { d.put(UInt16(p.count)); d.append(p) }
-    if let bb = sb.dataBuffer {
-        let len = CMBlockBufferGetDataLength(bb)
-        var body = Data(count: len)
-        body.withUnsafeMutableBytes { _ = CMBlockBufferCopyDataBytes(bb, atOffset: 0, dataLength: len, destination: $0.baseAddress!) }
-        d.append(body)
-    }
-    return d
 }
 
 func children(_ e: AXUIElement) -> [AXUIElement] {

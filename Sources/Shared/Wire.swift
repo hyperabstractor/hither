@@ -1,7 +1,9 @@
 import Foundation
 import Network
 import Security
+#if os(macOS)
 import SystemConfiguration
+#endif
 
 public let port: NWEndpoint.Port = 7420
 public let relayPort: NWEndpoint.Port = 7421   // launcher's loopback relay on the client Mac
@@ -14,12 +16,15 @@ public struct Msg: Codable {
     public var app: String?, title: String?, icon: Data?
     public var w: Double?, h: Double?, x: Double?, y: Double?, dx: Double?, dy: Double?
     public var k: Int?, b: Int?, c: Int?, p: Int?, mp: Int?
+    public var text: String?         // "text": typed characters (iPhone keyboard), not key codes
     public var f: UInt64?, seq: UInt32?
     public var down: Bool?, rep: Bool?
     public var items: [Item]?
     public var path: [Int]?          // menu path: indices from the menu bar down
     public var menu: [MenuEntry]?
-    public var caps: [String]?       // viewer → host on "open": decoders it has beyond H.264 (e.g. "hevc")
+    /// viewer → host on "open": what it can do beyond H.264 ("hevc", "hevc422", "audio"), and "restore" = put the window
+    /// back to its own size when done (a phone borrows windows); in "pair1"/"pair2", "viewer" = a device that only views
+    public var caps: [String]?
     public var codec: String?        // "h264" | "hevc" | "hevc422": host's current choice (in "windows"), or a new one ("codec")
     public var peer: String?, name: String?, key: Data?, nonce: Data?, commit: Data?   // pairing
     public init(_ t: String) { self.t = t }
@@ -43,6 +48,7 @@ public struct Item: Codable {
 
 public func log(_ s: String) { FileHandle.standardError.write(Data("[hither] \(s)\n".utf8)) }
 
+#if os(macOS)
 /// ~/.hither: pairings and settings, readable by you only.
 public let configDir: URL = {
     let d = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".hither")
@@ -55,30 +61,63 @@ public let configDir: URL = {
 public func localName() -> String {
     SCDynamicStoreCopyLocalHostName(nil) as String? ?? ProcessInfo.processInfo.hostName
 }
+#else
+/// "iPhone" or "iPad": what the Mac calls this device when pairing. (The user's own device name needs an entitlement.)
+public func localName() -> String {
+    var u = utsname()
+    uname(&u)
+    let machine = withUnsafeBytes(of: u.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+    let model = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] ?? machine   // "iPhone17,1"
+    return String(model.prefix { $0.isLetter })
+}
+#endif
 
-/// A Mac this one is paired with. Pairing is mutual: each can open the other's windows.
+/// A device this one is paired with. Pairing between Macs is mutual: each can open the other's windows.
+/// A `viewer` (iPhone) only opens this Mac's windows; it shares none of its own.
 public struct Peer: Codable {
     public var id: String, name: String, token: Data
-    public init(id: String, name: String, token: Data) { self.id = id; self.name = name; self.token = token }
+    public var viewer: Bool?
+    public init(id: String, name: String, token: Data, viewer: Bool? = nil) {
+        self.id = id; self.name = name; self.token = token; self.viewer = viewer
+    }
 }
 
-/// This Mac's ID and its pairings, in ~/.hither/pairings.json.
+/// This device's ID and its pairings: ~/.hither/pairings.json on a Mac, the Keychain on iPhone.
 public struct Pairings: Codable {
     public var id: String
     public var peers: [Peer]
-    static let url = configDir.appending(path: "pairings.json")
 
     public static func load() -> Pairings {
-        if let d = try? Data(contentsOf: url), let p = try? JSONDecoder().decode(Pairings.self, from: d) { return p }
+        if let d = read(), let p = try? JSONDecoder().decode(Pairings.self, from: d) { return p }
         let p = Pairings(id: UUID().uuidString, peers: [])
         p.save()
         return p
     }
 
     public func save() {
-        try? JSONEncoder().encode(self).write(to: Self.url, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.url.path)
+        try? Self.write(JSONEncoder().encode(self))
     }
+
+    #if os(macOS)
+    static let url = configDir.appending(path: "pairings.json")
+    static func read() -> Data? { try? Data(contentsOf: url) }
+    static func write(_ d: Data) throws {
+        try d.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+    #else
+    static let item: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: "dev.hither", kSecAttrAccount: "pairings"]
+    static func read() -> Data? {
+        var v: CFTypeRef?
+        guard SecItemCopyMatching(item.merging([kSecReturnData: true]) { $1 } as CFDictionary, &v) == errSecSuccess else { return nil }
+        return v as? Data
+    }
+    static func write(_ d: Data) throws {
+        if SecItemUpdate(item as CFDictionary, [kSecValueData: d] as CFDictionary) == errSecItemNotFound {
+            SecItemAdd(item.merging([kSecValueData: d, kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]) { $1 } as CFDictionary, nil)
+        }
+    }
+    #endif
 
     /// Client side of a connection to `host` ("mini.local" or "mini"): our ID with that pair's key.
     public func tls(to host: String) -> NWParameters {

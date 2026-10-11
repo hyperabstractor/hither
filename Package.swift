@@ -3,7 +3,10 @@ import PackageDescription
 
 let package = Package(
     name: "Hither",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v14), .iOS(.v17)],
+    products: [
+        .library(name: "Shared", targets: ["Shared"]),   // also used by the iPhone app in iOS/
+    ],
     targets: [
         .target(name: "Shared"),
         .executableTarget(name: "hither-host", dependencies: ["Shared"]),
