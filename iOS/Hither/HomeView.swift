@@ -1,7 +1,7 @@
 import Shared
 import SwiftUI
 
-/// The paired Mac's open windows (tap one to show it), its apps, and Macs nearby to pair with.
+/// Each paired Mac's open windows (tap one to show it) and apps, and Macs nearby to pair with.
 struct HomeView: View {
     @ObservedObject var macs: Macs
     @State private var showing: Showing?
@@ -14,25 +14,25 @@ struct HomeView: View {
     var body: some View {
         NavigationStack {
             List {
-                if let mac = macs.mac {
-                    Section("Windows on \(mac.name)") {
-                        if macs.macStopsSharing {
+                ForEach(macs.paired, id: \.id) { mac in
+                    let windows = macs.windows[mac.id] ?? []
+                    Section(mac.name) {
+                        if macs.stopsSharing(mac) {
                             Text("\(mac.name) isn't sharing its windows. Turn on Share This Mac in Hither's menu there.")
                                 .foregroundStyle(.secondary)
-                        } else if macs.windows.isEmpty {
-                            Text(macs.state.isEmpty ? "No windows open" : macs.state).foregroundStyle(.secondary)
+                        } else if windows.isEmpty {
+                            Text(macs.state[mac.id, default: ""].isEmpty ? "No windows open" : macs.state[mac.id]!)
+                                .foregroundStyle(.secondary)
                         }
-                        ForEach(macs.windows, id: \.id) { w in
-                            Button { show(w) } label: { AppRow(item: w, icon: macs.icons[w.bundle], detail: w.title) }
-                                .swipeActions { Button("Close", role: .destructive) { macs.close(w) } }
+                        ForEach(windows, id: \.id) { w in
+                            Button { show(w, on: mac) } label: { AppRow(item: w, icon: macs.icons[w.bundle], detail: w.title) }
+                                .swipeActions { Button("Close", role: .destructive) { macs.close(w, on: mac) } }
                         }
-                    }
-                    Section {
-                        NavigationLink("All Apps") { AppsView(macs: macs) { show($0) } }
+                        NavigationLink("All Apps") { AppsView(macs: macs, mac: mac) { show($0, on: mac) } }
                     }
                 }
                 let unpaired = macs.nearby.filter { n in !macs.paired.contains { $0.id == n.id } }
-                if macs.mac == nil || !unpaired.isEmpty {
+                if macs.paired.isEmpty || !unpaired.isEmpty {
                     Section {
                         if unpaired.isEmpty {
                             HStack(spacing: 10) { ProgressView(); Text("Looking for Macs running Hither…").foregroundStyle(.secondary) }
@@ -58,9 +58,11 @@ struct HomeView: View {
             .navigationTitle("Hither")
             .refreshable { await MainActor.run { macs.refresh() } }
             .toolbar {
-                if let mac = macs.mac {
+                if !macs.paired.isEmpty {
                     Menu {
-                        Button("Unpair \(mac.name)", systemImage: "xmark.circle", role: .destructive) { macs.unpair() }
+                        ForEach(macs.paired, id: \.id) { mac in
+                            Button("Unpair \(mac.name)", systemImage: "xmark.circle", role: .destructive) { macs.unpair(mac) }
+                        }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -76,9 +78,8 @@ struct HomeView: View {
         .fullScreenCover(item: $showing, onDismiss: { macs.refresh() }) { StreamScreen(host: $0.host, item: $0.item) }
     }
 
-    func show(_ item: Item) {
-        guard let host = macs.host else { return }
-        showing = Showing(host: host, item: item)
+    func show(_ item: Item, on mac: Peer) {
+        showing = Showing(host: Macs.host(mac), item: item)
     }
 }
 
@@ -104,18 +105,20 @@ struct AppRow: View {
 /// Every app installed on the Mac. Opening one that isn't running launches it there.
 struct AppsView: View {
     @ObservedObject var macs: Macs
+    let mac: Peer
     let open: (Item) -> Void
     @State private var search = ""
 
     var body: some View {
-        let shown = search.isEmpty ? macs.apps : macs.apps.filter { $0.app.localizedCaseInsensitiveContains(search) }
+        let apps = macs.apps[mac.id] ?? []
+        let shown = search.isEmpty ? apps : apps.filter { $0.app.localizedCaseInsensitiveContains(search) }
         List(shown, id: \.bundle) { a in
             Button { open(a) } label: { AppRow(item: a, icon: macs.icons[a.bundle], detail: "") }
         }
-        .overlay { if macs.apps.isEmpty { ProgressView() } }
+        .overlay { if apps.isEmpty { ProgressView() } }
         .searchable(text: $search)
-        .navigationTitle("Apps on \(macs.mac?.name ?? "Mac")")
-        .onAppear { if macs.apps.isEmpty { macs.loadApps() } }
+        .navigationTitle("Apps on \(mac.name)")
+        .onAppear { if apps.isEmpty { macs.loadApps(mac) } }
     }
 }
 

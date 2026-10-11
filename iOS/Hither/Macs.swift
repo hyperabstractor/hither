@@ -15,32 +15,31 @@ struct CodePrompt: Identifiable {
     let answer: (Bool) -> Void
 }
 
-/// Bonjour, pairing, and one control connection to the paired Mac that lists its windows and apps. Each window
+/// Bonjour, pairing, and one control connection per paired Mac that lists its windows and apps. Each window
 /// you open has its own connection (RemoteWindow). Everything here runs on the main queue.
 final class Macs: ObservableObject {
     @Published var nearby: [NearbyMac] = []
     @Published var paired: [Peer] = Pairings.load().peers
-    @Published var windows: [Item] = []
-    @Published var apps: [Item] = []
-    @Published var state = ""            // why there's no list: "Connecting…", "Can't reach mini"
+    @Published var windows: [String: [Item]] = [:]   // by Mac (its peer ID)
+    @Published var apps: [String: [Item]] = [:]
+    @Published var state: [String: String] = [:]     // why a Mac has no list: "Connecting…", "Can't reach mini"
     @Published var prompt: CodePrompt?
     @Published var problem: String?      // pairing failed
     var icons: [String: UIImage] = [:]   // by bundle; a list carries each app's icon once per connection
 
     private var browser: NWBrowser?
     private var pairing: PairSession?
-    private var wire: Wire?
+    private var wires: [String: Wire] = [:]
     private var active = true
 
-    /// The Mac this app shows: the first one paired.
-    var mac: Peer? { paired.first }
-    var host: String? { mac.map { "\($0.name).local" } }
-    /// The paired Mac has Share This Mac off (as far as Bonjour says): it can't be reached, and here's why.
-    var macStopsSharing: Bool { nearby.first { $0.id == mac?.id }?.shares == false }
+    static func host(_ mac: Peer) -> String { "\(mac.name).local" }
+
+    /// Share This Mac is off there (as far as Bonjour says): it can't be reached, and here's why.
+    func stopsSharing(_ mac: Peer) -> Bool { nearby.first { $0.id == mac.id }?.shares == false }
 
     init() {
         browse()
-        connect()
+        paired.forEach(connect)
     }
 
     // MARK: pairing
@@ -80,53 +79,57 @@ final class Macs: ObservableObject {
             all.peers.append(p)
             all.save()
             paired = all.peers
-            reconnect()
+            drop(p)   // a re-pair has a new key
+            connect(p)
         }
         s.start()
     }
 
-    func unpair() {
-        guard let p = mac else { return }
+    func unpair(_ mac: Peer) {
         var all = Pairings.load()
-        all.peers.removeAll { $0.id == p.id }
+        all.peers.removeAll { $0.id == mac.id }
         all.save()
         paired = all.peers
-        reconnect()
+        drop(mac)
     }
 
-    // MARK: the Mac's windows and apps
+    // MARK: the Macs' windows and apps
 
     /// Keeps trying while the app is in front: the Mac may be asleep, or Local Network access not granted yet.
-    func connect() {
-        guard active, wire == nil, let host else { return }
-        if windows.isEmpty { state = "Connecting…" }
+    func connect(_ mac: Peer) {
+        guard active, wires[mac.id] == nil else { return }
+        let host = Self.host(mac)
+        if windows[mac.id, default: []].isEmpty { state[mac.id] = "Connecting…" }
         let w = Wire(NWConnection(host: NWEndpoint.Host(host), port: port, using: Pairings.load().tls(to: host)), queue: .main)
         w.onMsg = { [weak self] m in
             guard let self else { return }
             switch m.t {
-            case "windows": state = ""; windows = keepIcons(m.items ?? [])
-            case "apps": apps = keepIcons(m.items ?? []).sorted { $0.app.localizedStandardCompare($1.app) == .orderedAscending }
+            case "windows": state[mac.id] = ""; windows[mac.id] = keepIcons(m.items ?? [])
+            case "apps": apps[mac.id] = keepIcons(m.items ?? []).sorted { $0.app.localizedStandardCompare($1.app) == .orderedAscending }
             default: break
             }
         }
         w.onClose = { [weak self, weak w] in
-            guard let self, let w, wire === w else { return }
-            wire = nil
-            state = "Can't reach \(mac?.name ?? "the Mac")"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.connect() }
+            guard let self, let w, wires[mac.id] === w else { return }
+            wires[mac.id] = nil
+            state[mac.id] = "Can't reach \(mac.name)"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self, let still = paired.first(where: { $0.id == mac.id }) else { return }
+                connect(still)
+            }
         }
-        wire = w
+        wires[mac.id] = w
         w.start()
         w.send(Msg("list"))
     }
 
-    func reconnect() {
-        let w = wire
-        wire = nil
+    /// Hang up on this Mac and forget what it showed.
+    private func drop(_ mac: Peer) {
+        let w = wires.removeValue(forKey: mac.id)
         w?.close()
-        windows = []
-        apps = []
-        connect()
+        windows[mac.id] = nil
+        apps[mac.id] = nil
+        state[mac.id] = nil
     }
 
     func keepIcons(_ items: [Item]) -> [Item] {
@@ -135,27 +138,29 @@ final class Macs: ObservableObject {
     }
 
     func refresh() {
-        connect()
-        wire?.send(Msg("list"))
+        for mac in paired {
+            connect(mac)
+            wires[mac.id]?.send(Msg("list"))
+        }
     }
 
-    func loadApps() {
-        connect()
-        wire?.send(Msg("apps"))
+    func loadApps(_ mac: Peer) {
+        connect(mac)
+        wires[mac.id]?.send(Msg("apps"))
     }
 
     /// Close it on the Mac (a save sheet can keep it open; it's then back in the next list).
-    func close(_ w: Item) {
+    func close(_ w: Item, on mac: Peer) {
         var m = Msg("close"); m.k = w.id
-        wire?.send(m)
-        windows.removeAll { $0.id == w.id }
+        wires[mac.id]?.send(m)
+        windows[mac.id]?.removeAll { $0.id == w.id }
     }
 
     func suspend() {
         active = false
-        let w = wire
-        wire = nil
-        w?.close()
+        let all = wires
+        wires = [:]
+        all.values.forEach { $0.close() }
     }
 
     func resume() {

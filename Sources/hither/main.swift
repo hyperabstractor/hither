@@ -689,7 +689,8 @@ final class Launcher: NSObject, NSMenuDelegate {
             return
         }
         var all = Pairings.load()
-        all.peers.removeAll { $0.id == p.id || $0.name == p.name }
+        // a Mac's name is its host name, so a re-paired Mac replaces its old entry; iPhones are all called "iPhone"
+        all.peers.removeAll { $0.id == p.id || (p.viewer != true && $0.name == p.name) }
         all.peers.append(p)
         all.save()
         log("paired with \(p.name)")
