@@ -72,6 +72,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var pid: pid_t = 0
     var windowID: CGWindowID = 0     // the display's ID when streaming the whole desktop
     var desktop = false              // a whole display, not one app's window
+    var opened = false               // streaming something: keeps this Mac's screen dark (Dark)
     var ax: AXUIElement?
     var display: SCDisplay!
     var frame = CGRect.zero          // window frame, global points, top-left origin
@@ -130,6 +131,11 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             DispatchQueue.main.async { sessions.values.forEach { $0.applyCodec() } }
             Task { await list() }   // reply with the new state
         case "apps": Task { apps() }
+        case "dark":
+            let on = m.dark ?? false
+            DispatchQueue.main.async { Dark.enabled = on }
+            Task { await list() }   // reply with the new state
+        case "lock": DispatchQueue.main.async { Dark.lock() }
         case "open":
             viewerHEVC = m.caps?.contains("hevc") == true   // older viewers only decode H.264
             viewer422 = m.caps?.contains("hevc422") == true   // an iPhone may not decode 4:2:2
@@ -196,6 +202,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         do { c = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true) } catch { return fail("\(error)") }
         var m = Msg("windows")
         m.codec = currentCodec()
+        m.dark = Dark.enabled
         m.items = q.sync {
             candidates(c).map { w in
                 let o = w.owningApplication!
@@ -265,6 +272,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             let owner = win.owningApplication!
             q.sync {
                 pid = owner.processID
+                opened = true
                 codec = viewerCodec()
                 if case .hostPort(_, let port) = wire.conn.endpoint { appName = "\(owner.applicationName):\(port)" }
                 else { appName = owner.applicationName }
@@ -292,6 +300,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         let main = CGMainDisplayID()
         q.sync {
             desktop = true
+            opened = true
             codec = viewerCodec()
             windowID = id != 0 && CGDisplayIsOnline(id) != 0 ? id : main
             frame = CGDisplayBounds(windowID)
@@ -786,6 +795,91 @@ extension Array { subscript(safe i: Int) -> Element? { indices.contains(i) ? sel
 /// the Air would otherwise stream its proxies of the Mini back to the Mini.
 func isOurs(_ bundle: String) -> Bool { bundle.hasPrefix("dev.hither.") }
 
+// MARK: dark screen
+
+/// Keep Screen Dark: while anything here is streamed, this Mac's own monitors show black, so whoever is near it
+/// doesn't see what you do. Their gamma tables are zeroed: capture happens before gamma, so the stream is unaffected,
+/// and macOS restores the colors by itself if this process dies. Two minutes after the last stream closes, the Mac
+/// locks and its monitors come back, showing the lock screen. Screen Sharing's virtual display is left alone.
+/// Everything here runs on the main queue.
+enum Dark {
+    static let url = configDir.appending(path: "dark")
+    static var enabled = FileManager.default.fileExists(atPath: url.path) {
+        didSet {
+            if enabled { FileManager.default.createFile(atPath: url.path, contents: nil) } else { try? FileManager.default.removeItem(at: url) }
+            log("keep screen dark: \(enabled ? "on" : "off")")
+            tick()
+        }
+    }
+    static let grace = 120.0          // after the last stream closes: then lock
+    static var lastStream = -Double.infinity
+    static var lockedAt = -Double.infinity
+    static var dark = false           // gamma currently zeroed by us
+
+    static func start() {
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in tick() }
+        tick()
+    }
+
+    /// Once a second: macOS resets gamma now and then (display sleep/wake, Night Shift, a resolution change), so
+    /// black it out again whenever that happened.
+    static func tick() {
+        let now = CACurrentMediaTime()
+        let streaming = sessions.values.contains { $0.opened && !$0.ended }
+        if streaming { lastStream = now }
+        let idle = now - lastStream
+        if enabled && !streaming && idle >= grace && idle < grace + 2 && now - lockedAt > grace {
+            log("nothing streamed for \(Int(grace)) s: locking")
+            lock()
+        }
+        // dark while in use, through the grace period, and for a moment after locking so the desktop never flashes up
+        if enabled && (idle < grace || now - lockedAt < 2) { blackOut() } else if dark { restore() }
+    }
+
+    static func blackOut() {
+        for d in physicalDisplays() where !isBlack(d) {
+            var zero = [CGGammaValue](repeating: 0, count: 256)
+            let err = CGSetDisplayTransferByTable(d, 256, &zero, &zero, &zero)
+            if err != .success { log("dark: display \(d): \(err.rawValue)") }
+            if !dark { log("screen dark") }
+            dark = true
+        }
+    }
+
+    static func restore() {
+        CGDisplayRestoreColorSyncSettings()
+        dark = false
+        log("screen back")
+    }
+
+    static func isBlack(_ d: CGDirectDisplayID) -> Bool {
+        var r = [CGGammaValue](repeating: 0, count: 256), g = r, b = r, n: UInt32 = 0
+        guard CGGetDisplayTransferByTable(d, 256, &r, &g, &b, &n) == .success, n > 0 else { return false }
+        return r[Int(n) - 1] == 0 && g[Int(n) - 1] == 0 && b[Int(n) - 1] == 0
+    }
+
+    /// Monitors someone could be looking at: not virtual ones (Screen Sharing's, whose picture is what you'd see).
+    static func physicalDisplays() -> [CGDirectDisplayID] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &n)
+        return ids.prefix(Int(n)).filter { d in
+            let name = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == d }?.localizedName ?? ""
+            return !name.localizedCaseInsensitiveContains("virtual")
+        }
+    }
+
+    /// Lock the screen (the menu's Lock, or after the grace period), the same as Control-Command-Q here.
+    static func lock() {
+        lockedAt = CACurrentMediaTime()
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: 12, keyDown: down) else { continue }   // kVK_ANSI_Q
+            e.flags = [.maskControl, .maskCommand]
+            e.post(tap: .cghidEventTap)
+        }
+        log("locked")
+    }
+}
+
 func isTrue(_ v: Any?) -> Bool { (v as? Bool) ?? ((v as? String).map { $0 == "1" || $0.lowercased() == "yes" || $0.lowercased() == "true" } ?? false) }
 
 func png(_ img: NSImage) -> Data? {
@@ -821,6 +915,7 @@ listener.newConnectionHandler = { conn in
 }
 listener.stateUpdateHandler = { log("listener: \($0)") }
 listener.start(queue: .main)
+Dark.start()
 
 /// New windows here show up on the client by themselves when they're plausibly the user's: they appeared within
 /// 15 s of input through a proxy (Cmd-N, File › New Window, opening a project, launching an app), or their app is

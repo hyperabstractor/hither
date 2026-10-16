@@ -593,6 +593,7 @@ final class Remote {
     var items: [Item] = []
     var state = "connecting…"
     var codec = "h264"   // the host's current video codec (from its "windows" replies)
+    var dark = false     // Keep Screen Dark is on over there (from its "windows" replies)
     var relay: NWListener?
     var gone = false   // unpaired
 
@@ -643,7 +644,7 @@ final class Remote {
                 onMain { [weak self] in
                     guard let self, !gone else { return }
                     switch m.t {
-                    case "windows": Reach.worked(host, for: peer); codec = m.codec ?? "h264"; update(m.items ?? [])
+                    case "windows": Reach.worked(host, for: peer); codec = m.codec ?? "h264"; dark = m.dark ?? false; update(m.items ?? [])
                     case "apps": launcher.makeProxies(m.items ?? [], on: self)
                     case "appeared": launcher.appeared(m.items ?? [], on: self)
                     default: break
@@ -958,6 +959,15 @@ final class Launcher: NSObject, NSMenuDelegate {
             mi.state = mac.codec == id ? .on : .off
         }
         codecItem.submenu = codecs
+        // what someone at that Mac sees: black while you use it, and locked once you're done
+        let dark = menu.addItem(withTitle: "Keep Screen Dark", action: #selector(toggleDark(_:)), keyEquivalent: "")
+        dark.target = self
+        dark.representedObject = mac
+        dark.state = mac.dark ? .on : .off
+        dark.toolTip = "While you use \(mac.name) from here, its own monitors show black, and it locks 2 minutes after you stop."
+        let lock = menu.addItem(withTitle: "Lock \(mac.name)", action: #selector(lockMac(_:)), keyEquivalent: "")
+        lock.target = self
+        lock.representedObject = mac
         // whole desktop: Apple's Screen Sharing does that job best, so just hand off to it
         let share = menu.addItem(withTitle: "Screen Share \(mac.name)…", action: #selector(screenShare(_:)), keyEquivalent: "")
         share.target = self
@@ -1118,6 +1128,16 @@ final class Launcher: NSObject, NSMenuDelegate {
         var m = Msg("codec"); m.codec = pick.codec
         pick.mac.wire?.send(m)
     }
+
+    @objc func toggleDark(_ sender: NSMenuItem) {
+        guard let mac = sender.representedObject as? Remote else { return }
+        mac.dark.toggle()
+        rebuild()
+        var m = Msg("dark"); m.dark = mac.dark
+        mac.wire?.send(m)
+    }
+
+    @objc func lockMac(_ sender: NSMenuItem) { (sender.representedObject as? Remote)?.wire?.send(Msg("lock")) }
 
     @objc func screenShare(_ sender: NSMenuItem) {
         guard let mac = sender.representedObject as? Remote, let host = Reach.hosts(mac.peer).first else { return }   // the name that answered last
@@ -1280,10 +1300,27 @@ default:
     let args = CommandLine.arguments
     if args.dropFirst().first == "--selftest" { pairSelfTest() }
     guard args.count >= 3 else {
-        print("usage: hither <host> <app> [window-title-substring]\n       hither <host> --list\n       hither <host> --codec h264|hevc|hevc422")
+        print("usage: hither <host> <app> [window-title-substring]\n       hither <host> --list\n       hither <host> --codec h264|hevc|hevc422"
+            + "\n       hither <host> --dark on|off\n       hither <host> --lock\n       hither <host> @desktop")
         exit(1)
     }
-    if args[2] == "--codec", args.count > 3 {   // same as the launcher's Video Codec menu
+    if args[2] == "--dark", args.count > 3 {   // same as the launcher's Keep Screen Dark
+        let w = dial(args[1])
+        listWire = w
+        w.onMsg = { m in print("keep screen dark: \(m.dark == true ? "on" : "off")"); exit(0) }
+        w.onClose = { exit(1) }
+        w.start()
+        var m = Msg("dark"); m.dark = args[3] == "on"
+        w.send(m)
+    } else if args[2] == "--lock" {
+        let w = dial(args[1])
+        listWire = w
+        w.onMsg = { _ in print("locked"); exit(0) }
+        w.onClose = { exit(1) }
+        w.start()
+        w.send(Msg("lock"))
+        w.send(Msg("list"))   // its reply means the lock went through first
+    } else if args[2] == "--codec", args.count > 3 {   // same as the launcher's Video Codec menu
         let w = dial(args[1])
         listWire = w
         w.onMsg = { m in print("codec: \(m.codec ?? "?")"); exit(0) }

@@ -27,6 +27,7 @@ public struct Msg: Codable {
     /// back to its own size when done (a phone borrows windows); in "pair1"/"pair2", "viewer" = a device that only views
     public var caps: [String]?
     public var codec: String?        // "h264" | "hevc" | "hevc422": host's current choice (in "windows"), or a new one ("codec")
+    public var dark: Bool?           // Keep Screen Dark on the host: its setting (in "windows"), or a new one ("dark")
     public var peer: String?, name: String?, key: Data?, nonce: Data?, commit: Data?   // pairing
     public init(_ t: String) { self.t = t }
 }
