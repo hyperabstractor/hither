@@ -36,3 +36,23 @@ func testViewerPairing() throws {
     try expectNil(phone.viewer)         // the iPhone's record of the Mac
     try expectTrue(sessions.first { !$0.initiator }?.theyView == true)
 }
+
+/// A Mac is tried by its Bonjour name, its Tailscale name, then the address it paired from; the one that answered
+/// last goes first. Pairings saved before `addr` existed still load, and a connection to the address gets the pair's key.
+func testReach() throws {
+    let old = #"{"id":"me","peers":[{"id":"P","name":"mini","token":"AAAA"}]}"#
+    let loaded = try JSONDecoder().decode(Pairings.self, from: Data(old.utf8))
+    try expectNil(loaded.peers[0].addr)
+    try expectEqual(Reach.hosts(loaded.peers[0]).count, 2)
+
+    let id = "reach-test-\(UUID().uuidString)"
+    let json = #"{"id":"me","peers":[{"id":"\#(id)","name":"mini-pb","token":"AAAA","addr":"100.103.209.65"}]}"#
+    let pairings = try JSONDecoder().decode(Pairings.self, from: Data(json.utf8))
+    let mac = pairings.peers[0]
+    defer { UserDefaults.standard.removeObject(forKey: "reach.\(id)") }
+    try expectEqual(Reach.hosts(mac), ["mini-pb.local", "mini-pb", "100.103.209.65"])
+    Reach.worked("100.103.209.65", for: mac)
+    try expectEqual(Reach.hosts(mac), ["100.103.209.65", "mini-pb.local", "mini-pb"])
+    for host in Reach.hosts(mac) { try expectEqual(pairings.peer(for: host)?.id, id) }
+    try expectNil(pairings.peer(for: "mini"))
+}

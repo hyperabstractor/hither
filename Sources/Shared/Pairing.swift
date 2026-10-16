@@ -26,6 +26,8 @@ public final class PairSession {
     public private(set) var failure: String?
     /// The other side only views (an iPhone). Known once the code is shown.
     public var theyView: Bool { them.viewer == true }
+    /// The other side answered at all (a failure before this means it couldn't be reached).
+    public var reachedPeer: Bool { step > 0 }
 
     private let myID = Pairings.load().id
     private let secret = Curve25519.KeyAgreement.PrivateKey()
@@ -89,6 +91,7 @@ public final class PairSession {
     }
 
     private func ask() {
+        them.addr = remoteAddress(wire.conn)
         let (kI, kR, nI, nR) = initiator ? (pub, theirKey, nonce, theirNonce) : (theirKey, pub, theirNonce, nonce)
         guard let key = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: theirKey),
               let shared = try? secret.sharedSecretFromKeyAgreement(with: key) else { return finish(nil, "Pairing failed. Try again.") }
@@ -123,6 +126,16 @@ public final class PairSession {
 }
 
 private func hash(_ parts: Data...) -> Data { Data(SHA256.hash(data: parts.reduce(Data(), +))) }
+
+/// The other side's IP on this connection, if it's one worth dialling later (not loopback or link-local).
+func remoteAddress(_ c: NWConnection) -> String? {
+    guard case .hostPort(let host, _)? = c.currentPath?.remoteEndpoint else { return nil }
+    switch host {
+    case .ipv4(let a): return a.isLoopback || a.isLinkLocal ? nil : "\(a)"
+    case .ipv6(let a): return a.isLoopback || a.isLinkLocal ? nil : "\(a)"
+    default: return nil
+    }
+}
 
 /// A peer's name ends up in a hostname ("mini.local") and in proxy app names, so only allow what a local host name can be.
 public func validName(_ s: String) -> Bool {

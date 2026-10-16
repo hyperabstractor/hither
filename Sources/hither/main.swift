@@ -582,6 +582,7 @@ final class Launcher: NSObject, NSMenuDelegate {
     var browser: NWBrowser?
     var pairing: PairSession?
     var asking = false   // a pairing code alert is up
+    var pairingHost: String?   // what "Pair with a Mac at an address" is dialling
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let menu = NSMenu()
     var wire: Wire?
@@ -645,6 +646,29 @@ final class Launcher: NSObject, NSMenuDelegate {
         begin(PairSession(c, initiator: true))
     }
 
+    /// A Mac Bonjour can't see (another network, over Tailscale): pair by its name or IP. Hither must be running
+    /// there, and someone has to click Pair on its screen too (Screen Sharing will do).
+    @objc func pairByAddress() {
+        guard pairing == nil else { return }
+        let a = NSAlert()
+        a.messageText = "Pair with a Mac at an address"
+        a.informativeText = "Its Tailscale name (like mini-pb) or IP address. Hither must be running on that Mac, "
+            + "and you'll compare a code on both screens."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "mini-pb or 100.x.y.z"
+        a.accessoryView = field
+        a.addButton(withTitle: "Pair")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = field
+        NSApp.activate()
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let host = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else { return }
+        pairingHost = host
+        begin(PairSession(NWConnection(host: NWEndpoint.Host(host), port: pairPort, using: NWParameters(tls: nil, tcp: tcpOptions())),
+                          initiator: true))
+    }
+
     func begin(_ s: PairSession) {
         pairing = s
         s.confirm = { [weak self] code, name, answer in self?.confirmCode(code, name, answer) }
@@ -678,9 +702,15 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func paired(_ p: Peer?, _ s: PairSession) {
         pairing = nil
+        let byAddress = pairingHost
+        pairingHost = nil
         if asking { NSApp.abortModal() }   // the other side cancelled or went away
         guard let p else {
-            if s.initiator, let why = s.failure {
+            if s.initiator, var why = s.failure {
+                if let byAddress, !s.reachedPeer {
+                    why = "Couldn't reach Hither on \(byAddress). Check that it's running there and that the Mac's "
+                        + "firewall lets Hither in."
+                }
                 let a = NSAlert()
                 a.messageText = "Couldn't pair"
                 a.informativeText = why
@@ -872,6 +902,7 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func footer() {
         menu.addItem(.separator())
+        menu.addItem(withTitle: "Pair with Mac at Address…", action: #selector(pairByAddress), keyEquivalent: "").target = self
         for v in Pairings.load().peers where v.viewer == true {
             let mi = menu.addItem(withTitle: "Unpair \(v.name)", action: #selector(unpairViewer(_:)), keyEquivalent: "")
             mi.target = self

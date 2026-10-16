@@ -74,11 +74,13 @@ public func localName() -> String {
 
 /// A device this one is paired with. Pairing between Macs is mutual: each can open the other's windows.
 /// A `viewer` (iPhone) only opens this Mac's windows; it shares none of its own.
+/// `addr`: the IP it paired from, a way back when its name doesn't resolve here (a Mac in someone else's tailnet).
 public struct Peer: Codable {
     public var id: String, name: String, token: Data
     public var viewer: Bool?
-    public init(id: String, name: String, token: Data, viewer: Bool? = nil) {
-        self.id = id; self.name = name; self.token = token; self.viewer = viewer
+    public var addr: String?
+    public init(id: String, name: String, token: Data, viewer: Bool? = nil, addr: String? = nil) {
+        self.id = id; self.name = name; self.token = token; self.viewer = viewer; self.addr = addr
     }
 }
 
@@ -119,10 +121,14 @@ public struct Pairings: Codable {
     }
     #endif
 
-    /// Client side of a connection to `host` ("mini.local" or "mini"): our ID with that pair's key.
+    /// The paired device `host` names: "mini.local", "mini" or the address it paired from.
+    public func peer(for host: String) -> Peer? {
+        peers.first { $0.name == host || "\($0.name).local" == host || $0.addr == host }
+    }
+
+    /// Client side of a connection to `host`: our ID with that pair's key.
     public func tls(to host: String) -> NWParameters {
-        let peer = peers.first { $0.name == host || "\($0.name).local" == host }
-        return tlsParams(psks: [(id, peer?.token ?? Data(count: 32))])   // unpaired: fails the handshake
+        tlsParams(psks: [(id, peer(for: host)?.token ?? Data(count: 32))])   // unpaired: fails the handshake
     }
 }
 

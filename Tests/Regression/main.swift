@@ -28,6 +28,8 @@ do {
     print("PASS video packets decode (H.264, HEVC) and input follows the letterbox")
     try testViewerPairing()
     print("PASS iPhone pairs as a viewer")
+    try testReach()
+    print("PASS a Mac is reached by name, Tailscale name, then its paired address")
     let arguments = CommandLine.arguments
     if arguments.count == 4, arguments[1] == "--remote" {
         try testMissingRemoteWindow(host: arguments[2], app: arguments[3], throughRelay: false)
