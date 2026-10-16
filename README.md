@@ -21,7 +21,12 @@ local network.
 - **Fast.** Hardware H.264 or HEVC (4:2:2 for sharper colour), about 35–45 ms from keypress to picture on a home
   network. Hidden windows are paused and background windows are throttled.
 - **Both directions.** Every Mac runs the same app: it shares its own windows and shows the other Mac's.
-- **Whole desktop.** For the rare times you need it, the menu hands off to macOS Screen Sharing.
+- **Whole desktop.** Desktop, at the top of each Mac's section, streams its whole screen the same smooth way:
+  menu bar, Dock and every window. You can unlock a locked Mac from there too.
+- **Keep Screen Dark.** While you use a Mac from here, its own monitors show black, so whoever sits near it
+  doesn't see what you're doing. Two minutes after you close its last window, it locks and the monitors come
+  back showing the lock screen. **Lock** locks it right away.
+- **Screen Sharing.** The menu still hands off to macOS Screen Sharing when you want it.
 
 ## Requirements
 
@@ -104,9 +109,11 @@ the menu bar app, so only Hither itself needs Local Network access.
 - If the other Mac's firewall is on, allow incoming connections for Hither there.
 - Keys are sent as key codes, so both Macs should use the same keyboard layout.
 - The mouse pointer's shape (I-beam, resize arrows) isn't mirrored.
-- A locked Mac can't be captured or typed into. Unlock it with Screen Sharing. To stop it locking again when you
-  disconnect, run
+- A locked Mac shows its lock screen in Desktop; type your password there. A window stream can't show it.
+  macOS locks a Mac when a Screen Sharing session ends; to stop that, run
   `sudo defaults write /Library/Preferences/com.apple.RemoteManagement RestoreMachineState -bool NO`.
+- Keep Screen Dark blacks out the picture, not the Mac: its own keyboard and mouse still work while you use it.
+  It only covers the session on the monitors; another user can't log in there at the same time.
 - Audio is captured before the host's volume control. Mute the host if you only want sound on this Mac.
 - There's no clipboard sync. Universal Clipboard already covers it.
 - It isn't notarized, and it uses one private but widely used Accessibility call (`_AXUIElementGetWindow`) to match
