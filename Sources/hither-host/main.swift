@@ -499,7 +499,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !ended, visible, let p = pending else { return }
         guard unacked < window.limit else { held = true; return }
         let busy = CACurrentMediaTime() - lastInputAt < 0.5
-        let gap = windowID == lastRaised ? 0 : busy ? 0.5 : 0.1
+        let gap = desktop || windowID == lastRaised ? 0 : busy ? 0.5 : 0.1   // a desktop is always the one in front
         let wait = lastEncode + gap - CACurrentMediaTime()
         guard wait <= 0 else {
             if !pumpQueued {
