@@ -8,7 +8,7 @@ func testMissingRemoteWindow(host: String, app: String, throughRelay: Bool) thro
     let queue = DispatchQueue(label: "hither.tests.remote")
     let done = DispatchSemaphore(value: 0)
     let connection = NWConnection(host: NWEndpoint.Host(throughRelay ? "127.0.0.1" : host),
-                                  port: throughRelay ? relayPort : port, using: Pairings.load().tls(to: host))
+                                  port: throughRelay ? relayPort(for: host)! : port, using: Pairings.load().tls(to: host))
     let wire = Wire(connection, queue: queue)
     var outcome: String?
     var requested = false

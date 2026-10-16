@@ -18,12 +18,13 @@ let launcherID = "dev.hither.app"
 let quitNote = Notification.Name("dev.hither.quit")   // launcher quitting → proxies go too (they need its relay)
 
 func short(_ host: String) -> String { host.split(separator: ".").first.map(String.init) ?? host }
-/// Proxies go through the launcher's loopback relay (only the launcher needs Local Network access);
-/// TLS still runs end to end with the host, so the relay only ever sees ciphertext.
+/// Proxies go through the launcher's loopback relay for their Mac (only the launcher needs Local Network access);
+/// TLS still runs end to end with the host, so the relay only ever sees ciphertext. No relay yet (the launcher isn't
+/// running): port 0 fails at once, and the proxy retries.
 func dial(_ host: String) -> Wire {
     let tls = Pairings.load().tls(to: host)
     let c = role == "proxy"
-        ? NWConnection(host: "127.0.0.1", port: relayPort, using: tls)
+        ? NWConnection(host: "127.0.0.1", port: relayPort(for: host) ?? .any, using: tls)
         : NWConnection(host: NWEndpoint.Host(host), port: port, using: tls)
     return Wire(c, queue: DispatchQueue(label: "wire"))
 }
@@ -565,19 +566,154 @@ final class CloseRow: NSView {
             return
         }
         item.menu?.cancelTracking()
-        if let w = item.representedObject as? Item { launcher.openItem(w) }
+        if let r = item.representedObject as? Row { launcher.openItem(r.item, on: r.mac) }
     }
 }
 
 // MARK: - launcher (menu bar)
 
-final class Launcher: NSObject, NSMenuDelegate {
-    /// The Mac whose windows this menu shows (the first one paired; iPhones only view). nil until paired.
-    var peer: Peer? { didSet { relayPeer.withLock { $0 = peer } } }
-    var name: String { peer?.name ?? "" }
-    let relayPeer = OSAllocatedUnfairLock<Peer?>(initialState: nil)   // read on the relay queue
+/// What a row in the menu opens: a window on one of the paired Macs (id 0: the app's main window).
+struct Row { let item: Item; let mac: Remote }
+
+/// A row in the Video Codec submenu: that Mac's encoder choice.
+struct CodecPick { let mac: Remote; let codec: String }
+
+/// One paired Mac in the menu: a long-lived control connection that lists its windows and apps (each menu open asks
+/// for a fresh list), and the loopback relay its proxies reach it through. All but the relay runs on the main queue.
+final class Remote {
+    private(set) var peer: Peer
+    var name: String { peer.name }
+    unowned let launcher: Launcher
+    let relayPeer: OSAllocatedUnfairLock<Peer>   // read on the relay queue
     var attempt = 0   // the control connection tries the peer's names (Reach.hosts) in turn
-    var nearby: [(name: String, endpoint: NWEndpoint)] = []   // other Macs running Hither (Bonjour)
+    var wire: Wire?
+    var items: [Item] = []
+    var state = "connecting…"
+    var codec = "h264"   // the host's current video codec (from its "windows" replies)
+    var relay: NWListener?
+    var gone = false   // unpaired
+
+    init(_ peer: Peer, launcher: Launcher) {
+        self.peer = peer
+        self.launcher = launcher
+        relayPeer = OSAllocatedUnfairLock(initialState: peer)
+        startRelay()
+        refresh()
+    }
+
+    /// Paired again: a new key, so hang up and connect with it.
+    func repaired(_ p: Peer) {
+        peer = p
+        relayPeer.withLock { $0 = p }
+        wire?.close()
+        wire = nil
+        refresh()
+    }
+
+    func stop() {
+        gone = true
+        wire?.close()
+        wire = nil
+        relay?.cancel()
+        try? FileManager.default.removeItem(at: relayPortFile(name))
+    }
+
+    func refresh() {
+        guard !gone else { return }
+        if wire == nil {
+            let peer = peer, hosts = Reach.hosts(peer), host = hosts[attempt % hosts.count]
+            let w = dial(host), me = ObjectIdentifier(w)
+            w.onClose = { [weak self] in
+                onMain { [weak self] in
+                    guard let self, let cur = wire, ObjectIdentifier(cur) == me else { return }   // already replaced (re-paired)
+                    wire = nil
+                    attempt += 1
+                    let triedAll = attempt % hosts.count == 0
+                    if triedAll { state = "can't reach \(peer.name)"; launcher.rebuild() }
+                    // keep trying: the Mac may be asleep or out of reach, or this is the Local Network race after login
+                    DispatchQueue.main.asyncAfter(deadline: .now() + (triedAll ? 3 : 0.2)) { [weak self] in
+                        if self?.wire == nil { self?.refresh() }
+                    }
+                }
+            }
+            w.onMsg = { [weak self] m in
+                onMain { [weak self] in
+                    guard let self, !gone else { return }
+                    switch m.t {
+                    case "windows": Reach.worked(host, for: peer); codec = m.codec ?? "h264"; update(m.items ?? [])
+                    case "apps": launcher.makeProxies(m.items ?? [], on: self)
+                    case "appeared": launcher.appeared(m.items ?? [], on: self)
+                    default: break
+                    }
+                }
+            }
+            wire = w
+            w.start()
+            w.send(Msg("apps"))   // every (re)connect: a proxy per installed app, so Spotlight finds "Xcode · mini"
+            w.send(Msg("watch"))  // …and new windows over there (Cmd-N, launched apps) open here by themselves
+            Reach.giveUpLater(on: w)
+        }
+        wire?.send(Msg("list"))
+    }
+
+    func update(_ new: [Item]) {
+        for i in new { if let icon = i.icon { launcher.icons[i.bundle] = icon } }
+        items = new
+        state = ""
+        launcher.rebuild()
+    }
+
+    /// Loopback-only byte pipe: proxy ⇄ launcher ⇄ host. Keeps the per-app Local Network prompt away. Each paired Mac
+    /// has its own, on a port written to ~/.hither for that Mac's proxies to find.
+    func startRelay() {
+        let q = DispatchQueue(label: "relay")
+        let params = NWParameters(tls: nil, tcp: tcpOptions())
+        params.requiredInterfaceType = .loopback
+        guard let l = try? NWListener(using: params, on: .any) else { return log("relay for \(name): no port") }
+        l.newConnectionHandler = { [relayPeer] local in
+            let peer = relayPeer.withLock { $0 }
+            local.start(queue: q)   // nothing is read from it until the host end is up
+            connectFirst(Reach.hosts(peer), queue: q) { remote in
+                guard let remote else { log("relay: can't reach \(peer.name)"); return local.cancel() }
+                var finishedDirections = 0   // both pipe callbacks run on q
+                let finished: () -> Void = {
+                    finishedDirections += 1
+                    if finishedDirections == 2 {
+                        q.asyncAfter(deadline: .now() + 2) { local.cancel(); remote.cancel() }
+                    }
+                }
+                for c in [local, remote] {
+                    c.stateUpdateHandler = { s in
+                        switch s {
+                        case .failed, .cancelled, .waiting: local.cancel(); remote.cancel()
+                        default: break
+                        }
+                    }
+                }
+                switch local.state {   // the proxy may have gone away meanwhile
+                case .failed, .cancelled: return remote.cancel()
+                default: break
+                }
+                pipe(local, remote, onEOF: finished)
+                pipe(remote, local, onEOF: finished)
+            }
+        }
+        let file = relayPortFile(name)
+        l.stateUpdateHandler = { [weak l] s in
+            switch s {
+            case .ready: if let p = l?.port { try? Data("\(p.rawValue)".utf8).write(to: file, options: .atomic) }
+            case .failed(let e): log("relay: \(e)")
+            default: break
+            }
+        }
+        l.start(queue: q)
+        relay = l
+    }
+}
+
+final class Launcher: NSObject, NSMenuDelegate {
+    var remotes: [Remote] = []   // the paired Macs whose windows this menu shows (iPhones only view)
+    var nearby: [(id: String, name: String, endpoint: NWEndpoint)] = []   // other Macs running Hither (Bonjour)
     var pairListener: NWListener?
     var browser: NWBrowser?
     var pairing: PairSession?
@@ -585,22 +721,15 @@ final class Launcher: NSObject, NSMenuDelegate {
     var pairingHost: String?   // what "Pair with a Mac at an address" is dialling
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let menu = NSMenu()
-    var wire: Wire?
-    var items: [Item] = []
     var icons: [String: Data] = [:]
-    var state = "connecting…"
-    var relay: NWListener?
-    var codec = "h264"   // host's current video codec (from its "windows" replies)
     let buildQ = DispatchQueue(label: "proxies")   // all proxy-bundle writes, in order
 
     func start() {
         status.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Hither")
         menu.delegate = self
         status.menu = menu
-        peer = Pairings.load().peers.first { $0.viewer != true }
+        remotes = Pairings.load().peers.filter { $0.viewer != true }.map { Remote($0, launcher: self) }
         rebuild()
-        refresh()
-        startRelay()
         startPairing()
     }
 
@@ -627,7 +756,7 @@ final class Launcher: NSObject, NSMenuDelegate {
             self?.nearby = results.compactMap { r in
                 guard case .service(let name, _, _, _) = r.endpoint, case .bonjour(let txt) = r.metadata,
                       let id = txt["id"], id != me, seen.insert(id).inserted else { return nil }
-                return (name, r.endpoint)
+                return (id, name, r.endpoint)
             }.sorted { $0.name < $1.name }
             self?.rebuild()
         }
@@ -726,121 +855,37 @@ final class Launcher: NSObject, NSMenuDelegate {
         all.save()
         log("paired with \(p.name)")
         restartHost()   // it only lets in devices it knew about when it started
-        if p.viewer != true, peer == nil || peer?.id == p.id || peer?.name == p.name {
-            peer = p
-            wire?.close()
-            wire = nil
-        }
-        rebuild()
-        refresh()
-    }
-
-    @objc func unpair() {
-        guard let p = peer else { return }
-        var all = Pairings.load()
-        all.peers.removeAll { $0.id == p.id }
-        all.save()
-        restartHost()
-        peer = all.peers.first { $0.viewer != true }
-        items = []
-        wire?.close()
-        wire = nil
-        rebuild()
-        refresh()
-    }
-
-    /// Loopback-only byte pipe: proxy ⇄ launcher ⇄ host. Keeps the per-app Local Network prompt away.
-    // ponytail: relays to this launcher's one host; key the relay by host when there's a second Mac
-    func startRelay() {
-        let q = DispatchQueue(label: "relay")
-        let params = NWParameters(tls: nil, tcp: tcpOptions())
-        params.requiredInterfaceType = .loopback
-        guard let l = try? NWListener(using: params, on: relayPort) else { return log("relay: port \(relayPort) busy") }
-        l.newConnectionHandler = { [relayPeer] local in
-            guard let peer = relayPeer.withLock({ $0 }) else { return local.cancel() }
-            local.start(queue: q)   // nothing is read from it until the host end is up
-            connectFirst(Reach.hosts(peer), queue: q) { remote in
-                guard let remote else { log("relay: can't reach \(peer.name)"); return local.cancel() }
-                var finishedDirections = 0   // both pipe callbacks run on q
-                let finished: () -> Void = {
-                    finishedDirections += 1
-                    if finishedDirections == 2 {
-                        q.asyncAfter(deadline: .now() + 2) { local.cancel(); remote.cancel() }
-                    }
-                }
-                for c in [local, remote] {
-                    c.stateUpdateHandler = { s in
-                        switch s {
-                        case .failed, .cancelled, .waiting: local.cancel(); remote.cancel()
-                        default: break
-                        }
-                    }
-                }
-                switch local.state {   // the proxy may have gone away meanwhile
-                case .failed, .cancelled: return remote.cancel()
-                default: break
-                }
-                pipe(local, remote, onEOF: finished)
-                pipe(remote, local, onEOF: finished)
+        if p.viewer != true {
+            if let mac = remotes.first(where: { $0.peer.id == p.id || $0.name == p.name }) {
+                mac.repaired(p)
+            } else {
+                remotes.append(Remote(p, launcher: self))
             }
         }
-        l.stateUpdateHandler = { if case .failed(let e) = $0 { log("relay: \(e)") } }
-        l.start(queue: q)
-        relay = l
+        rebuild()
     }
 
-    func menuWillOpen(_ m: NSMenu) { refresh() }
+    /// A Mac or an iPhone. Either can no longer connect once the host restarts without its key.
+    @objc func unpair(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        var all = Pairings.load()
+        all.peers.removeAll { $0.id == id }
+        all.save()
+        restartHost()
+        remotes.filter { $0.peer.id == id }.forEach { $0.stop() }
+        remotes.removeAll { $0.peer.id == id }
+        rebuild()
+    }
+
+    func menuWillOpen(_ m: NSMenu) { remotes.forEach { $0.refresh() } }
 
     func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
         menu.items.forEach { $0.view?.needsDisplay = true }
     }
 
-    /// One long-lived control connection; each menu open asks for a fresh window list.
-    func refresh() {
-        guard let peer else { return }
-        if wire == nil {
-            let hosts = Reach.hosts(peer), host = hosts[attempt % hosts.count]
-            let w = dial(host), me = ObjectIdentifier(w)
-            w.onClose = { [weak self] in
-                onMain { [weak self] in
-                    guard let self, let cur = wire, ObjectIdentifier(cur) == me else { return }   // already replaced (re-paired)
-                    wire = nil
-                    attempt += 1
-                    let triedAll = attempt % hosts.count == 0
-                    if triedAll { state = "can't reach \(peer.name)"; rebuild() }
-                    // keep trying: the Mac may be asleep or out of reach, or this is the Local Network race after login
-                    DispatchQueue.main.asyncAfter(deadline: .now() + (triedAll ? 3 : 0.2)) { [weak self] in
-                        if self?.wire == nil { self?.refresh() }
-                    }
-                }
-            }
-            w.onMsg = { [weak self] m in
-                switch m.t {
-                case "windows": onMain { Reach.worked(host, for: peer); self?.codec = m.codec ?? "h264"; self?.update(m.items ?? []) }
-                case "apps": onMain { self?.makeProxies(m.items ?? []) }
-                case "appeared": onMain { self?.appeared(m.items ?? []) }
-                default: break
-                }
-            }
-            wire = w
-            w.start()
-            w.send(Msg("apps"))   // every (re)connect: a proxy per installed app, so Spotlight finds "Xcode · mini"
-            w.send(Msg("watch"))  // …and new windows over there (Cmd-N, launched apps) open here by themselves
-            Reach.giveUpLater(on: w)
-        }
-        wire?.send(Msg("list"))
-    }
-
-    func update(_ new: [Item]) {
-        for i in new { if let icon = i.icon { icons[i.bundle] = icon } }
-        items = new
-        state = ""
-        rebuild()
-    }
-
-    func makeProxies(_ apps: [Item]) {
+    func makeProxies(_ apps: [Item], on mac: Remote) {
         for a in apps { if let icon = a.icon { icons[a.bundle] = icon } }
-        let host = name   // proxies reach it through the relay, by name
+        let host = mac.name   // proxies reach it through its relay, by name
         buildQ.async {
             let made = apps.filter { (try? self.ensureProxy($0, icon: $0.icon, host: host))?.2 == true }.count
             log("proxies: \(apps.count) apps on \(host), \(made) created/updated")
@@ -848,25 +893,39 @@ final class Launcher: NSObject, NSMenuDelegate {
         rebuild()
     }
 
+    // MARK: menu
+
     func rebuild() {
         menu.removeAllItems()
-        guard let peer else {   // not paired: offer the Macs we can see
-            menu.addItem(withTitle: "Not paired", action: nil, keyEquivalent: "").isEnabled = false
-            if nearby.isEmpty { menu.addItem(withTitle: "Looking for Macs running Hither…", action: nil, keyEquivalent: "").isEnabled = false }
-            for (i, n) in nearby.enumerated() {
-                let mi = menu.addItem(withTitle: "Pair with \(n.name)…", action: #selector(pairWith(_:)), keyEquivalent: "")
-                mi.target = self
-                mi.tag = i
-            }
-            return footer()
+        if remotes.isEmpty { menu.addItem(withTitle: "Not paired", action: nil, keyEquivalent: "").isEnabled = false }
+        for (n, mac) in remotes.enumerated() {
+            if n > 0 { menu.addItem(.separator()) }
+            section(mac)
         }
-        menu.addItem(withTitle: state.isEmpty ? "On \(peer.name)" : "\(peer.name): \(state)", action: nil, keyEquivalent: "").isEnabled = false
+        // Macs nearby that aren't paired yet; ones elsewhere pair by address (in the footer)
+        let paired = Set(remotes.map(\.peer.id))
+        let unpaired = nearby.indices.filter { !paired.contains(nearby[$0].id) }
+        if remotes.isEmpty && unpaired.isEmpty {
+            menu.addItem(withTitle: "Looking for Macs running Hither…", action: nil, keyEquivalent: "").isEnabled = false
+        }
+        if !remotes.isEmpty && !unpaired.isEmpty { menu.addItem(.separator()) }
+        for i in unpaired {
+            let mi = menu.addItem(withTitle: "Pair with \(nearby[i].name)…", action: #selector(pairWith(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.tag = i
+        }
+        footer()
+    }
+
+    /// One paired Mac: its windows, then what to do with it.
+    func section(_ mac: Remote) {
+        menu.addItem(withTitle: mac.state.isEmpty ? "On \(mac.name)" : "\(mac.name): \(mac.state)", action: nil, keyEquivalent: "").isEnabled = false
         var apps: [String] = []
-        for i in items where !apps.contains(i.bundle) { apps.append(i.bundle) }
+        for i in mac.items where !apps.contains(i.bundle) { apps.append(i.bundle) }
         for b in apps {
-            let wins = items.filter { $0.bundle == b }
+            let wins = mac.items.filter { $0.bundle == b }
             if wins.count == 1 {   // one row: "App  window title"
-                let w = wins[0], mi = add(w.app, w, indent: 0)
+                let w = wins[0], mi = add(w.app, Row(item: w, mac: mac), indent: 0)
                 mi.image = icon(b)
                 if !w.title.isEmpty && w.title != w.app {
                     let t = NSMutableAttributedString(string: w.app + "  ")
@@ -875,36 +934,39 @@ final class Launcher: NSObject, NSMenuDelegate {
                 }
                 pinClose(mi)
             } else {   // app row opens its main window; window rows open that exact window
-                add(wins[0].app, Item(id: 0, app: wins[0].app, bundle: b, title: ""), indent: 0).image = icon(b)
-                for w in wins { pinClose(add(w.title.isEmpty ? "Untitled" : w.title, w, indent: 1)) }
+                add(wins[0].app, Row(item: Item(id: 0, app: wins[0].app, bundle: b, title: ""), mac: mac), indent: 0).image = icon(b)
+                for w in wins { pinClose(add(w.title.isEmpty ? "Untitled" : w.title, Row(item: w, mac: mac), indent: 1)) }
             }
         }
         menu.addItem(.separator())
         let recentItem = menu.addItem(withTitle: "Recent", action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        for r in recent { add(r.app, r, indent: 0, to: sub).image = icon(r.bundle) }
+        let sub = NSMenu(), recent = recent(on: mac)
+        for r in recent { add(r.app, Row(item: r, mac: mac), indent: 0, to: sub).image = icon(r.bundle) }
         recentItem.submenu = sub
         recentItem.isEnabled = !recent.isEmpty
         let codecItem = menu.addItem(withTitle: "Video Codec", action: nil, keyEquivalent: "")
         let codecs = NSMenu()
-        for (name, id) in [("H.264", "h264"), ("HEVC", "hevc"), ("HEVC 4:2:2 (sharpest color)", "hevc422")] {
-            let mi = codecs.addItem(withTitle: name, action: #selector(setCodec(_:)), keyEquivalent: "")
+        for (title, id) in [("H.264", "h264"), ("HEVC", "hevc"), ("HEVC 4:2:2 (sharpest color)", "hevc422")] {
+            let mi = codecs.addItem(withTitle: title, action: #selector(setCodec(_:)), keyEquivalent: "")
             mi.target = self
-            mi.representedObject = id
-            mi.state = codec == id ? .on : .off
+            mi.representedObject = CodecPick(mac: mac, codec: id)
+            mi.state = mac.codec == id ? .on : .off
         }
         codecItem.submenu = codecs
         // whole desktop: Apple's Screen Sharing does that job best, so just hand off to it
-        menu.addItem(withTitle: "Screen Share \(peer.name)…", action: #selector(screenShare), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Unpair \(peer.name)", action: #selector(unpair), keyEquivalent: "").target = self
-        footer()
+        let share = menu.addItem(withTitle: "Screen Share \(mac.name)…", action: #selector(screenShare(_:)), keyEquivalent: "")
+        share.target = self
+        share.representedObject = mac
+        let unpair = menu.addItem(withTitle: "Unpair \(mac.name)", action: #selector(unpair(_:)), keyEquivalent: "")
+        unpair.target = self
+        unpair.representedObject = mac.peer.id
     }
 
     func footer() {
         menu.addItem(.separator())
         menu.addItem(withTitle: "Pair with Mac at Address…", action: #selector(pairByAddress), keyEquivalent: "").target = self
         for v in Pairings.load().peers where v.viewer == true {
-            let mi = menu.addItem(withTitle: "Unpair \(v.name)", action: #selector(unpairViewer(_:)), keyEquivalent: "")
+            let mi = menu.addItem(withTitle: "Unpair \(v.name)", action: #selector(unpair(_:)), keyEquivalent: "")
             mi.target = self
             mi.representedObject = v.id
         }
@@ -917,30 +979,21 @@ final class Launcher: NSObject, NSMenuDelegate {
         menu.addItem(withTitle: "Quit Hither", action: #selector(quit), keyEquivalent: "q").target = self
     }
 
-    /// An iPhone: it can no longer connect once the host restarts without its key.
-    @objc func unpairViewer(_ sender: NSMenuItem) {
-        var all = Pairings.load()
-        all.peers.removeAll { $0.id == sender.representedObject as? String }
-        all.save()
-        restartHost()
-        rebuild()
-    }
-
     func icon(_ bundle: String) -> NSImage? {
         icons[bundle].flatMap(NSImage.init(data:)).map { $0.size = NSSize(width: 16, height: 16); return $0 }
     }
 
-    @discardableResult func add(_ title: String, _ item: Item, indent: Int, to m: NSMenu? = nil) -> NSMenuItem {
+    @discardableResult func add(_ title: String, _ row: Row, indent: Int, to m: NSMenu? = nil) -> NSMenuItem {
         let mi = (m ?? menu).addItem(withTitle: title, action: #selector(open(_:)), keyEquivalent: "")
         mi.target = self
-        mi.representedObject = item
+        mi.representedObject = row
         mi.indentationLevel = indent
         return mi
     }
 
     /// X on a real window (not the app header, which has no single window, and not Recent). Clicking the row still opens it.
     func pinClose(_ mi: NSMenuItem) {
-        guard (mi.representedObject as? Item)?.id != 0 else { return }
+        guard (mi.representedObject as? Row)?.item.id != 0 else { return }
         let font = NSFont.menuFont(ofSize: 0)
         let text = mi.attributedTitle?.string ?? mi.title
         let textW = (text as NSString).size(withAttributes: [.font: font]).width
@@ -953,42 +1006,50 @@ final class Launcher: NSObject, NSMenuDelegate {
     /// Close that window on the host and drop the row. The menu stays open so several can go in one pass.
     /// A window that refuses (a save sheet) is still there the next time the menu opens.
     @objc func closeWindow(_ sender: NSMenuItem) {
-        guard let w = sender.representedObject as? Item, w.id != 0, let wire else { return }
+        guard let row = sender.representedObject as? Row, row.item.id != 0, let wire = row.mac.wire else { return }
+        let w = row.item, mac = row.mac
         var m = Msg("close"); m.k = w.id
         wire.send(m)
-        items.removeAll { $0.id == w.id }
+        mac.items.removeAll { $0.id == w.id }
         sender.isHidden = true
-        guard !items.contains(where: { $0.bundle == w.bundle && $0.id != 0 }), let menu = sender.menu else { return }
-        for item in menu.items where (item.representedObject as? Item)?.bundle == w.bundle { item.isHidden = true }
-    }
-
-    /// Apps opened through Hither, newest first (launching one that isn't running starts it on the host).
-    var recent: [Item] {
-        (UserDefaults.standard.array(forKey: "recent") as? [[String: String]] ?? []).compactMap { d in
-            d["bundle"].map { Item(id: 0, app: d["app"] ?? $0, bundle: $0, title: "") }
+        guard !mac.items.contains(where: { $0.bundle == w.bundle && $0.id != 0 }), let menu = sender.menu else { return }
+        for item in menu.items {
+            if let r = item.representedObject as? Row, r.mac === mac, r.item.bundle == w.bundle { item.isHidden = true }
         }
     }
 
-    func remember(_ w: Item) {
-        let r = ([Item(id: 0, app: w.app, bundle: w.bundle, title: "")] + recent.filter { $0.bundle != w.bundle }).prefix(10)
-        UserDefaults.standard.set(r.map { ["bundle": $0.bundle, "app": $0.app] }, forKey: "recent")
+    /// Apps opened through Hither on `mac`, newest first (launching one that isn't running starts it on the host).
+    /// Entries from before there could be more than one Mac belong to the first.
+    func recent(on mac: Remote) -> [Item] {
+        recentEntries.compactMap { d in
+            guard let bundle = d["bundle"], d["host"].map({ $0 == mac.name }) ?? (mac === remotes.first) else { return nil }
+            return Item(id: 0, app: d["app"] ?? bundle, bundle: bundle, title: "")
+        }
+    }
+
+    var recentEntries: [[String: String]] { UserDefaults.standard.array(forKey: "recent") as? [[String: String]] ?? [] }
+
+    func remember(_ w: Item, on mac: Remote) {
+        let others = recentEntries.filter { $0["bundle"] != w.bundle || ($0["host"] ?? remotes.first?.name) != mac.name }
+        let r = [["bundle": w.bundle, "app": w.app, "host": mac.name]] + others.prefix(19)
+        UserDefaults.standard.set(r, forKey: "recent")
     }
 
     /// A new window appeared on the host because of something done through a proxy: open it like a local app would.
-    func appeared(_ new: [Item]) {
+    func appeared(_ new: [Item], on mac: Remote) {
         for i in new {
             if let icon = i.icon { icons[i.bundle] = icon }
-            openItem(i)
+            openItem(i, on: mac)
         }
     }
 
     @objc func open(_ sender: NSMenuItem) {
-        if let w = sender.representedObject as? Item { openItem(w) }
+        if let r = sender.representedObject as? Row { openItem(r.item, on: r.mac) }
     }
 
-    func openItem(_ w: Item) {
-        remember(w)
-        let icon = icons[w.bundle], host = name
+    func openItem(_ w: Item, on mac: Remote) {
+        remember(w, on: mac)
+        let icon = icons[w.bundle], host = mac.name
         buildQ.async {   // same queue as the bulk proxy build, so they never write one bundle at once
             do {
                 let (url, id, _) = try self.ensureProxy(w, icon: icon, host: host)
@@ -1043,18 +1104,18 @@ final class Launcher: NSObject, NSMenuDelegate {
         return (url, id, true)
     }
 
-    /// Applies to every open window at once (the host swaps encoders); remembered on the host for new ones.
+    /// Applies to every open window from that Mac at once (it swaps encoders); remembered there for new ones.
     @objc func setCodec(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        codec = id
+        guard let pick = sender.representedObject as? CodecPick else { return }
+        pick.mac.codec = pick.codec
         rebuild()
-        refresh()
-        var m = Msg("codec"); m.codec = id
-        wire?.send(m)
+        pick.mac.refresh()
+        var m = Msg("codec"); m.codec = pick.codec
+        pick.mac.wire?.send(m)
     }
 
-    @objc func screenShare() {
-        guard let peer, let host = Reach.hosts(peer).first else { return }   // the name that answered last
+    @objc func screenShare(_ sender: NSMenuItem) {
+        guard let mac = sender.representedObject as? Remote, let host = Reach.hosts(mac.peer).first else { return }   // the name that answered last
         NSWorkspace.shared.open(URL(string: "vnc://\(host)")!)
     }
 

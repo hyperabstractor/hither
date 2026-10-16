@@ -6,7 +6,6 @@ import SystemConfiguration
 #endif
 
 public let port: NWEndpoint.Port = 7420
-public let relayPort: NWEndpoint.Port = 7421   // launcher's loopback relay on the client Mac
 public let pairPort: NWEndpoint.Port = 7422    // pairing, plain TCP; advertised over Bonjour
 public let serviceType = "_hither._tcp"
 
@@ -55,6 +54,16 @@ public let configDir: URL = {
     try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     return d
 }()
+
+/// The launcher's loopback relay to the paired Mac `name`, which that Mac's proxies connect through, listens on a
+/// port of its own, kept here.
+public func relayPortFile(_ name: String) -> URL { configDir.appending(path: "relay-\(name).port") }
+
+/// The relay port for `host` ("mini" or "mini.local"); nil while the launcher isn't running.
+public func relayPort(for host: String) -> NWEndpoint.Port? {
+    let name = host.split(separator: ".").first.map(String.init) ?? host
+    return (try? String(contentsOf: relayPortFile(name), encoding: .utf8)).flatMap { UInt16($0) }.flatMap(NWEndpoint.Port.init(rawValue:))
+}
 
 /// This Mac's short network name ("mini" for mini.local): Bonjour name, proxy suffix ("Cursor · mini"), and how the
 /// other Mac reaches this one.

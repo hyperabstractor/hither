@@ -55,6 +55,10 @@ On first launch, macOS asks for three permissions for **Hither**. Grant them on 
 
 Pairing is mutual, so both Macs can open each other's windows. Tick **Open at Login** on both, and you're done.
 
+A Mac on another network (over [Tailscale](https://tailscale.com)) doesn't show up nearby: choose **Pair with Mac at
+Address…** and type its Tailscale name or IP. You'll need to click Pair on that Mac's screen too, so have Screen
+Sharing open. Pair as many Macs as you like; each gets its own section in the menu.
+
 ## Use
 
 - Pick a window or app from the menu bar icon, or type an app's name in Spotlight (`Safari · mini`).
@@ -95,8 +99,9 @@ the menu bar app, so only Hither itself needs Local Network access.
 
 ## Limitations
 
-- The menu shows one other Mac at a time: the first one you paired.
-- Same local network only. Macs find each other with Bonjour and connect via `<name>.local`.
+- Macs find each other with Bonjour on the same network. Elsewhere, pair by address over Tailscale; Hither then
+  tries `<name>.local`, the Tailscale name, and the address it paired from, in turn.
+- If the other Mac's firewall is on, allow incoming connections for Hither there.
 - Keys are sent as key codes, so both Macs should use the same keyboard layout.
 - The mouse pointer's shape (I-beam, resize arrows) isn't mirrored.
 - A locked Mac can't be captured or typed into. Unlock it with Screen Sharing. To stop it locking again when you
