@@ -73,7 +73,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var windowID: CGWindowID = 0     // the display's ID when streaming the whole desktop
     var desktop = false              // a whole display, not one app's window
     var opened = false               // streaming something: keeps this Mac's screen dark (Dark)
-    var aspect: Double?              // desktop: the viewer's screen shape, which a dark display may take (Dark.fit)
+    var viewer: (size: CGSize, scale: Double)?   // desktop: the viewer's screen, whose shape a dark display may take (Dark.fit)
     var ax: AXUIElement?
     var display: SCDisplay!
     var frame = CGRect.zero          // window frame, global points, top-left origin
@@ -178,7 +178,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         case "focus": if pid != 0 { inputQ.async { self.focus(force: false) } }   // proxy became the active window on the client
         case "resize":
             if !desktop { resize(m.w ?? frame.width, m.h ?? frame.height) }
-            else if let w = m.w, let h = m.h, h > 0 { aspect = w / h; DispatchQueue.main.async { Dark.tick() } }   // a shape to fit, if dark
+            else if let w = m.w, let h = m.h, w > 0, h > 0 {   // a shape to fit, if dark
+                viewer = (CGSize(width: w, height: h), m.scale ?? 1)
+                DispatchQueue.main.async { Dark.tick() }
+            }
         case "close": menuQ.async { pressClose(CGWindowID(m.k ?? 0)) }   // launcher menu's X; AX can block on a modal
         default:
             let f = frame
@@ -852,9 +855,9 @@ enum Dark {
     /// window instead of being a letterboxed strip (an ultrawide on a laptop). Back to its own mode once no dark Desktop
     /// wants it; the change is the host's alone, so macOS undoes it if the host dies.
     static func fit() {
-        var want: [CGDirectDisplayID: Double] = [:]
+        var want: [CGDirectDisplayID: (size: CGSize, scale: Double)] = [:]
         if enabled {
-            for s in sessions.values where s.desktop && s.opened && !s.ended { if let a = s.aspect { want[s.windowID] = a } }
+            for s in sessions.values where s.desktop && s.opened && !s.ended { if let v = s.viewer { want[s.windowID] = v } }
         }
         for (d, own) in fitted where want[d] == nil {
             fitted[d] = nil
@@ -862,8 +865,8 @@ enum Dark {
             set(d, own)
         }
         let physical = physicalDisplays()
-        for (d, aspect) in want where physical.contains(d) {
-            guard let current = CGDisplayCopyDisplayMode(d), let best = bestMode(d, aspect),
+        for (d, viewer) in want where physical.contains(d) {
+            guard let current = CGDisplayCopyDisplayMode(d), let best = bestMode(d, for: viewer.size, scale: viewer.scale),
                   best.width != current.width || best.height != current.height,
                   fittedTo[d].map({ $0.width != best.width || $0.height != best.height }) ?? true else { continue }
             if fitted[d] == nil { fitted[d] = current }
@@ -872,13 +875,11 @@ enum Dark {
         }
     }
 
-    /// Among the modes nearest the viewer's shape, the one with the most room.
-    static func bestMode(_ d: CGDirectDisplayID, _ aspect: Double) -> CGDisplayMode? {
+    static func bestMode(_ d: CGDirectDisplayID, for viewer: CGSize, scale: Double) -> CGDisplayMode? {
         let modes = (CGDisplayCopyAllDisplayModes(d, [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary) as? [CGDisplayMode] ?? [])
-            .filter { $0.isUsableForDesktopGUI() && $0.width >= 1024 }
-        let off = { (m: CGDisplayMode) in abs(Double(m.width) / Double(m.height) - aspect) }
-        guard let nearest = modes.map(off).min() else { return nil }
-        return modes.filter { off($0) - nearest < 0.02 }.max { ($0.width * $0.height, $0.pixelWidth) < ($1.width * $1.height, $1.pixelWidth) }
+            .filter { $0.isUsableForDesktopGUI() }
+        return Shared.bestMode(modes.map { ModeSize(width: $0.width, height: $0.height, pixelWidth: $0.pixelWidth) },
+                               for: viewer, scale: scale).map { modes[$0] }
     }
 
     static func set(_ d: CGDirectDisplayID, _ m: CGDisplayMode) {

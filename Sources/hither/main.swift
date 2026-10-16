@@ -370,8 +370,8 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
 
     /// A desktop: tell the host this screen's shape, which a dark display there takes on (an ultrawide becomes 16:10).
     func sendShape() {
-        guard isDesktop, let s = (window?.screen ?? NSScreen.main)?.frame.size else { return }
-        var m = Msg("resize"); m.w = s.width; m.h = s.height
+        guard isDesktop, let screen = window?.screen ?? NSScreen.main else { return }
+        var m = Msg("resize"); m.w = screen.frame.width; m.h = screen.frame.height; m.scale = screen.backingScaleFactor
         wire?.send(m)
     }
 

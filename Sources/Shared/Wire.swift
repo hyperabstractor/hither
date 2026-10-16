@@ -28,6 +28,7 @@ public struct Msg: Codable {
     public var caps: [String]?
     public var codec: String?        // "h264" | "hevc" | "hevc422": host's current choice (in "windows"), or a new one ("codec")
     public var dark: Bool?           // Keep Screen Dark on the host: its setting (in "windows"), or a new one ("dark")
+    public var scale: Double?        // a desktop's "resize": the viewer's screen is Retina (2) or not (1)
     public var peer: String?, name: String?, key: Data?, nonce: Data?, commit: Data?   // pairing
     public init(_ t: String) { self.t = t }
 }
