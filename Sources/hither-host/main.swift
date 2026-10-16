@@ -67,7 +67,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var onEnd: () -> Void = {}
 
     var pid: pid_t = 0
-    var windowID: CGWindowID = 0
+    var windowID: CGWindowID = 0     // the display's ID when streaming the whole desktop
+    var desktop = false              // a whole display, not one app's window
     var ax: AXUIElement?
     var display: SCDisplay!
     var frame = CGRect.zero          // window frame, global points, top-left origin
@@ -132,7 +133,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             viewerAudio = m.caps?.contains("audio") == true
             if m.caps?.contains("restore") == true { original = .zero }   // filled in once the window is known
             inputQ.async { wake() }   // a sleeping display may give the new window no frames
-            Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
+            if m.app == desktopApp { Task { await openDesktop(CGDirectDisplayID(m.k ?? 0)) } }
+            else { Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) } }
         case "ack":
             unacked -= 1
             if !inflight.isEmpty {
@@ -163,7 +165,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             log("\(appName) \(visible ? "visible" : "hidden — paused")")
             pump()   // newly visible: send whatever changed while hidden
         case "focus": if pid != 0 { inputQ.async { self.focus(force: false) } }   // proxy became the active window on the client
-        case "resize": resize(m.w ?? frame.width, m.h ?? frame.height)
+        case "resize": if !desktop { resize(m.w ?? frame.width, m.h ?? frame.height) }   // a display's size isn't ours to change
         case "close": menuQ.async { pressClose(CGWindowID(m.k ?? 0)) }   // launcher menu's X; AX can block on a modal
         default:
             let f = frame
@@ -281,11 +283,34 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// The whole display `id` (0, or one that's gone: the main one), like Screen Sharing but through Hither's stream.
+    func openDesktop(_ id: CGDirectDisplayID) async {
+        let main = CGMainDisplayID()
+        q.sync {
+            desktop = true
+            codec = viewerCodec()
+            windowID = id != 0 && CGDisplayIsOnline(id) != 0 ? id : main
+            frame = CGDisplayBounds(windowID)
+            if case .hostPort(_, let port) = wire.conn.endpoint { appName = "Desktop:\(port)" } else { appName = "Desktop" }
+        }
+        var m = Msg("opened")
+        m.app = "Desktop"
+        m.title = localName()
+        m.w = frame.width; m.h = frame.height
+        m.k = Int(windowID)
+        wire.send(m)
+        log("opening desktop \(Int(frame.width))×\(Int(frame.height)), accessibility=\(AXIsProcessTrusted())")
+        await capture()
+    }
+
     /// (Re)attach capture to whatever display the window is on *now*. Displays come and go
     /// (Screen Sharing connects/disconnects, monitor sleeps), so a stopped stream retries instead of dying.
     func capture() async {
         guard !ended else { return }
-        guard q.sync(execute: readFrame) != nil else { return fail("window closed") }
+        guard q.sync(execute: readFrame) != nil else {
+            if q.sync(execute: { desktop }) { log("no display yet, retrying"); return retry() }   // a headless Mac between screens
+            return fail("window closed")
+        }
         do {
             let c = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
             let setup: (SCContentFilter, SCStreamConfiguration)? = q.sync {
@@ -337,6 +362,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Capture the whole app on the display (so menus, sheets, popovers, Open/Save panels come along),
     /// cropped to our window, minus the app's *other* main windows so they don't bleed through.
     func filter(_ c: SCShareableContent) -> SCContentFilter {
+        if desktop { return SCContentFilter(display: display, excludingWindows: []) }
         let apps = c.applications.filter { $0.processID == pid || $0.bundleIdentifier == panelService }
         // ponytail: "fully inside our frame" = sheet/dialog heuristic; per-window proxies if it misfires
         let others = c.windows.filter { $0.owningApplication?.processID == pid && $0.windowID != windowID
@@ -375,6 +401,11 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func readFrame() -> CGRect? {
+        if desktop {   // a display that went away (Screen Sharing's, say): follow the main one
+            if CGDisplayIsOnline(windowID) == 0 { windowID = CGMainDisplayID() }
+            let r = CGDisplayBounds(windowID)
+            return r.isEmpty ? nil : r
+        }
         guard let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]])?.first,
               let b = info[kCGWindowBounds as String] else { return nil }
         if let t = info[kCGWindowName as String] as? String, t != title {
@@ -386,7 +417,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func poll() {
         guard !ended else { return }
-        guard let r = readFrame() else { return fail("window closed") }
+        guard let r = readFrame() else { return desktop ? () : fail("window closed") }
         if r != frame {
             frame = r
             // Moved where capture can't follow (partly off its display, onto another): the stream would keep the old
@@ -601,6 +632,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Keys/clicks land in whatever is frontmost on this Mac, so make sure that's our window first.
     func focus(force: Bool) {
+        guard !desktop else { return }   // the whole screen: input goes wherever it lands, as at the Mac itself
         let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
         guard force || front != pid || lastRaised != windowID else { return }
         if nRaises < 3 { log("raise \(appName): front=\(front.map(String.init) ?? "nil") pid=\(pid) lastRaised=\(lastRaised) win=\(windowID)") }
@@ -617,7 +649,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Runs on inputQ. `frame` is a snapshot taken on the session queue.
     func input(_ m: Msg, frame: CGRect) {
-        guard pid != 0 else { return }
+        guard pid != 0 || desktop else { return }
         if m.t != "mouse" || m.k != 0 { lastInputAt = CACurrentMediaTime(); wake() }   // hover doesn't count
         let pt = CGPoint(x: frame.minX + (m.x ?? 0), y: frame.minY + (m.y ?? 0))
         let flags = CGEventFlags(rawValue: m.f ?? 0)
@@ -651,7 +683,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             let b = min(m.b ?? 0, 2), kind = m.k ?? 0
             if kind == 1 { focus(force: true) }
             // hover lands on whatever is topmost at that point here; skip it unless that's our window
-            if kind == 0 && lastRaised != windowID { return }
+            if kind == 0 && !desktop && lastRaised != windowID { return }
             let types: [[CGEventType]] = [[.mouseMoved, .mouseMoved, .mouseMoved],
                                           [.leftMouseDown, .rightMouseDown, .otherMouseDown],
                                           [.leftMouseUp, .rightMouseUp, .otherMouseUp],

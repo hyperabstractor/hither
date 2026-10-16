@@ -8,6 +8,8 @@ import SystemConfiguration
 public let port: NWEndpoint.Port = 7420
 public let pairPort: NWEndpoint.Port = 7422    // pairing, plain TCP; advertised over Bonjour
 public let serviceType = "_hither._tcp"
+/// The "app" to open for a whole display rather than one window: its menu bar, Dock and every window on it.
+public let desktopApp = "@desktop"
 
 /// Every control/input message. One loose struct beats a dozen types for a wire this small.
 public struct Msg: Codable {

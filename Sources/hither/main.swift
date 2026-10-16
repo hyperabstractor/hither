@@ -176,7 +176,8 @@ var proxies: [ProxyWindow] = []
 
 final class ProxyWindow: NSObject, NSWindowDelegate {
     let host: String, app: String, titleFilter: String?
-    var windowID: Int     // pins reconnects to the exact remote window, even after its title changes
+    var windowID: Int     // pins reconnects to the exact remote window (a display's ID for the desktop)
+    var isDesktop: Bool { app == desktopApp }   // a whole display: resizing here scales it, never resizes it there
     let view = StreamView(frame: .zero)
     var window: NSWindow?
     var wire: Wire?
@@ -282,6 +283,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
             }
         case "size":
             remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
+            if isDesktop { window?.contentAspectRatio = remoteSize; return }
             guard let w = window, !w.inLiveResize, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) else { return }
             w.setContentSize(fit(remoteSize))
         default: break
@@ -303,6 +305,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         w.contentView = view
         w.delegate = self
         w.makeFirstResponder(view)
+        if isDesktop { w.contentAspectRatio = remoteSize }
         if let last = proxies.last(where: { $0.window != nil })?.window { w.setFrameTopLeftPoint(last.cascadeTopLeft(from: .zero)) } else { w.center() }
         window = w
         AudioOut.shared.claim(ObjectIdentifier(self))
@@ -359,14 +362,14 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     }
 
     func windowDidResize(_ n: Notification) {
-        guard let s = window?.contentLayoutRect.size, s != remoteSize else { return }
+        guard !isDesktop, let s = window?.contentLayoutRect.size, s != remoteSize else { return }
         var m = Msg("resize"); m.w = s.width.rounded(); m.h = s.height.rounded()
         wire?.send(m)
     }
 
     func windowDidEndLiveResize(_ n: Notification) {
         // host may have clamped us (window can't exceed its display there) — snap to what it really is
-        if let w = window, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) { w.setContentSize(fit(remoteSize)) }
+        if !isDesktop, let w = window, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) { w.setContentSize(fit(remoteSize)) }
     }
 
     /// Never grow past this screen: if the host can't shrink its window (some apps refuse), show it scaled instead.
@@ -728,6 +731,7 @@ final class Launcher: NSObject, NSMenuDelegate {
         status.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Hither")
         menu.delegate = self
         status.menu = menu
+        icons[desktopApp] = NSImage(systemSymbolName: "display", accessibilityDescription: "Desktop").flatMap(desktopIcon)
         remotes = Pairings.load().peers.filter { $0.viewer != true }.map { Remote($0, launcher: self) }
         rebuild()
         startPairing()
@@ -920,6 +924,7 @@ final class Launcher: NSObject, NSMenuDelegate {
     /// One paired Mac: its windows, then what to do with it.
     func section(_ mac: Remote) {
         menu.addItem(withTitle: mac.state.isEmpty ? "On \(mac.name)" : "\(mac.name): \(mac.state)", action: nil, keyEquivalent: "").isEnabled = false
+        add("Desktop", Row(item: Item(id: 0, app: "Desktop", bundle: desktopApp, title: ""), mac: mac), indent: 0).image = icon(desktopApp)
         var apps: [String] = []
         for i in mac.items where !apps.contains(i.bundle) { apps.append(i.bundle) }
         for b in apps {
@@ -1048,7 +1053,7 @@ final class Launcher: NSObject, NSMenuDelegate {
     }
 
     func openItem(_ w: Item, on mac: Remote) {
-        remember(w, on: mac)
+        if w.bundle != desktopApp { remember(w, on: mac) }   // Recent is for apps; Desktop is always at the top
         let icon = icons[w.bundle], host = mac.name
         buildQ.async {   // same queue as the bulk proxy build, so they never write one bundle at once
             do {
@@ -1179,6 +1184,21 @@ func pipe(_ from: NWConnection, _ to: NWConnection, onEOF: @escaping () -> Void)
         if let data, !data.isEmpty { to.send(content: data, completion: .idempotent) }
         pipe(from, to, onEOF: onEOF)
     }
+}
+
+/// The Desktop proxy's icon: a display symbol on a plain tile, as PNG (proxies get theirs from PNG data).
+func desktopIcon(_ symbol: NSImage) -> Data? {
+    let size = NSSize(width: 256, height: 256)
+    let img = NSImage(size: size, flipped: false) { r in
+        NSColor.systemBlue.setFill()
+        NSBezierPath(roundedRect: r.insetBy(dx: 16, dy: 16), xRadius: 48, yRadius: 48).fill()
+        let glyph = symbol.withSymbolConfiguration(.init(pointSize: 120, weight: .regular).applying(.init(paletteColors: [.white]))) ?? symbol
+        let g = glyph.size
+        glyph.draw(in: NSRect(x: (r.width - g.width) / 2, y: (r.height - g.height) / 2, width: g.width, height: g.height))
+        return true
+    }
+    guard let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+    return NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
 }
 
 func writeICNS(_ png: Data, to url: URL) -> Bool {
