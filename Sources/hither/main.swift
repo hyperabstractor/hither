@@ -573,9 +573,10 @@ final class CloseRow: NSView {
 
 final class Launcher: NSObject, NSMenuDelegate {
     /// The Mac whose windows this menu shows (the first one paired; iPhones only view). nil until paired.
-    var peer: Peer? { didSet { relayHost.withLock { $0 = peer == nil ? nil : host } } }
-    var host: String { "\(peer?.name ?? "").local" }
-    let relayHost = OSAllocatedUnfairLock<String?>(initialState: nil)   // read on the relay queue
+    var peer: Peer? { didSet { relayPeer.withLock { $0 = peer } } }
+    var name: String { peer?.name ?? "" }
+    let relayPeer = OSAllocatedUnfairLock<Peer?>(initialState: nil)   // read on the relay queue
+    var attempt = 0   // the control connection tries the peer's names (Reach.hosts) in turn
     var nearby: [(name: String, endpoint: NWEndpoint)] = []   // other Macs running Hither (Bonjour)
     var pairListener: NWListener?
     var browser: NWBrowser?
@@ -725,27 +726,33 @@ final class Launcher: NSObject, NSMenuDelegate {
         let params = NWParameters(tls: nil, tcp: tcpOptions())
         params.requiredInterfaceType = .loopback
         guard let l = try? NWListener(using: params, on: relayPort) else { return log("relay: port \(relayPort) busy") }
-        l.newConnectionHandler = { [relayHost] local in
-            guard let host = relayHost.withLock({ $0 }) else { return local.cancel() }
-            let remote = NWConnection(host: NWEndpoint.Host(host), port: port, using: NWParameters(tls: nil, tcp: tcpOptions()))
-            var finishedDirections = 0   // both pipe callbacks run on q
-            let finished: () -> Void = {
-                finishedDirections += 1
-                if finishedDirections == 2 {
-                    q.asyncAfter(deadline: .now() + 2) { local.cancel(); remote.cancel() }
-                }
-            }
-            for c in [local, remote] {
-                c.stateUpdateHandler = { s in
-                    switch s {
-                    case .failed, .cancelled, .waiting: local.cancel(); remote.cancel()
-                    default: break
+        l.newConnectionHandler = { [relayPeer] local in
+            guard let peer = relayPeer.withLock({ $0 }) else { return local.cancel() }
+            local.start(queue: q)   // nothing is read from it until the host end is up
+            connectFirst(Reach.hosts(peer), queue: q) { remote in
+                guard let remote else { log("relay: can't reach \(peer.name)"); return local.cancel() }
+                var finishedDirections = 0   // both pipe callbacks run on q
+                let finished: () -> Void = {
+                    finishedDirections += 1
+                    if finishedDirections == 2 {
+                        q.asyncAfter(deadline: .now() + 2) { local.cancel(); remote.cancel() }
                     }
                 }
-                c.start(queue: q)
+                for c in [local, remote] {
+                    c.stateUpdateHandler = { s in
+                        switch s {
+                        case .failed, .cancelled, .waiting: local.cancel(); remote.cancel()
+                        default: break
+                        }
+                    }
+                }
+                switch local.state {   // the proxy may have gone away meanwhile
+                case .failed, .cancelled: return remote.cancel()
+                default: break
+                }
+                pipe(local, remote, onEOF: finished)
+                pipe(remote, local, onEOF: finished)
             }
-            pipe(local, remote, onEOF: finished)
-            pipe(remote, local, onEOF: finished)
         }
         l.stateUpdateHandler = { if case .failed(let e) = $0 { log("relay: \(e)") } }
         l.start(queue: q)
@@ -760,22 +767,26 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     /// One long-lived control connection; each menu open asks for a fresh window list.
     func refresh() {
-        guard peer != nil else { return }
+        guard let peer else { return }
         if wire == nil {
+            let hosts = Reach.hosts(peer), host = hosts[attempt % hosts.count]
             let w = dial(host), me = ObjectIdentifier(w)
             w.onClose = { [weak self] in
-                onMain {
-                    guard let cur = self?.wire, ObjectIdentifier(cur) == me else { return }   // already replaced (re-paired)
-                    self?.wire = nil
-                    self?.state = "can't reach \(self?.host ?? "")"
-                    self?.rebuild()
-                    // keep trying: the first connect after install/login can hit the Local Network race
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if self?.wire == nil { self?.refresh() } }
+                onMain { [weak self] in
+                    guard let self, let cur = wire, ObjectIdentifier(cur) == me else { return }   // already replaced (re-paired)
+                    wire = nil
+                    attempt += 1
+                    let triedAll = attempt % hosts.count == 0
+                    if triedAll { state = "can't reach \(peer.name)"; rebuild() }
+                    // keep trying: the Mac may be asleep or out of reach, or this is the Local Network race after login
+                    DispatchQueue.main.asyncAfter(deadline: .now() + (triedAll ? 3 : 0.2)) { [weak self] in
+                        if self?.wire == nil { self?.refresh() }
+                    }
                 }
             }
             w.onMsg = { [weak self] m in
                 switch m.t {
-                case "windows": onMain { self?.codec = m.codec ?? "h264"; self?.update(m.items ?? []) }
+                case "windows": onMain { Reach.worked(host, for: peer); self?.codec = m.codec ?? "h264"; self?.update(m.items ?? []) }
                 case "apps": onMain { self?.makeProxies(m.items ?? []) }
                 case "appeared": onMain { self?.appeared(m.items ?? []) }
                 default: break
@@ -785,6 +796,7 @@ final class Launcher: NSObject, NSMenuDelegate {
             w.start()
             w.send(Msg("apps"))   // every (re)connect: a proxy per installed app, so Spotlight finds "Xcode · mini"
             w.send(Msg("watch"))  // …and new windows over there (Cmd-N, launched apps) open here by themselves
+            Reach.giveUpLater(on: w)
         }
         wire?.send(Msg("list"))
     }
@@ -798,7 +810,7 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func makeProxies(_ apps: [Item]) {
         for a in apps { if let icon = a.icon { icons[a.bundle] = icon } }
-        let host = host
+        let host = name   // proxies reach it through the relay, by name
         buildQ.async {
             let made = apps.filter { (try? self.ensureProxy($0, icon: $0.icon, host: host))?.2 == true }.count
             log("proxies: \(apps.count) apps on \(host), \(made) created/updated")
@@ -818,7 +830,7 @@ final class Launcher: NSObject, NSMenuDelegate {
             }
             return footer()
         }
-        menu.addItem(withTitle: state.isEmpty ? "On \(short(host))" : "\(short(host)): \(state)", action: nil, keyEquivalent: "").isEnabled = false
+        menu.addItem(withTitle: state.isEmpty ? "On \(peer.name)" : "\(peer.name): \(state)", action: nil, keyEquivalent: "").isEnabled = false
         var apps: [String] = []
         for i in items where !apps.contains(i.bundle) { apps.append(i.bundle) }
         for b in apps {
@@ -945,7 +957,7 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func openItem(_ w: Item) {
         remember(w)
-        let icon = icons[w.bundle], host = host
+        let icon = icons[w.bundle], host = name
         buildQ.async {   // same queue as the bulk proxy build, so they never write one bundle at once
             do {
                 let (url, id, _) = try self.ensureProxy(w, icon: icon, host: host)
@@ -1010,7 +1022,10 @@ final class Launcher: NSObject, NSMenuDelegate {
         wire?.send(m)
     }
 
-    @objc func screenShare() { NSWorkspace.shared.open(URL(string: "vnc://\(host)")!) }
+    @objc func screenShare() {
+        guard let peer, let host = Reach.hosts(peer).first else { return }   // the name that answered last
+        NSWorkspace.shared.open(URL(string: "vnc://\(host)")!)
+    }
 
     @objc func quit() {
         DistributedNotificationCenter.default().postNotificationName(quitNote, object: nil, userInfo: nil, deliverImmediately: true)
@@ -1031,6 +1046,31 @@ final class Launcher: NSObject, NSMenuDelegate {
         } catch { log("login item: \(error)") }
         rebuild()
     }
+}
+
+/// Plain TCP to the host on the first of `hosts` that's up within Reach.patience, trying them in order; nil if none.
+func connectFirst(_ hosts: [String], queue q: DispatchQueue, _ done: @escaping (NWConnection?) -> Void) {
+    guard let host = hosts.first else { return done(nil) }
+    let c = NWConnection(host: NWEndpoint.Host(host), port: port, using: NWParameters(tls: nil, tcp: tcpOptions()))
+    var settled = false   // everything here runs on q
+    let next = {
+        guard !settled else { return }
+        settled = true
+        c.cancel()
+        connectFirst(Array(hosts.dropFirst()), queue: q, done)
+    }
+    c.stateUpdateHandler = { s in
+        switch s {
+        case .ready:
+            guard !settled else { return }
+            settled = true
+            done(c)
+        case .waiting, .failed: next()
+        default: break
+        }
+    }
+    c.start(queue: q)
+    q.asyncAfter(deadline: .now() + Reach.patience, execute: next)
 }
 
 func pipe(_ from: NWConnection, _ to: NWConnection, onEOF: @escaping () -> Void) {
