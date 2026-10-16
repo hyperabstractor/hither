@@ -27,6 +27,9 @@ let inputQ = DispatchQueue(label: "input")
 /// off both the session and input queues.
 let menuQ = DispatchQueue(label: "menu")
 var lastInputAt: CFTimeInterval = 0
+/// Input through a window proxy (not a desktop): a new window soon after is the user's doing, so it follows them.
+/// Through a desktop they already see it there.
+var lastWindowInputAt: CFTimeInterval = 0
 var wakeID: IOPMAssertionID = 0, lastWake: CFTimeInterval = 0
 /// Runs on inputQ. Remote use counts as someone at this Mac: wakes a sleeping display (capture needs it) and
 /// resets the idle timer, exactly like touching its own keyboard.
@@ -156,6 +159,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             let path = m.path ?? []
             inputQ.async {
                 lastInputAt = CACurrentMediaTime()   // File › New Window etc. count as the user's doing
+                lastWindowInputAt = lastInputAt
                 wake()
                 self.focus(force: false)   // e.g. File › Save acts on the key window, so make it ours
                 menuQ.async { if let e = self.menuItems(at: path.dropLast())?[safe: path.last ?? -1] { AXUIElementPerformAction(e, kAXPressAction as CFString) } }
@@ -650,7 +654,11 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Runs on inputQ. `frame` is a snapshot taken on the session queue.
     func input(_ m: Msg, frame: CGRect) {
         guard pid != 0 || desktop else { return }
-        if m.t != "mouse" || m.k != 0 { lastInputAt = CACurrentMediaTime(); wake() }   // hover doesn't count
+        if m.t != "mouse" || m.k != 0 {   // hover doesn't count
+            lastInputAt = CACurrentMediaTime()
+            if !desktop { lastWindowInputAt = lastInputAt }
+            wake()
+        }
         let pt = CGPoint(x: frame.minX + (m.x ?? 0), y: frame.minY + (m.y ?? 0))
         let flags = CGEventFlags(rawValue: m.f ?? 0)
         switch m.t {
@@ -827,7 +835,7 @@ func watchWindows() {
         let pid = w[kCGWindowOwnerPID as String] as? pid_t ?? 0
         let f = (w[kCGWindowBounds as String]).flatMap { CGRect(dictionaryRepresentation: $0 as! CFDictionary) } ?? .zero
         guard f.width > 100, f.height > 100,
-              CACurrentMediaTime() - lastInputAt < 15 || sessions.values.contains(where: { $0.pid == pid }),
+              CACurrentMediaTime() - lastWindowInputAt < 15 || sessions.values.contains(where: { $0.pid == pid }),
               let app = NSRunningApplication(processIdentifier: pid), app.activationPolicy == .regular,
               let bundle = app.bundleIdentifier, !isOurs(bundle), !launchingApps.contains(bundle)
         else { knownWindows.insert(id); continue }
