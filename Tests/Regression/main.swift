@@ -30,6 +30,8 @@ do {
     print("PASS iPhone pairs as a viewer")
     try testReach()
     print("PASS a Mac is reached by name, Tailscale name, then its paired address")
+    try testFrameWindow()
+    print("PASS frame window opens up over a long link and backs off when it fills")
     let arguments = CommandLine.arguments
     if arguments.count == 4, arguments[1] == "--remote" {
         try testMissingRemoteWindow(host: arguments[2], app: arguments[3], throughRelay: false)

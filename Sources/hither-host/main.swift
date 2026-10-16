@@ -84,6 +84,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var encSize = (0, 0)
     var forceKey = true
     var unacked = 0                  // frames sent but not yet acked by the viewer
+    var window = FrameWindow()       // how many may be: grows over a long link, shrinks when it fills
+    var held = false                 // a frame waited on the window since the last ack
     var pending: CVPixelBuffer?      // newest frame we skipped while the viewer was behind
     var inputSeq: UInt32 = 0         // last injected keyDown seq, stamped on frames for the latency meter
     var scrollAcc = (0.0, 0.0)
@@ -133,7 +135,12 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) }
         case "ack":
             unacked -= 1
-            if !inflight.isEmpty { rtts.append((CACurrentMediaTime() - inflight.removeFirst()) * 1000) }
+            if !inflight.isEmpty {
+                let now = CACurrentMediaTime(), rtt = (now - inflight.removeFirst()) * 1000
+                rtts.append(rtt)
+                window.ack(rtt: rtt, at: now, held: held)
+                held = false
+            }
             pump()
         case "keyframe": forceKey = true
         case "menu":
@@ -400,9 +407,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         ticks += 1
         if ticks % 20 == 0 && (nFrames > 0 || nRaises > 0 || nAudio > 0) {
             let r = rtts.sorted()
-            log(String(format: "stats %@: %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms delayed=%d raises=%d (%.0fms avg) audio=%d/s peak=%.2f",
+            log(String(format: "stats %@: %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms window=%d delayed=%d raises=%d (%.0fms avg) audio=%d/s peak=%.2f",
                        appName, nFrames / 5, Double(nBytes) * 8 / 5e6, nKeys, nFrames > 0 ? encMs / Double(nFrames) : 0,
-                       r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, nDelayed, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
+                       r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, window.limit, nDelayed, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
             nAudio = 0; audioPeak = 0; nFrames = 0; nBytes = 0; nKeys = 0; nDelayed = 0; nRaises = 0; encMs = 0; raiseMs = 0; rtts = []
         }
         if ticks % 4 == 0 {  // new/closed sibling windows → refresh exclusions ~1/s
@@ -455,10 +462,11 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         pump()
     }
 
-    /// Encode the newest captured frame once the viewer has caught up (≤2 frames in flight). The Mac has one
-    /// hardware encoder, so: focused window full rate; visible background ≤10 fps (2 while you type); hidden paused.
+    /// Encode the newest captured frame once the viewer has caught up (no more in flight than the window allows). The
+    /// Mac has one hardware encoder, so: focused window full rate; visible background ≤10 fps (2 while you type); hidden paused.
     func pump() {
-        guard !ended, visible, let p = pending, unacked < 2 else { return }
+        guard !ended, visible, let p = pending else { return }
+        guard unacked < window.limit else { held = true; return }
         let busy = CACurrentMediaTime() - lastInputAt < 0.5
         let gap = windowID == lastRaised ? 0 : busy ? 0.5 : 0.1
         let wait = lastEncode + gap - CACurrentMediaTime()
