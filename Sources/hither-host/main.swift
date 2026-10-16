@@ -73,6 +73,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var windowID: CGWindowID = 0     // the display's ID when streaming the whole desktop
     var desktop = false              // a whole display, not one app's window
     var opened = false               // streaming something: keeps this Mac's screen dark (Dark)
+    var aspect: Double?              // desktop: the viewer's screen shape, which a dark display may take (Dark.fit)
     var ax: AXUIElement?
     var display: SCDisplay!
     var frame = CGRect.zero          // window frame, global points, top-left origin
@@ -175,7 +176,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             log("\(appName) \(visible ? "visible" : "hidden — paused")")
             pump()   // newly visible: send whatever changed while hidden
         case "focus": if pid != 0 { inputQ.async { self.focus(force: false) } }   // proxy became the active window on the client
-        case "resize": if !desktop { resize(m.w ?? frame.width, m.h ?? frame.height) }   // a display's size isn't ours to change
+        case "resize":
+            if !desktop { resize(m.w ?? frame.width, m.h ?? frame.height) }
+            else if let w = m.w, let h = m.h, h > 0 { aspect = w / h; DispatchQueue.main.async { Dark.tick() } }   // a shape to fit, if dark
         case "close": menuQ.async { pressClose(CGWindowID(m.k ?? 0)) }   // launcher menu's X; AX can block on a modal
         default:
             let f = frame
@@ -818,6 +821,10 @@ enum Dark {
 
     static func start() {
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in tick() }
+        // any display change (mode, wake, a monitor plugged in) resets gamma: black it out again at once
+        CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
+            if !flags.contains(.beginConfigurationFlag) { DispatchQueue.main.async { if Dark.dark { Dark.blackOut() } } }
+        }, nil)
         tick()
     }
 
@@ -832,8 +839,55 @@ enum Dark {
             log("nothing streamed for \(Int(grace)) s: locking")
             lock()
         }
+        fit()
         // dark while in use, through the grace period, and for a moment after locking so the desktop never flashes up
         if enabled && (idle < grace || now - lockedAt < 2) { blackOut() } else if dark { restore() }
+    }
+
+    static var fitted: [CGDirectDisplayID: CGDisplayMode] = [:]   // displays switched to a viewer's shape: their own mode
+    static var fittedTo: [CGDirectDisplayID: CGDisplayMode] = [:] // …and the mode they were switched to (macOS reports the
+                                                                   // old one for a moment after a switch)
+
+    /// A dark monitor nobody looks at can take the shape of the screen a Desktop is viewed on, so the stream fills that
+    /// window instead of being a letterboxed strip (an ultrawide on a laptop). Back to its own mode once no dark Desktop
+    /// wants it; the change is the host's alone, so macOS undoes it if the host dies.
+    static func fit() {
+        var want: [CGDirectDisplayID: Double] = [:]
+        if enabled {
+            for s in sessions.values where s.desktop && s.opened && !s.ended { if let a = s.aspect { want[s.windowID] = a } }
+        }
+        for (d, own) in fitted where want[d] == nil {
+            fitted[d] = nil
+            fittedTo[d] = nil
+            set(d, own)
+        }
+        let physical = physicalDisplays()
+        for (d, aspect) in want where physical.contains(d) {
+            guard let current = CGDisplayCopyDisplayMode(d), let best = bestMode(d, aspect),
+                  best.width != current.width || best.height != current.height,
+                  fittedTo[d].map({ $0.width != best.width || $0.height != best.height }) ?? true else { continue }
+            if fitted[d] == nil { fitted[d] = current }
+            fittedTo[d] = best
+            set(d, best)
+        }
+    }
+
+    /// Among the modes nearest the viewer's shape, the one with the most room.
+    static func bestMode(_ d: CGDirectDisplayID, _ aspect: Double) -> CGDisplayMode? {
+        let modes = (CGDisplayCopyAllDisplayModes(d, [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary) as? [CGDisplayMode] ?? [])
+            .filter { $0.isUsableForDesktopGUI() && $0.width >= 1024 }
+        let off = { (m: CGDisplayMode) in abs(Double(m.width) / Double(m.height) - aspect) }
+        guard let nearest = modes.map(off).min() else { return nil }
+        return modes.filter { off($0) - nearest < 0.02 }.max { ($0.width * $0.height, $0.pixelWidth) < ($1.width * $1.height, $1.pixelWidth) }
+    }
+
+    static func set(_ d: CGDirectDisplayID, _ m: CGDisplayMode) {
+        var c: CGDisplayConfigRef?
+        CGBeginDisplayConfiguration(&c)
+        CGConfigureDisplayWithDisplayMode(c, d, m, nil)
+        let err = CGCompleteDisplayConfiguration(c, .forAppOnly)
+        log("display \(d) → \(m.width)×\(m.height): \(err == .success ? "ok" : "error \(err.rawValue)")")
+        if dark { blackOut() }   // a mode change resets gamma: black again before anyone sees the desktop
     }
 
     static func blackOut() {

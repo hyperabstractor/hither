@@ -277,13 +277,18 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
                 remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
                 updateTitle()
                 windowDidResize(Notification(name: NSWindow.didResizeNotification))
+                sendShape()
             } else {
                 open(m)
                 RemoteMenus.shared.install()
             }
         case "size":
             remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
-            if isDesktop { window?.contentAspectRatio = remoteSize; return }
+            if isDesktop {   // the display changed shape (Keep Screen Dark fit it to this screen): follow it
+                window?.contentAspectRatio = remoteSize
+                if let w = window, !w.styleMask.contains(.fullScreen) { w.setContentSize(fitShape(remoteSize)) }
+                return
+            }
             guard let w = window, !w.inLiveResize, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) else { return }
             w.setContentSize(fit(remoteSize))
         default: break
@@ -296,7 +301,8 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         remoteTitle = m.title ?? ""
         remoteSize = CGSize(width: m.w ?? 800, height: m.h ?? 600)
         let screen = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame.size ?? remoteSize
-        let size = CGSize(width: min(remoteSize.width, screen.width), height: min(remoteSize.height, screen.height - 28))
+        let size = isDesktop ? fitShape(remoteSize, in: screen)
+            : CGSize(width: min(remoteSize.width, screen.width), height: min(remoteSize.height, screen.height - 28))
         let w = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
@@ -314,6 +320,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         if let icon = m.icon.flatMap(NSImage.init(data:)) { NSApp.applicationIconImage = icon }
         NSApp.activate()
         if size != remoteSize { windowDidResize(Notification(name: NSWindow.didResizeNotification)) }
+        sendShape()
         if let n = Int(ProcessInfo.processInfo.environment["HITHER_TEST_TYPE"] ?? "") { selfTest(n) }
         if ProcessInfo.processInfo.environment["HITHER_TEST_MENU"] != nil {   // test hook: dump the first few remote menus
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
@@ -359,6 +366,20 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         window.title = remoteTitle.isEmpty ? appName : remoteTitle
         let extra = status ?? latency
         window.subtitle = "\(appName) on \(short(host))" + (extra.isEmpty ? "" : " · \(extra)")
+    }
+
+    /// A desktop: tell the host this screen's shape, which a dark display there takes on (an ultrawide becomes 16:10).
+    func sendShape() {
+        guard isDesktop, let s = (window?.screen ?? NSScreen.main)?.frame.size else { return }
+        var m = Msg("resize"); m.w = s.width; m.h = s.height
+        wire?.send(m)
+    }
+
+    /// `s` scaled down to fit the screen's usable area (title bar included), keeping its shape.
+    func fitShape(_ s: CGSize, in screen: CGSize? = nil) -> CGSize {
+        guard s.width > 0, s.height > 0, let v = screen ?? (window?.screen ?? NSScreen.main)?.visibleFrame.size else { return s }
+        let k = min(1, v.width / s.width, (v.height - 28) / s.height)
+        return CGSize(width: (s.width * k).rounded(), height: (s.height * k).rounded())
     }
 
     func windowDidResize(_ n: Notification) {
