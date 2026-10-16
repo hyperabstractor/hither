@@ -8,8 +8,8 @@ struct StreamScreen: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var phase
 
-    init(host: String, item: Item) {
-        _window = StateObject(wrappedValue: RemoteWindow(host: host, app: item.bundle, windowID: item.id,
+    init(mac: Peer, item: Item) {
+        _window = StateObject(wrappedValue: RemoteWindow(mac: mac, app: item.bundle, windowID: item.id,
                                                          title: item.title.isEmpty ? item.app : item.title))
     }
 

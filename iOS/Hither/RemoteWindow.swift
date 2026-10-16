@@ -8,7 +8,7 @@ import UIKit
 /// asks the Mac to size the real window to fit the phone ("restore" puts it back when the connection ends), and it
 /// reconnects after a Wi-Fi blip or when the app comes back to the front.
 final class RemoteWindow: ObservableObject {
-    let host: String, app: String
+    let mac: Peer, app: String
     var windowID: Int     // pins reconnects to the exact window, even after its title changes
     let view = StreamView()
     @Published var title = ""
@@ -20,10 +20,11 @@ final class RemoteWindow: ObservableObject {
     private var opened = false              // this connection has its window; resizes can go out
     private var requested: CGSize?          // the size last asked for on this connection
     private var retries = 0
+    private var host = ""                   // the name this connection dialed (see Reach)
     private var done = false, paused = false
 
-    init(host: String, app: String, windowID: Int, title: String) {
-        self.host = host; self.app = app; self.windowID = windowID; self.title = title
+    init(mac: Peer, app: String, windowID: Int, title: String) {
+        self.mac = mac; self.app = app; self.windowID = windowID; self.title = title
         view.send = { [weak self] in self?.wire?.send($0) }
         view.onWantSize = { [weak self] in self?.resize($0) }
         view.onLatency = { [weak self] ms in self?.latency = "\(ms) ms" }
@@ -32,6 +33,8 @@ final class RemoteWindow: ObservableObject {
 
     func connect() {
         guard !done, !paused, wire == nil else { return }
+        let hosts = Reach.hosts(mac)
+        host = hosts[retries % hosts.count]   // each retry tries the Mac's other name
         let w = Wire(NWConnection(host: NWEndpoint.Host(host), port: port, using: Pairings.load().tls(to: host)),
                      queue: DispatchQueue(label: "wire"))
         w.onClose = { [weak self, weak w] in
@@ -69,11 +72,12 @@ final class RemoteWindow: ObservableObject {
         // no "hevc422": an iPhone may not decode HEVC 4:2:2
         var m = Msg("open"); m.app = app; m.k = windowID; m.caps = ["hevc", "audio", "restore"]
         w.send(m)
+        Reach.giveUpLater(on: w)
     }
 
     func lost() {
         guard !done, !paused else { return }
-        guard retries < 30 else { status = "Can't reach \(host.split(separator: ".").first ?? "")"; return }
+        guard retries < 30 else { status = "Can't reach \(mac.name)"; return }
         retries += 1
         status = "Reconnecting…"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.connect() }
@@ -90,6 +94,7 @@ final class RemoteWindow: ObservableObject {
             windowID = id
             opened = true
             retries = 0
+            Reach.worked(host, for: mac)
             status = ""
             if let t = m.title, !t.isEmpty { title = t } else if let a = m.app { title = a }
             view.remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)

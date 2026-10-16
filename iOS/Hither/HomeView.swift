@@ -8,7 +8,7 @@ struct HomeView: View {
 
     struct Showing: Identifiable {
         let id = UUID()
-        let host: String, item: Item
+        let mac: Peer, item: Item
     }
 
     var body: some View {
@@ -32,7 +32,7 @@ struct HomeView: View {
                     }
                 }
                 let unpaired = macs.nearby.filter { n in !macs.paired.contains { $0.id == n.id } }
-                if macs.paired.isEmpty || !unpaired.isEmpty {
+                if macs.paired.isEmpty || !unpaired.isEmpty || macs.noLocalNetwork {
                     Section {
                         if unpaired.isEmpty {
                             HStack(spacing: 10) { ProgressView(); Text("Looking for Macs running Hither…").foregroundStyle(.secondary) }
@@ -51,7 +51,9 @@ struct HomeView: View {
                     } header: {
                         Text("Nearby Macs")
                     } footer: {
-                        Text("Open Hither on the Mac. You'll check that both screens show the same code.")
+                        Text(macs.noLocalNetwork
+                             ? "Hither can't look for Macs: turn on Local Network for it in Settings › Apps › Hither."
+                             : "Open Hither on the Mac. You'll check that both screens show the same code.")
                     }
                 }
             }
@@ -75,11 +77,11 @@ struct HomeView: View {
         } message: {
             Text(macs.problem ?? "")
         }
-        .fullScreenCover(item: $showing, onDismiss: { macs.refresh() }) { StreamScreen(host: $0.host, item: $0.item) }
+        .fullScreenCover(item: $showing, onDismiss: { macs.refresh() }) { StreamScreen(mac: $0.mac, item: $0.item) }
     }
 
     func show(_ item: Item, on mac: Peer) {
-        showing = Showing(host: Macs.host(mac), item: item)
+        showing = Showing(mac: mac, item: item)
     }
 }
 

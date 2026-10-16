@@ -8,6 +8,27 @@ struct NearbyMac: Identifiable {
     let id: String, name: String, endpoint: NWEndpoint, shares: Bool
 }
 
+/// How to reach a Mac: its Bonjour name on the home network ("mini.local"), its Tailscale name elsewhere ("mini",
+/// MagicDNS). Whichever answered last is tried first; a name that hasn't connected in 5 s gives way to the other.
+enum Reach {
+    static let patience = 5.0
+
+    static func hosts(_ mac: Peer) -> [String] {
+        let last = UserDefaults.standard.string(forKey: "reach.\(mac.id)")
+        return ["\(mac.name).local", mac.name].sorted { a, b in a == last && b != last }
+    }
+
+    static func worked(_ host: String, for mac: Peer) { UserDefaults.standard.set(host, forKey: "reach.\(mac.id)") }
+
+    /// Give up on a connection that isn't up yet, so its close handler tries the next name.
+    static func giveUpLater(on w: Wire) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + patience) { [weak w] in
+            guard let w, w.conn.state != .ready else { return }
+            w.close()
+        }
+    }
+}
+
 /// The pairing code on screen, waiting for Pair or Cancel.
 struct CodePrompt: Identifiable {
     let id = UUID()
@@ -25,6 +46,7 @@ final class Macs: ObservableObject {
     @Published var state: [String: String] = [:]     // why a Mac has no list: "Connecting…", "Can't reach mini"
     @Published var prompt: CodePrompt?
     @Published var problem: String?      // pairing failed
+    @Published var noLocalNetwork = false   // Local Network access is off: nothing nearby can be found
     var icons: [String: UIImage] = [:]   // by bundle; a list carries each app's icon once per connection
 
     private var browser: NWBrowser?
@@ -32,19 +54,20 @@ final class Macs: ObservableObject {
     private var wires: [String: Wire] = [:]
     private var active = true
 
-    static func host(_ mac: Peer) -> String { "\(mac.name).local" }
-
     /// Share This Mac is off there (as far as Bonjour says): it can't be reached, and here's why.
     func stopsSharing(_ mac: Peer) -> Bool { nearby.first { $0.id == mac.id }?.shares == false }
 
     init() {
         browse()
-        paired.forEach(connect)
+        paired.forEach { connect($0) }
     }
 
     // MARK: pairing
 
+    /// Looks again from scratch each time the app comes forward: a browser that failed (no network for a while)
+    /// stays failed.
     func browse() {
+        browser?.cancel()
         let b = NWBrowser(for: .bonjourWithTXTRecord(type: serviceType, domain: nil), using: NWParameters())
         b.browseResultsChangedHandler = { [weak self] results, _ in
             var seen = Set<String>()
@@ -54,9 +77,15 @@ final class Macs: ObservableObject {
                 return NearbyMac(id: id, name: name, endpoint: r.endpoint, shares: txt["shares"] != "0")
             }.sorted { $0.name < $1.name }
         }
-        b.stateUpdateHandler = { s in
+        b.stateUpdateHandler = { [weak self, weak b] s in
             switch s {
-            case .failed(let e), .waiting(let e): log("browse: \(e)")   // NoAuth = Local Network access is off
+            case .ready: self?.noLocalNetwork = false
+            case .waiting(let e):
+                log("browse: \(e)")
+                if case .dns(let code) = e, [kDNSServiceErr_PolicyDenied, kDNSServiceErr_NoAuth].contains(Int(code)) { self?.noLocalNetwork = true }
+            case .failed(let e):
+                log("browse: \(e)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if let self, self.browser === b { self.browse() } }
             default: break
             }
         }
@@ -95,16 +124,17 @@ final class Macs: ObservableObject {
 
     // MARK: the Macs' windows and apps
 
-    /// Keeps trying while the app is in front: the Mac may be asleep, or Local Network access not granted yet.
-    func connect(_ mac: Peer) {
+    /// Keeps trying while the app is in front, alternating between the Mac's names: it may be asleep, out of reach
+    /// without Tailscale, or Local Network access not granted yet.
+    func connect(_ mac: Peer, attempt: Int = 0) {
         guard active, wires[mac.id] == nil else { return }
-        let host = Self.host(mac)
+        let hosts = Reach.hosts(mac), host = hosts[attempt % hosts.count]
         if windows[mac.id, default: []].isEmpty { state[mac.id] = "Connecting…" }
         let w = Wire(NWConnection(host: NWEndpoint.Host(host), port: port, using: Pairings.load().tls(to: host)), queue: .main)
         w.onMsg = { [weak self] m in
             guard let self else { return }
             switch m.t {
-            case "windows": state[mac.id] = ""; windows[mac.id] = keepIcons(m.items ?? [])
+            case "windows": Reach.worked(host, for: mac); state[mac.id] = ""; windows[mac.id] = keepIcons(m.items ?? [])
             case "apps": apps[mac.id] = keepIcons(m.items ?? []).sorted { $0.app.localizedStandardCompare($1.app) == .orderedAscending }
             default: break
             }
@@ -112,15 +142,17 @@ final class Macs: ObservableObject {
         w.onClose = { [weak self, weak w] in
             guard let self, let w, wires[mac.id] === w else { return }
             wires[mac.id] = nil
-            state[mac.id] = "Can't reach \(mac.name)"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            let next = attempt + 1
+            if next % hosts.count == 0 { state[mac.id] = "Can't reach \(mac.name)" }   // tried every name
+            DispatchQueue.main.asyncAfter(deadline: .now() + (next % hosts.count == 0 ? 3 : 0.2)) { [weak self] in
                 guard let self, let still = paired.first(where: { $0.id == mac.id }) else { return }
-                connect(still)
+                connect(still, attempt: next)
             }
         }
         wires[mac.id] = w
         w.start()
         w.send(Msg("list"))
+        Reach.giveUpLater(on: w)
     }
 
     /// Hang up on this Mac and forget what it showed.
@@ -165,6 +197,7 @@ final class Macs: ObservableObject {
 
     func resume() {
         active = true
+        browse()
         refresh()
     }
 }
