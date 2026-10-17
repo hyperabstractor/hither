@@ -37,6 +37,7 @@ do {
     try testClip()
     print("PASS a clipboard crosses the wire; screenshots go as PNG; Finder files are refused")
     try testSeal()
+    try testFragments()
     try testLossyLink()
     try testVideoLink()
     print("PASS video datagrams: sealed, repaired after loss, and delivered in order over UDP")

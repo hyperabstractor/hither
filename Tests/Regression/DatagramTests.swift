@@ -23,6 +23,21 @@ func testSeal() throws {
     try expectNil(viewer.open(late))
 }
 
+/// A frame the encoder dropped goes as an empty packet: the viewer skips its number without losing the picture. And
+/// a fragment asked for twice within a round trip goes again only once.
+func testFragments() throws {
+    var frag = Fragmenter(), asm = Reassembler()
+    var shown: [Data] = []
+    for (seq, p) in [(UInt32(1), Data([1, 2, 3])), (2, Data()), (3, Data([4]))] {
+        for d in frag.fragments(p, seq: seq, key: seq == 1, at: 0) { shown += asm.receive(d, at: 0) }
+    }
+    try expectEqual(shown, [Data([1, 2, 3]), Data([4])])
+    try expectFalse(asm.broken)
+    try expectEqual(frag.resend(1, [0], at: 1, gap: 0.3).count, 1)
+    try expectEqual(frag.resend(1, [0], at: 1.2, gap: 0.3).count, 0)   // the first copy may still be on its way
+    try expectEqual(frag.resend(1, [], at: 1.4, gap: 0.3).count, 1)
+}
+
 /// Seeded, so a failure repeats.
 private struct LCG { var s: UInt64; mutating func next() -> Double { s = s &* 6364136223846793005 &+ 1442695040888963407; return Double(s >> 11) / Double(1 << 53) } }
 

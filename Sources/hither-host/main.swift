@@ -107,6 +107,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var heardAt: CFTimeInterval = 0
     var frag = Fragmenter()
     var lastKeyAt: CFTimeInterval = 0
+    var offeredAt: CFTimeInterval = 0   // "udp" sent: the first picture waits a moment for it rather than crawl through TCP
     var nLost = 0, nResent = 0
     var nFrames = 0, nBytes = 0, nKeys = 0, nDelayed = 0, nRaises = 0
     var encMs = 0.0, raiseMs = 0.0, rtts: [Double] = []
@@ -174,6 +175,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 let tag = UInt64.random(in: 1...UInt64.max)
                 seal = Seal(secret: secret, tag: tag, host: true)
                 udpLock.withLock { udpSessions[tag] = self }
+                offeredAt = CACurrentMediaTime()
                 var r = Msg("udp"); r.f = tag
                 wire.send(r)   // video stays on TCP until the viewer's datagrams get through
             }
@@ -550,7 +552,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         guard unacked < window.limit else { held = true; return }
         let busy = CACurrentMediaTime() - lastInputAt < 0.5
         let gap = desktop || windowID == lastRaised ? 0 : busy ? 0.5 : 0.1   // a desktop is always the one in front
-        let wait = lastEncode + gap - CACurrentMediaTime()
+        // a keyframe through cold TCP takes seconds at 300 ms; the viewer's first datagram is a round trip away
+        let udpSoon = seal != nil && flow == nil && frameSeq == 0 ? offeredAt + 1.5 - CACurrentMediaTime() : 0
+        let wait = max(lastEncode + gap - CACurrentMediaTime(), udpSoon)
         guard wait <= 0 else {
             if !pumpQueued {
                 pumpQueued = true
@@ -636,7 +640,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         VTCompressionSessionEncodeFrame(encoder, imageBuffer: px, presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
                                         duration: .invalid, frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
             guard let self else { return }
-            guard status == noErr, let sb else { self.q.async { self.inflight.removeAll { $0.seq == fseq } }; return }
+            guard status == noErr, let sb else {   // dropped: over UDP its number still goes, so the viewer doesn't wait for it
+                self.q.async { self.inflight.removeAll { $0.seq == fseq }; if udp { self.sendUDP(Data(), fseq) } }
+                return
+            }
             let p = packet(sb, seq), ms = (CACurrentMediaTime() - t0) * 1000
             if udp { self.q.async { self.sendUDP(p, fseq) } } else { self.wire.sendVideo(p) }
             self.q.async { self.nFrames += 1; self.nBytes += p.count; self.encMs += ms; if p[4] & 0x7f != 0 { self.nKeys += 1 } }
@@ -808,7 +815,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func sendUDP(_ p: Data, _ seq: UInt32) {
-        let key = p[p.startIndex + 4] & 0x7f != 0
+        let key = p.count > 4 && p[p.startIndex + 4] & 0x7f != 0
         if key { lastKeyAt = CACurrentMediaTime() }
         sendDatagrams(frag.fragments(p, seq: seq, key: key, at: CACurrentMediaTime()))
     }
@@ -832,6 +839,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             flow = f
             forceKey = true   // a fresh start on the new path
             if pending == nil { pending = lastFrame }
+            pump()
         }
         var r = Reader(plain)
         switch r.u8() {
@@ -849,7 +857,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         case 3:   // nack: fragments to send again
             let seq = r.u32(), n = Int(r.u16())
             guard plain.count >= 7 + 2 * n else { return }
-            let again = frag.resend(seq, (0..<n).map { _ in Int(r.u16()) })
+            let again = frag.resend(seq, (0..<n).map { _ in Int(r.u16()) }, at: CACurrentMediaTime(), gap: 0.9 * (window.base ?? 0) / 1000)
             nResent += again.count
             sendDatagrams(again)
         default: break
@@ -877,7 +885,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         let before = inflight.count
         if let last = inflight.last, last.udp, !last.retried, now - last.at > limit {
             inflight[inflight.count - 1].retried = true
-            let again = frag.resend(last.seq, [])
+            let again = frag.resend(last.seq, [], at: now, gap: 0.9 * (window.base ?? 0) / 1000)
             nResent += again.count
             sendDatagrams(again)
         }

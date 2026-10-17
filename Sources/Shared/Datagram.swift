@@ -65,9 +65,10 @@ public struct Seal {
     }
 }
 
-/// Host side: a video packet → fragments, kept for two seconds in case the viewer asks for some again.
+/// Host side: a video packet → fragments, kept for two seconds in case the viewer asks for some again. An empty
+/// packet stands for a frame the encoder dropped, so its number isn't missed.
 public struct Fragmenter {
-    private var sent: [UInt32: (at: Double, parts: [Data])] = [:]
+    private var sent: [UInt32: (at: Double, parts: [Data], resent: [Double])] = [:]
     public init() {}
 
     public mutating func fragments(_ packet: Data, seq: UInt32, key: Bool, at now: Double) -> [Data] {
@@ -76,15 +77,20 @@ public struct Fragmenter {
             fragment(seq, i, count, key ? 1 : 0, packet.dropFirst(i * fragmentSize).prefix(fragmentSize))
         }
         sent = sent.filter { now - $0.value.at < 2 }
-        sent[seq] = (now, parts)
+        sent[seq] = (now, parts, Array(repeating: -.infinity, count: count))
         return parts
     }
 
-    /// The fragments `indices` of frame `seq` (all of them when empty), marked resent; none once it's too old.
-    public func resend(_ seq: UInt32, _ indices: [Int]) -> [Data] {
-        guard let parts = sent[seq]?.parts else { return [] }
-        return (indices.isEmpty ? Array(parts.indices) : indices.filter(parts.indices.contains)).map {
-            var p = parts[$0]
+    /// The fragments `indices` of frame `seq` (all of them when empty), marked resent; none once it's too old. A
+    /// fragment resent less than `gap` ago is skipped: the viewer asked before that copy could arrive, and sending
+    /// it again would only add to whatever queue delayed it.
+    public mutating func resend(_ seq: UInt32, _ indices: [Int], at now: Double = 0, gap: Double = 0) -> [Data] {
+        guard var f = sent[seq] else { return [] }
+        let want = (indices.isEmpty ? Array(f.parts.indices) : indices.filter(f.parts.indices.contains)).filter { now - f.resent[$0] >= gap }
+        for i in want { f.resent[i] = now }
+        sent[seq] = f
+        return want.map {
+            var p = f.parts[$0]
             p[p.startIndex + 9] |= 2
             return p
         }
@@ -105,6 +111,7 @@ public struct Reassembler {
     struct Partial {
         var parts: [Data?], key = false, repaired = false
         var heard: Double, nacked: Double?   // last fragment in; last nack out
+        var nacks = 0
         var started: Double                  // first noticed: it gives up a while after this
         var complete: Bool { !parts.isEmpty && !parts.contains(nil) }
     }
@@ -137,7 +144,8 @@ public struct Reassembler {
             f.parts[i] = r.rest()
             if flags & 2 != 0 {
                 f.repaired = true
-                if let t = f.nacked { resendWait = 0.8 * resendWait + 0.2 * max(0.05, (now - t) * 1.3 + 0.03) }
+                // a round trip, from first asks only: a later ask may be answered by the copy an earlier one brought
+                if f.nacks == 1, let t = f.nacked { resendWait = 0.8 * resendWait + 0.2 * max(0.05, (now - t) * 1.3 + 0.03) }
             }
         }
         f.key = f.key || flags & 1 != 0
@@ -178,6 +186,7 @@ public struct Reassembler {
             if overtaken || now - f.heard > 0.03, f.nacked.map({ now - $0 > resendWait }) ?? true {
                 nacks.append((s, f.parts.isEmpty || missing.count > 500 ? [] : missing))
                 f.nacked = now
+                f.nacks += 1
             }
             frames[s] = f
         }
@@ -189,9 +198,11 @@ public struct Reassembler {
         while let n = next, let f = frames[n], f.complete {
             frames[n] = nil
             next = n &+ 1
+            let p = f.parts.reduce(into: Data()) { $0.append($1!) }
+            if p.isEmpty { continue }          // the encoder dropped it: nothing to show, and nothing lost
             if broken && !f.key { continue }   // can't decode without the reference that was lost
             broken = false
-            out.append(f.parts.reduce(into: Data()) { $0.append($1!) })
+            out.append(p)
         }
         return out
     }
