@@ -105,6 +105,12 @@ in time it waits for a keyframe instead of showing a broken picture. The datagra
 using a key that each TLS connection exports, so the pairing is still the only thing that lets a Mac in. If no
 datagrams get through, or they stop for 3 s, video carries on over TCP. The iPhone app uses TCP.
 
+Over UDP a Mac viewer uses H.264 with long-term references (LTR): the viewer confirms each frame it shows, and every
+frame is built only on confirmed ones. So a lost frame spoils only itself; the next one decodes, with no repair to
+wait for and no keyframe. (VideoToolbox's HEVC encoder doesn't support this, so over UDP the codec setting doesn't
+apply; it does for TCP and the iPhone.) Keys, clicks and scrolls also go over UDP, three copies each, and the host
+applies each once and in order, whether its UDP or TCP copy arrives first.
+
 ## Security
 
 - Paired Macs can fully control each other. Only pair your own Macs.
@@ -139,7 +145,8 @@ the two Macs. Over UDP, mild loss shows as a brief pause while missing pieces ar
 more) still stalls the picture, and over TCP any loss does, because TCP stops and waits for every lost packet.
 Keystrokes are tiny, so they still get through. The host log (`/tmp/hither-host.log` on the other Mac) shows a
 `stats` line every 5 s: `udp` or `tcp`, `0 fps` while the screen is changing, `delivery` times of several seconds,
-and with UDP, how many frames were `lost` and how many datagrams were `resent`.
+and with UDP, the codec (`h264+ltr` when frames are built on confirmed ones), how many frames were `lost`, how many
+datagrams were `resent`, and how much input arrived first over UDP or TCP (`input udp/tcp`).
 
 To see how video copes with loss, set `HITHER_DROP=0.05` to drop 5% of video datagrams at random: on the host for
 outgoing ones, or on the dev viewer (`HITHER_DROP=0.05 .build/release/hither <host> @desktop`) for incoming ones.
