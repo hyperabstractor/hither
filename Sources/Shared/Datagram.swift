@@ -180,10 +180,11 @@ public struct Reassembler {
                 next = s &+ 1
                 continue
             }
-            // late: something sent after the gap already came, or the frame went quiet
-            let missing = f.parts.indices.filter { f.parts[$0] == nil }
-            let overtaken = s != top.seq || missing.contains { $0 < top.index }
-            if overtaken || now - f.heard > 0.03, f.nacked.map({ now - $0 > resendWait }) ?? true {
+            // late: sent before something that already came, or anything once the frame went quiet. (A big frame
+            // takes a while to arrive: what's after the newest fragment heard is still on its way.)
+            let quiet = now - f.heard > 0.03
+            let missing = f.parts.indices.filter { f.parts[$0] == nil && (quiet || s != top.seq || $0 < top.index) }
+            if !missing.isEmpty || f.parts.isEmpty, f.nacked.map({ now - $0 > resendWait }) ?? true {
                 nacks.append((s, f.parts.isEmpty || missing.count > 500 ? [] : missing))
                 f.nacked = now
                 f.nacks += 1

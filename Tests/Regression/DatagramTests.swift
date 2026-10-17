@@ -41,12 +41,15 @@ func testFragments() throws {
 /// Seeded, so a failure repeats.
 private struct LCG { var s: UInt64; mutating func next() -> Double { s = s &* 6364136223846793005 &+ 1442695040888963407; return Double(s >> 11) / Double(1 << 53) } }
 
-/// Ten seconds of 60 fps over a 320 ms round trip that loses 3% of datagrams each way: every frame the viewer shows
-/// is the host's, in order; lost fragments come back on request, so the picture never stalls for long; and a frame
-/// that can't be saved costs a keyframe, not the rest of the stream.
+/// Ten seconds of 60 fps over a 320 ms round trip at 30 Mbps that loses 3% of datagrams each way: every frame the
+/// viewer shows is the host's, in order; lost fragments come back on request, and only those, so the picture never
+/// stalls for long; and a frame that can't be saved costs a keyframe, not the rest of the stream.
 func testLossyLink() throws {
     var rng = LCG(s: 1)
-    let oneWay = 0.16, loss = 0.03
+    let oneWay = 0.16, loss = 0.03, perDatagram = Double(fragmentSize + 42) * 8 / 30e6
+    var free = 0.0   // when the link can take the next datagram toward the viewer: big frames take a while to arrive
+    func toward(_ d: Data, _ t: Double) -> (at: Double, d: Data) { free = max(free, t) + perDatagram; return (free + oneWay, d) }
+    var resent = 0, dropped = 0
     var frag = Fragmenter(), asm = Reassembler()
     var toViewer: [(at: Double, d: Data)] = [], toHost: [(at: Double, nack: (UInt32, [Int])?, needKey: Bool)] = []
     var sent: [UInt32: Data] = [:], shown: [Data] = [], shownAt: [Double] = []
@@ -61,11 +64,13 @@ func testLossyLink() throws {
             let size = key ? 120_000 : seq % 30 == 0 ? 40_000 : 2_000 + Int(rng.next() * 6000)
             var p = Data(count: size); p.withUnsafeMutableBytes { $0.storeBytes(of: seq, as: UInt32.self) }
             sent[seq] = p
-            for d in frag.fragments(p, seq: seq, key: key, at: t) where rng.next() >= loss { toViewer.append((t + oneWay, d)) }
+            for d in frag.fragments(p, seq: seq, key: key, at: t) { if rng.next() >= loss { toViewer.append(toward(d, t)) } else { dropped += 1 } }
         }
         for m in toHost where m.at <= t {
             if m.needKey { wantKey = true }
-            if let (s, idx) = m.nack { for d in frag.resend(s, idx) where rng.next() >= loss { toViewer.append((t + oneWay, d)) } }
+            if let (s, idx) = m.nack {
+                for d in frag.resend(s, idx, at: t, gap: 0.9 * 2 * oneWay) { resent += 1; if rng.next() >= loss { toViewer.append(toward(d, t)) } else { dropped += 1 } }
+            }
         }
         toHost.removeAll { $0.at <= t }
         // viewer
@@ -83,8 +88,8 @@ func testLossyLink() throws {
     try expectEqual(Set(seqs).count, seqs.count)
     let gaps = zip(shownAt.dropFirst(), shownAt).map { $0 - $1 }.sorted()
     let worst = gaps.last ?? 99, after = shownAt.first ?? 99
-    guard seqs.count > 500, worst < 1.2, after < 0.5 else {
-        throw RegressionFailure(message: "lossy link: \(seqs.count)/\(seq) shown, first at \(after) s, worst stall \(worst) s, \(asm.lost) lost, \(asm.repairedCount) repaired")
+    guard seqs.count > 500, worst < 1.2, after < 1, resent < 2 * dropped else {
+        throw RegressionFailure(message: "lossy link: \(seqs.count)/\(seq) shown, first at \(after) s, worst stall \(worst) s, \(asm.lost) lost, \(asm.repairedCount) repaired, \(resent) resent for \(dropped) dropped")
     }
 }
 
