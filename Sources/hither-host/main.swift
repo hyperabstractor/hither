@@ -540,7 +540,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         guard type == .screen, let px = sb.imageBuffer,
               let info = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
               (info[.status] as? Int).flatMap({ SCFrameStatus(rawValue: $0) }) == .complete else { return }
-        if pending != nil { nDelayed += 1 }
+        if pending != nil && visible { nDelayed += 1 }   // hidden is paused on purpose: nothing is waiting on the viewer
         pending = px   // keep only the newest frame
         pump()
     }
