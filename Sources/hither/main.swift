@@ -207,6 +207,8 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     let view = StreamView(frame: .zero)
     var window: NSWindow?
     var wire: Wire?
+    var link: VideoLink?   // video over UDP, once the host offers it
+    var viaUDP = false     // a datagram frame was shown: TCP frames still on their way are older, so they're dropped
     let activeWire = OSAllocatedUnfairLock<ObjectIdentifier?>(initialState: nil)
     var appName = "", remoteTitle = "", latency = ""
     var note: String?   // a passing status ("Sent text to mini-pb") shown in place of the latency
@@ -232,6 +234,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
                 guard let self, let w, self.wire === w else { return }
                 self.activeWire.withLock { $0 = nil }
                 self.wire = nil
+                self.link?.stop(); self.link = nil; self.viaUDP = false
                 self.lost()
             }
         }
@@ -239,7 +242,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
             guard let self, let w, self.activeWire.withLock({ $0 == ObjectIdentifier(w) }) else { return }
             w.send(Msg("ack"))
             DispatchQueue.main.async { [weak self, weak w] in
-                guard let self, let w, self.wire === w, !self.done else { return }
+                guard let self, let w, self.wire === w, !self.done, !self.viaUDP else { return }
                 self.view.show(d)
             }
         }
@@ -257,6 +260,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         w.onMsg = { [weak self, weak w] m in
             guard let self, let w, self.activeWire.withLock({ $0 == ObjectIdentifier(w) }) else { return }
             if m.t == "menu" { return RemoteMenus.shared.deliver(m) }
+            if m.t == "udp", let tag = m.f { return self.startLink(w, tag: tag) }
             DispatchQueue.main.async { [weak self, weak w] in
                 guard let self, let w, self.wire === w, !self.done else { return }
                 self.handle(m)
@@ -265,8 +269,32 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         wire = w
         activeWire.withLock { $0 = ObjectIdentifier(w) }
         w.start()
-        var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "hevc422", "audio"]
+        var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "hevc422", "audio", "udp"]
         w.send(m)
+    }
+
+    /// The host offered video over UDP: sealed with this connection's own secret, straight to the host from the CLI,
+    /// through the launcher's loopback relay from a proxy (as for TCP). Video carries on over TCP until it works.
+    func startLink(_ w: Wire, tag: UInt64) {
+        guard let secret = w.secret() else { return }
+        let to: (NWEndpoint.Host, NWEndpoint.Port)
+        if role != "proxy" { to = (NWEndpoint.Host(host), videoPort) }
+        else if let p = videoRelayPort(for: host) { to = ("127.0.0.1", p) }
+        else { return log("no video relay for \(host): video stays on TCP") }
+        let l = VideoLink(secret: secret, tag: tag, to: to.0, port: to.1)
+        l.onFrame = { [weak self, weak w] d in
+            DispatchQueue.main.async { [weak self, weak w] in
+                guard let self, let w, self.wire === w, !self.done else { return }
+                if !self.viaUDP { log("video over UDP"); self.viaUDP = true }
+                self.view.show(d)
+            }
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.wire === w else { return }
+            self.link?.stop()
+            self.link = l
+            l.start()
+        }
     }
 
     /// Keep the window and retry, so a host restart / Wi-Fi blip / sleep resumes instead of closing.
@@ -287,6 +315,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     func handle(_ m: Msg) {
         switch m.t {
         case "closed": log(m.title ?? "closed"); finish()
+        case "udpoff": log("video back on TCP"); viaUDP = false; link?.reset()   // the host stopped hearing our datagrams
         case "title": remoteTitle = m.title ?? ""; updateTitle()
         case "clipset": flash("Sent \(m.text ?? "clipboard") to \(macName(host))")
         case "cliperr": flash(m.text ?? "Couldn't get the clipboard")
@@ -473,6 +502,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         done = true
         activeWire.withLock { $0 = nil }
         wire?.close()
+        link?.stop(); link = nil
         window?.delegate = nil
         window?.close()
         window = nil
@@ -697,7 +727,8 @@ final class Remote {
     var state = "connecting…"
     var codec = "h264"   // the host's current video codec (from its "windows" replies)
     var dark = false     // Keep Screen Dark is on over there (from its "windows" replies)
-    var relay: NWListener?
+    var relay: NWListener?, videoRelay: NWListener?
+    let relayHost = OSAllocatedUnfairLock<NWEndpoint.Host?>(initialState: nil)   // where the byte pipe last reached the host
     var gone = false   // unpaired
 
     init(_ peer: Peer, launcher: Launcher) {
@@ -722,7 +753,9 @@ final class Remote {
         wire?.close()
         wire = nil
         relay?.cancel()
+        videoRelay?.cancel()
         try? FileManager.default.removeItem(at: relayPortFile(name))
+        try? FileManager.default.removeItem(at: videoRelayPortFile(name))
     }
 
     func refresh() {
@@ -785,11 +818,12 @@ final class Remote {
         let params = NWParameters(tls: nil, tcp: tcpOptions())
         params.requiredInterfaceType = .loopback
         guard let l = try? NWListener(using: params, on: .any) else { return log("relay for \(name): no port") }
-        l.newConnectionHandler = { [relayPeer] local in
+        l.newConnectionHandler = { [relayPeer, relayHost] local in
             let peer = relayPeer.withLock { $0 }
             local.start(queue: q)   // nothing is read from it until the host end is up
             connectFirst(Reach.hosts(peer), queue: q) { remote in
                 guard let remote else { log("relay: can't reach \(peer.name)"); return local.cancel() }
+                if case .hostPort(let h, _) = remote.endpoint { relayHost.withLock { $0 = h } }
                 var finishedDirections = 0   // both pipe callbacks run on q
                 let finished: () -> Void = {
                     finishedDirections += 1
@@ -823,6 +857,45 @@ final class Remote {
         }
         l.start(queue: q)
         relay = l
+        startVideoRelay(q)
+    }
+
+    /// The same for video datagrams: each proxy's flow gets one of its own to the host, at the address the byte pipe
+    /// last reached it on. Sealed end to end like TLS, so the relay only forwards. A flow quiet for 15 s is let go.
+    func startVideoRelay(_ q: DispatchQueue) {
+        let params = NWParameters.udp
+        params.requiredInterfaceType = .loopback
+        guard let l = try? NWListener(using: params, on: .any) else { return log("video relay for \(name): no port") }
+        l.newConnectionHandler = { [relayHost] local in
+            guard let host = relayHost.withLock({ $0 }) else { return local.cancel() }
+            let remote = NWConnection(host: host, port: videoPort, using: .udp)
+            var heard = CACurrentMediaTime()   // on q
+            local.start(queue: q); remote.start(queue: q)
+            forward(local, to: remote) { heard = CACurrentMediaTime() }
+            forward(remote, to: local) { heard = CACurrentMediaTime() }
+            func idle() {
+                guard CACurrentMediaTime() - heard < 15 else { local.cancel(); remote.cancel(); return }
+                q.asyncAfter(deadline: .now() + 5, execute: idle)
+            }
+            idle()
+        }
+        let file = videoRelayPortFile(name)
+        l.stateUpdateHandler = { [weak l] s in
+            switch s {
+            case .ready: if let p = l?.port { try? Data("\(p.rawValue)".utf8).write(to: file, options: .atomic) }
+            case .failed(let e): log("video relay: \(e)")
+            default: break
+            }
+        }
+        l.start(queue: q)
+        videoRelay = l
+    }
+}
+
+func forward(_ from: NWConnection, to: NWConnection, heard: @escaping () -> Void) {
+    from.receiveMessage { d, _, _, err in
+        if let d { to.send(content: d, completion: .idempotent); heard() }
+        if err == nil { forward(from, to: to, heard: heard) } else { from.cancel(); to.cancel() }
     }
 }
 

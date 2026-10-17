@@ -63,10 +63,16 @@ public let configDir: URL = {
 /// port of its own, kept here.
 public func relayPortFile(_ name: String) -> URL { configDir.appending(path: "relay-\(name).port") }
 
+/// …and its loopback relay for video datagrams.
+public func videoRelayPortFile(_ name: String) -> URL { configDir.appending(path: "relay-\(name).video.port") }
+
 /// The relay port for `host` ("mini" or "mini.local"); nil while the launcher isn't running.
-public func relayPort(for host: String) -> NWEndpoint.Port? {
+public func relayPort(for host: String) -> NWEndpoint.Port? { port(in: relayPortFile, for: host) }
+public func videoRelayPort(for host: String) -> NWEndpoint.Port? { port(in: videoRelayPortFile, for: host) }
+
+private func port(in file: (String) -> URL, for host: String) -> NWEndpoint.Port? {
     let name = host.split(separator: ".").first.map(String.init) ?? host
-    return (try? String(contentsOf: relayPortFile(name), encoding: .utf8)).flatMap { UInt16($0) }.flatMap(NWEndpoint.Port.init(rawValue:))
+    return (try? String(contentsOf: file(name), encoding: .utf8)).flatMap { UInt16($0) }.flatMap(NWEndpoint.Port.init(rawValue:))
 }
 
 /// This Mac's short network name ("mini" for mini.local): Bonjour name, proxy suffix ("Cursor · mini"), and how the
@@ -232,6 +238,13 @@ public final class Wire {
         }
     }
 
+    /// Keying material only the two ends of this TLS session know (RFC 5705 exporter): it seals the video datagrams.
+    public func secret(_ label: String = "hither video") -> Data? {
+        guard let m = conn.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata else { return nil }
+        return label.withCString { sec_protocol_metadata_create_secret(m.securityProtocolMetadata, label.utf8.count, $0, 32) }
+            .map { Data($0 as DispatchData) }
+    }
+
     public func send(_ m: Msg) { frame(1, try! JSONEncoder().encode(m)) }
     public func sendVideo(_ d: Data) { frame(2, d) }
     public func sendAudio(_ d: Data) { frame(3, d) }
@@ -286,6 +299,7 @@ public struct Reader {
     public mutating func u8() -> UInt8 { int(UInt8.self) }
     public mutating func u16() -> UInt16 { int(UInt16.self) }
     public mutating func u32() -> UInt32 { int(UInt32.self) }
+    public mutating func u64() -> UInt64 { int(UInt64.self) }
     public mutating func bytes(_ n: Int) -> Data { defer { i += n }; return d[i..<i + n] }
     public mutating func rest() -> Data { defer { i = d.endIndex }; return d[i...] }
 }

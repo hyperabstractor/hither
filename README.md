@@ -98,6 +98,13 @@ them with CGEvent and Accessibility. Each remote app's proxy is an APFS clone of
 bundle name and icon, which is what gives it a Dock and Cmd-Tab identity. Proxies connect through a loopback relay in
 the menu bar app, so only Hither itself needs Local Network access.
 
+Control, input, menus, audio and the clipboard go over TCP 7420. Video goes over UDP 7421 when both ends support
+it, so a lost packet costs one frame's repair instead of holding up every frame behind it. Each frame is split into
+datagrams that fit Tailscale's MTU. The viewer asks again for any missing pieces, and when a frame can't be saved
+in time it waits for a keyframe instead of showing a broken picture. The datagrams are sealed with ChaChaPoly
+using a key that each TLS connection exports, so the pairing is still the only thing that lets a Mac in. If no
+datagrams get through, or they stop for 3 s, video carries on over TCP. The iPhone app uses TCP.
+
 ## Security
 
 - Paired Macs can fully control each other. Only pair your own Macs.
@@ -111,7 +118,7 @@ the menu bar app, so only Hither itself needs Local Network access.
 
 - Macs find each other with Bonjour on the same network. Elsewhere, pair by address over Tailscale; Hither then
   tries `<name>.local`, the Tailscale name, and the address it paired from, in turn.
-- If the other Mac's firewall is on, allow incoming connections for Hither there.
+- If the other Mac's firewall is on, allow incoming connections for Hither there (TCP 7420 and UDP 7421).
 - Keys are sent as key codes, so both Macs should use the same keyboard layout.
 - The mouse pointer's shape (I-beam, resize arrows) isn't mirrored.
 - A locked Mac shows its lock screen in Desktop; type your password there. A window stream can't show it.
@@ -128,9 +135,14 @@ the menu bar app, so only Hither itself needs Local Network access.
 ## Troubleshooting
 
 **The picture freezes, but typing still reaches the other Mac.** Usually the network is losing packets between
-the two Macs. Video goes over TCP, which stops and waits for every lost packet, so the picture stalls. Keystrokes
-are tiny, so they still get through. The host log (`/tmp/hither-host.log` on the other Mac) shows `0 fps` while
-the screen is changing, with `delivery` times of several seconds.
+the two Macs. Over UDP, mild loss shows as a brief pause while missing pieces are sent again. Heavy loss (10% or
+more) still stalls the picture, and over TCP any loss does, because TCP stops and waits for every lost packet.
+Keystrokes are tiny, so they still get through. The host log (`/tmp/hither-host.log` on the other Mac) shows a
+`stats` line every 5 s: `udp` or `tcp`, `0 fps` while the screen is changing, `delivery` times of several seconds,
+and with UDP, how many frames were `lost` and how many datagrams were `resent`.
+
+To see how video copes with loss, set `HITHER_DROP=0.05` to drop 5% of video datagrams at random: on the host for
+outgoing ones, or on the dev viewer (`HITHER_DROP=0.05 .build/release/hither <host> @desktop`) for incoming ones.
 
 Over Tailscale between two networks, the cause can be a single bad route. Providers pick a route partly by the
 connection's port numbers, so after a restart one Mac's connection can land on a lossy path while another Mac
