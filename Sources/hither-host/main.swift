@@ -112,6 +112,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     // LTR (H.264 over UDP, the viewer's "ltr" cap): once the viewer has confirmed a frame, every frame is built only on
     // confirmed ones, so a lost frame spoils itself and no other
     var viewerLTR = false
+    var viewerTwice = false               // the viewer takes second copies of small frames ("twice")
     var ltrOn = false                     // the encoder took kVTCompressionPropertyKey_EnableLTR
     var tokenSeq: [UInt32: UInt32] = [:]  // LTR token → frame seq, for frames not yet confirmed
     var newAcks: [Int] = []               // confirmed tokens for the next encode
@@ -182,6 +183,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             viewer422 = m.caps?.contains("hevc422") == true   // an iPhone may not decode 4:2:2
             viewerAudio = m.caps?.contains("audio") == true
             viewerLTR = m.caps?.contains("ltr") == true && m.caps?.contains("udp") == true
+            viewerTwice = m.caps?.contains("twice") == true
             if m.caps?.contains("restore") == true { original = .zero }   // filled in once the window is known
             if m.caps?.contains("udp") == true, seal == nil, let secret = wire.secret() {
                 let tag = UInt64.random(in: 1...UInt64.max)
@@ -857,7 +859,14 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             tokenSeq[token] = seq
             if tokenSeq.count > 1000 { tokenSeq = tokenSeq.filter { Int32(bitPattern: seq &- $0.value) < 600 } }
         }
-        sendDatagrams(frag.fragments(p, seq: seq, key: key, independent: independent && !key, token: token, at: CACurrentMediaTime()))
+        let parts = frag.fragments(p, seq: seq, key: key, independent: independent && !key, token: token, at: CACurrentMediaTime())
+        sendDatagrams(parts)
+        // A keystroke often makes one small frame and then nothing: lost, it would wait for a resend a round trip
+        // later. A few datagrams cost nothing to send twice; 15 ms apart, one burst of loss rarely takes both.
+        if viewerTwice, parts.count <= 4 {
+            let copies = parts.map { var c = $0; c[c.startIndex + 9] |= 16; return c }
+            q.asyncAfter(deadline: .now() + 0.015) { self.sendDatagrams(copies) }
+        }
     }
 
     func sendDatagrams(_ plain: [Data]) {

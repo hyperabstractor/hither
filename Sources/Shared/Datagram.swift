@@ -11,7 +11,8 @@ import Network
 // port for all of them), the counter is the nonce and the replay check. Plaintext starts with a type byte:
 //   host → viewer  1 fragment  [seq u32][index u16][count u16][flags u8][token u32][bytes]
 //                     flags: 1 keyframe, 2 resent, 4 independent (built only on frames the viewer confirmed, so it
-//                     decodes whatever was lost before it), 8 the token is the frame's long-term reference (LTR)
+//                     decodes whatever was lost before it), 8 the token is the frame's long-term reference (LTR),
+//                     16 a second copy (a small frame goes twice, so losing a lone keystroke's frame costs no round trip)
 //   viewer → host  2 ack       [seq u32: newest whole frame][flags u8: 1 need a keyframe, 2 that frame was repaired]
 //                              [n u8]([token u32])*n: the LTR tokens of the last frames shown, for the encoder
 //                  3 nack      [seq u32][n u16]([index u16])*n   n = 0: the whole frame
@@ -136,6 +137,8 @@ public struct Reassembler {
     /// Resent fragments that weren't needed: a copy was already here, or the frame was already shown. Near zero
     /// unless the viewer asks too soon.
     public private(set) var spurious = 0
+    /// Second copies of small frames that filled in a piece the first copy lost.
+    public private(set) var savedByCopy = 0
     private var passed: Set<UInt32> = []   // recent frames given up or skipped: resends for them came late, not spuriously
     private var newestIndependent = false  // the newest frame heard was independent: older ones will never be needed
     /// LTR tokens of the last few frames handed on, newest last: acks carry them so the encoder can build on them.
@@ -160,9 +163,10 @@ public struct Reassembler {
         }
         var f = frames[seq] ?? Partial(parts: [], heard: now, nacked: nil, started: now)
         if f.parts.count != count { f.parts = Array(repeating: nil, count: count) }   // first heard of it (or a whole-frame nack placeholder)
-        if f.parts[i] != nil { spurious += 1 }
+        if f.parts[i] != nil, flags & 16 == 0 { spurious += 1 }
         if f.parts[i] == nil {
             f.parts[i] = r.rest()
+            if flags & 16 != 0 { savedByCopy += 1 }
             if flags & 2 != 0 {
                 f.repaired = true
                 // a round trip, from first asks only: a later ask may be answered by the copy an earlier one brought
@@ -295,7 +299,9 @@ public final class VideoLink {
     public var onFrame: (Data) -> Void = { _ in }
     public private(set) var frames = 0
     /// For logs and tests, read on any queue (approximate).
-    public var counts: (lost: Int, repaired: Int, spurious: Int) { (assembler.lost, assembler.repairedCount, assembler.spurious) }
+    public var counts: (lost: Int, repaired: Int, spurious: Int, savedByCopy: Int) {
+        (assembler.lost, assembler.repairedCount, assembler.spurious, assembler.savedByCopy)
+    }
 
     public init(secret: Data, tag: UInt64, to host: NWEndpoint.Host, port: NWEndpoint.Port) {
         seal = Seal(secret: secret, tag: tag, host: false)

@@ -53,6 +53,16 @@ func testIndependentFrames() throws {
     try expectTrue(asm.tick(at: 1).nacks.isEmpty)
     try expectEqual(asm.receive(frag.resend(2, [2])[0], at: 1), [])   // a late copy of the skipped frame is ignored…
     try expectEqual(asm.spurious, 0)                                   // …and wasn't asked for, so isn't spurious either
+
+    // a small frame's second copy fills in what the first lost, and a copy of what came isn't counted as spurious
+    let small = frag.fragments(Data([4]), seq: 4, key: false, independent: true, token: 13, at: 1)
+    let copy = small.map { var c = $0; c[9] |= 16; return c }
+    try expectEqual(asm.receive(copy[0], at: 1.02), [Data([4])])
+    try expectEqual(asm.savedByCopy, 1)
+    let big = frag.fragments(Data([5]), seq: 5, key: false, independent: true, token: 14, at: 1)
+    _ = asm.receive(big[0], at: 1.03)
+    _ = asm.receive({ var c = big[0]; c[9] |= 16; return c }(), at: 1.05)
+    try expectEqual(asm.spurious, 0)
 }
 
 /// Input comes in by TCP and UDP copies in any order: each is applied once, in the order it was made.
