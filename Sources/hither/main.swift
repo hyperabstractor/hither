@@ -1035,7 +1035,8 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     /// One paired Mac: its windows, then what to do with it.
     func section(_ mac: Remote) {
-        menu.addItem(withTitle: mac.state.isEmpty ? "On \(mac.name)" : "\(mac.name): \(mac.state)", action: nil, keyEquivalent: "").isEnabled = false
+        let header = mac.state.isEmpty ? "On \(mac.name)" + (mac.dark ? " · dark" : "") : "\(mac.name): \(mac.state)"
+        menu.addItem(withTitle: header, action: nil, keyEquivalent: "").isEnabled = false
         add("Desktop", Row(item: Item(id: 0, app: "Desktop", bundle: desktopApp, title: ""), mac: mac), indent: 0).image = icon(desktopApp)
         var apps: [String] = []
         for i in mac.items where !apps.contains(i.bundle) { apps.append(i.bundle) }
@@ -1055,21 +1056,30 @@ final class Launcher: NSObject, NSMenuDelegate {
                 for w in wins { pinClose(add(w.title.isEmpty ? "Untitled" : w.title, Row(item: w, mac: mac), indent: 1)) }
             }
         }
-        menu.addItem(.separator())
         let recentItem = menu.addItem(withTitle: "Recent", action: nil, keyEquivalent: "")
         let sub = NSMenu(), recent = recent(on: mac)
         for r in recent { add(r.app, Row(item: r, mac: mac), indent: 0, to: sub).image = icon(r.bundle) }
         recentItem.submenu = sub
         recentItem.isEnabled = !recent.isEmpty
-        let send = menu.addItem(withTitle: "Send Clipboard to \(mac.name)", action: #selector(sendClipboard(_:)), keyEquivalent: "")
-        send.target = self
-        send.representedObject = mac
-        send.toolTip = "Puts what you copied here on \(mac.name)'s clipboard, ready to paste there."
-        let get = menu.addItem(withTitle: "Get Clipboard from \(mac.name)", action: #selector(getClipboard(_:)), keyEquivalent: "")
-        get.target = self
-        get.representedObject = mac
-        get.toolTip = "Puts what you copied on \(mac.name) on this Mac's clipboard."
-        let codecItem = menu.addItem(withTitle: "Video Codec", action: nil, keyEquivalent: "")
+        // everything else about that Mac, out of the way of its windows
+        let more = NSMenu()
+        menu.addItem(withTitle: mac.name, action: nil, keyEquivalent: "").submenu = more
+        let item = { (title: String, action: Selector, tip: String?) -> NSMenuItem in
+            let mi = more.addItem(withTitle: title, action: action, keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = mac
+            mi.toolTip = tip
+            return mi
+        }
+        _ = item("Send Clipboard to \(mac.name)", #selector(sendClipboard(_:)), "Puts what you copied here on \(mac.name)'s clipboard, ready to paste there.")
+        _ = item("Get Clipboard from \(mac.name)", #selector(getClipboard(_:)), "Puts what you copied on \(mac.name) on this Mac's clipboard.")
+        more.addItem(.separator())
+        // what someone at that Mac sees: black while you use it, and locked once you're done
+        item("Keep Screen Dark", #selector(toggleDark(_:)),
+             "While you use \(mac.name) from here, its own monitors show black, and it locks 2 minutes after you stop.").state = mac.dark ? .on : .off
+        _ = item("Lock \(mac.name)", #selector(lockMac(_:)), nil)
+        more.addItem(.separator())
+        let codecItem = more.addItem(withTitle: "Video Codec", action: nil, keyEquivalent: "")
         let codecs = NSMenu()
         for (title, id) in [("H.264", "h264"), ("HEVC", "hevc"), ("HEVC 4:2:2 (sharpest color)", "hevc422")] {
             let mi = codecs.addItem(withTitle: title, action: #selector(setCodec(_:)), keyEquivalent: "")
@@ -1078,36 +1088,28 @@ final class Launcher: NSObject, NSMenuDelegate {
             mi.state = mac.codec == id ? .on : .off
         }
         codecItem.submenu = codecs
-        // what someone at that Mac sees: black while you use it, and locked once you're done
-        let dark = menu.addItem(withTitle: "Keep Screen Dark", action: #selector(toggleDark(_:)), keyEquivalent: "")
-        dark.target = self
-        dark.representedObject = mac
-        dark.state = mac.dark ? .on : .off
-        dark.toolTip = "While you use \(mac.name) from here, its own monitors show black, and it locks 2 minutes after you stop."
-        let lock = menu.addItem(withTitle: "Lock \(mac.name)", action: #selector(lockMac(_:)), keyEquivalent: "")
-        lock.target = self
-        lock.representedObject = mac
-        // whole desktop: Apple's Screen Sharing does that job best, so just hand off to it
-        let share = menu.addItem(withTitle: "Screen Share \(mac.name)…", action: #selector(screenShare(_:)), keyEquivalent: "")
-        share.target = self
-        share.representedObject = mac
-        let unpair = menu.addItem(withTitle: "Unpair \(mac.name)", action: #selector(unpair(_:)), keyEquivalent: "")
-        unpair.target = self
-        unpair.representedObject = mac.peer.id
+        _ = item("Screen Share \(mac.name)…", #selector(screenShare(_:)), nil)   // Apple's own, for when you want it
+        more.addItem(.separator())
+        item("Unpair \(mac.name)", #selector(unpair(_:)), nil).representedObject = mac.peer.id
     }
 
+    /// Settings that rarely change, in one submenu. Nothing paired yet: pairing by address stays in sight.
     func footer() {
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Pair with Mac at Address…", action: #selector(pairByAddress), keyEquivalent: "").target = self
+        if remotes.isEmpty { menu.addItem(withTitle: "Pair with Mac at Address…", action: #selector(pairByAddress), keyEquivalent: "").target = self }
+        let settings = NSMenu()
+        menu.addItem(withTitle: "Settings", action: nil, keyEquivalent: "").submenu = settings
+        settings.addItem(withTitle: "Pair with Mac at Address…", action: #selector(pairByAddress), keyEquivalent: "").target = self
         for v in Pairings.load().peers where v.viewer == true {
-            let mi = menu.addItem(withTitle: "Unpair \(v.name)", action: #selector(unpair(_:)), keyEquivalent: "")
+            let mi = settings.addItem(withTitle: "Unpair \(v.name)", action: #selector(unpair(_:)), keyEquivalent: "")
             mi.target = self
             mi.representedObject = v.id
         }
-        let share = menu.addItem(withTitle: "Share This Mac", action: #selector(toggleSharing), keyEquivalent: "")
+        settings.addItem(.separator())
+        let share = settings.addItem(withTitle: "Share This Mac", action: #selector(toggleSharing), keyEquivalent: "")
         share.target = self
         share.state = sharing ? .on : .off
-        let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
+        let login = settings.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(withTitle: "Quit Hither", action: #selector(quit), keyEquivalent: "q").target = self

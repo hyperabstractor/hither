@@ -60,11 +60,12 @@ On first launch, macOS asks for three permissions for **Hither**. Grant them on 
 1. Click Hither's menu bar icon and choose **Pair with <other Mac>…**
 2. Both Macs show a 6-digit code. Check they match, then click **Pair** on both.
 
-Pairing is mutual, so both Macs can open each other's windows. Tick **Open at Login** on both, and you're done.
+Pairing is mutual, so both Macs can open each other's windows. Tick **Settings › Open at Login** on both, and you're done.
 
-A Mac on another network (over [Tailscale](https://tailscale.com)) doesn't show up nearby: choose **Pair with Mac at
+A Mac on another network (over [Tailscale](https://tailscale.com)) doesn't show up nearby: choose **Settings › Pair with Mac at
 Address…** and type its Tailscale name or IP. You'll need to click Pair on that Mac's screen too, so have Screen
-Sharing open. Pair as many Macs as you like; each gets its own section in the menu.
+Sharing open. Pair as many Macs as you like; each gets its own section in the menu: its Desktop, its open windows, Recent,
+and a submenu named after it with Clipboard, Keep Screen Dark, Lock, Video Codec, Screen Share and Unpair.
 
 ## Use
 
@@ -72,8 +73,8 @@ Sharing open. Pair as many Macs as you like; each gets its own section in the me
 - Cmd-H and Cmd-M hide or minimise the window on this Mac. Ctrl-Cmd-F makes it full screen here. Every other key
   goes to the app.
 - Ctrl-Option-Cmd-C in a remote window sends your clipboard there; Ctrl-Option-Cmd-V gets theirs. Both are also at
-  the bottom of the window's Edit menu, and in each Mac's section of the menu bar icon.
-- **Video Codec** in the menu switches every window between H.264, HEVC and HEVC 4:2:2.
+  the bottom of the window's Edit menu, and in the Mac's submenu of the menu bar icon.
+- **Video Codec** in the Mac's submenu switches every window between H.264, HEVC and HEVC 4:2:2.
 
 ## iPhone
 
@@ -82,7 +83,7 @@ time, full screen. The Mac sizes the window to fit the phone and puts it back wh
 
 - Build it with Xcode (sign in under Settings › Accounts and pick your team) and run it on your phone.
 - **Pair:** the Mac shows up under Nearby Macs. Tap it, check both screens show the same code, and click Pair on
-  the Mac too. Paired iPhones get their own **Unpair** item in the Mac's menu.
+  the Mac too. Paired iPhones get their own **Unpair** item under **Settings** in the Mac's menu.
 - **Touch:** tap to click (tap again quickly for a double click), two-finger tap to right-click, drag to scroll,
   touch and hold then drag to select or move things.
 - **Typing:** the keyboard button types into the window. The bar above the keyboard has esc, tab, arrows and
@@ -104,7 +105,7 @@ the menu bar app, so only Hither itself needs Local Network access.
   value before seeing the other's, and a code derived from both that you compare on the two screens. A machine
   in the middle can't make both codes match. The key never crosses the network.
 - After pairing, every connection is TLS with that pre-shared key, so unpaired Macs can't connect.
-- Pairings live in `~/.hither/pairings.json` (readable only by you). **Unpair** is in the menu.
+- Pairings live in `~/.hither/pairings.json` (readable only by you). **Unpair** is in each Mac's submenu.
 
 ## Limitations
 
