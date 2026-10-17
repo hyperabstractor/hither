@@ -55,6 +55,18 @@ func testIndependentFrames() throws {
     try expectEqual(asm.spurious, 0)                                   // …and wasn't asked for, so isn't spurious either
 }
 
+/// Input comes in by TCP and UDP copies in any order: each is applied once, in the order it was made.
+func testInputOrder() throws {
+    var order = InputOrder()
+    func key(_ n: UInt32?) -> Msg { var m = Msg("key"); m.n = n; m.k = Int(n ?? 0); return m }
+    try expectEqual(order.take(key(2)).map(\.n), [])          // early: waits for 1
+    try expectEqual(order.take(key(2)).map(\.n), [])          // a second copy
+    try expectEqual(order.take(key(1)).map(\.n), [1, 2])
+    try expectEqual(order.take(key(1)).map(\.n), [])          // TCP's copy, late
+    try expectEqual(order.take(key(3)).map(\.n), [3])
+    try expectEqual(order.take(key(nil)).count, 1)             // an older viewer's, unnumbered
+}
+
 /// Seeded, so a failure repeats.
 private struct LCG { var s: UInt64; mutating func next() -> Double { s = s &* 6364136223846793005 &+ 1442695040888963407; return Double(s >> 11) / Double(1 << 53) } }
 

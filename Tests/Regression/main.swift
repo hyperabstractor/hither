@@ -39,9 +39,10 @@ do {
     try testSeal()
     try testFragments()
     try testIndependentFrames()
+    try testInputOrder()
     try testLossyLink()
     try testVideoLink()
-    print("PASS video datagrams: sealed, repaired after loss, and delivered in order over UDP")
+    print("PASS video datagrams: sealed, repaired after loss, independent with LTR; input over UDP applied once, in order")
     let arguments = CommandLine.arguments
     if arguments.count == 4, arguments[1] == "--remote" {
         try testMissingRemoteWindow(host: arguments[2], app: arguments[3], throughRelay: false)

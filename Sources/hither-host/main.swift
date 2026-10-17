@@ -118,6 +118,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var keySeq: UInt32 = 0                // the last keyframe: it drops every older reference
     var confirmed = false                 // a frame since that keyframe was confirmed: refreshes can build on it
     var srtt = 0.0, rttvar = 0.0          // seconds: resend timeouts follow the round trip and its jitter
+    var inputs = InputOrder()             // input from TCP and UDP, each applied once, in order
+    var nInUDP = 0, nInTCP = 0            // input applied from each: the stats show how often UDP got there first
     var nFrames = 0, nBytes = 0, nKeys = 0, nDelayed = 0, nRaises = 0
     var encMs = 0.0, raiseMs = 0.0, rtts: [Double] = []
     var lastEncode: CFTimeInterval = 0
@@ -224,9 +226,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 DispatchQueue.main.async { Dark.tick() }
             }
         case "close": menuQ.async { pressClose(CGWindowID(m.k ?? 0)) }   // launcher menu's X; AX can block on a modal
-        default:
-            let f = frame
-            inputQ.async { self.input(m, frame: f) }
+        default: applyInput(m, udp: false)
         }
     }
 
@@ -497,12 +497,12 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         ticks += 1
         udpTimeouts()
-        if ticks % 20 == 0 && (nFrames > 0 || nRaises > 0 || nAudio > 0) {
+        if ticks % 20 == 0 && (nFrames > 0 || nRaises > 0 || nAudio > 0 || nInUDP + nInTCP > 0) {
             let r = rtts.sorted()
-            log(String(format: "stats %@: %@ %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms window=%d delayed=%d lost=%d resent=%d raises=%d (%.0fms avg) audio=%d/s peak=%.2f",
+            log(String(format: "stats %@: %@ %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms window=%d delayed=%d lost=%d resent=%d input udp/tcp=%d/%d raises=%d (%.0fms avg) audio=%d/s peak=%.2f",
                        appName, "\(flow != nil ? "udp" : "tcp") \(codec)\(ltrOn ? confirmed ? "+ltr" : "+ltr(waiting)" : "")", nFrames / 5, Double(nBytes) * 8 / 5e6, nKeys, nFrames > 0 ? encMs / Double(nFrames) : 0,
-                       r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, window.limit, nDelayed, nLost, nResent, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
-            nLost = 0; nResent = 0
+                       r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, window.limit, nDelayed, nLost, nResent, nInUDP, nInTCP, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
+            nLost = 0; nResent = 0; nInUDP = 0; nInTCP = 0
             nAudio = 0; audioPeak = 0; nFrames = 0; nBytes = 0; nKeys = 0; nDelayed = 0; nRaises = 0; encMs = 0; raiseMs = 0; rtts = []
         }
         if ticks % 4 == 0 {  // new/closed sibling windows → refresh exclusions ~1/s
@@ -829,6 +829,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    func applyInput(_ m: Msg, udp: Bool) {
+        let ready = inputs.take(m)
+        if udp { nInUDP += ready.count } else { nInTCP += ready.count }
+        for m in ready {
+            let f = frame
+            inputQ.async { self.input(m, frame: f) }
+        }
+    }
+
     // MARK: video over UDP
 
     /// A frame was acked `sent` after it went: a round trip for the window.
@@ -893,6 +902,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 if pending == nil { pending = lastFrame }
             }
             pump()
+        case 4:   // input, ahead of its TCP copy
+            if let m = try? JSONDecoder().decode(Msg.self, from: plain.dropFirst()), inputTypes.contains(m.t), m.n != nil { applyInput(m, udp: true) }
         case 3:   // nack: fragments to send again
             let seq = r.u32(), n = Int(r.u16())
             guard plain.count >= 7 + 2 * n else { return }

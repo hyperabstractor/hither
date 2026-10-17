@@ -19,6 +19,7 @@ public struct Msg: Codable {
     public var k: Int?, b: Int?, c: Int?, p: Int?, mp: Int?
     public var text: String?         // "text": typed characters (iPhone keyboard), not key codes
     public var f: UInt64?, seq: UInt32?
+    public var n: UInt32?            // input order: also sent over UDP, so the host applies each once, in order
     public var down: Bool?, rep: Bool?
     public var items: [Item]?
     public var path: [Int]?          // menu path: indices from the menu bar down

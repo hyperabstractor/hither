@@ -209,6 +209,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     var wire: Wire?
     var link: VideoLink?   // video over UDP, once the host offers it
     var viaUDP = false     // a datagram frame was shown: TCP frames still on their way are older, so they're dropped
+    var inputN: UInt32 = 0 // this connection's input order (Msg.n), on the main thread
     let activeWire = OSAllocatedUnfairLock<ObjectIdentifier?>(initialState: nil)
     var appName = "", remoteTitle = "", latency = ""
     var note: String?   // a passing status ("Sent text to mini-pb") shown in place of the latency
@@ -219,7 +220,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     init(host: String, app: String, title: String? = nil, windowID: Int = 0) {
         self.host = host; self.app = app; titleFilter = title; self.windowID = windowID
         super.init()
-        view.send = { [weak self] in self?.wire?.send($0) }
+        view.send = { [weak self] in self?.send($0) }
         view.onLatency = { [weak self] ms in self?.latency = "\(ms) ms"; self?.updateTitle() }
         view.onClipboard = { [weak self] send in send ? self?.sendClipboard() : self?.getClipboard() }
         proxies.append(self)
@@ -267,9 +268,22 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
             }
         }
         wire = w
+        inputN = 0
         activeWire.withLock { $0 = ObjectIdentifier(w) }
         w.start()
         var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "hevc422", "audio", "udp", "ltr"]
+        w.send(m)
+    }
+
+    /// To the host. Input is numbered and goes over UDP too, once there's a link: TCP stays the backstop.
+    func send(_ m: Msg) {
+        guard let w = wire else { return }
+        var m = m
+        if inputTypes.contains(m.t) {
+            inputN &+= 1
+            m.n = inputN
+            link?.sendInput(m)
+        }
         w.send(m)
     }
 

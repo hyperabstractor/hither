@@ -15,6 +15,7 @@ import Network
 //   viewer → host  2 ack       [seq u32: newest whole frame][flags u8: 1 need a keyframe, 2 that frame was repaired]
 //                              [n u8]([token u32])*n: the LTR tokens of the last frames shown, for the encoder
 //                  3 nack      [seq u32][n u16]([index u16])*n   n = 0: the whole frame
+//                  4 input     [JSON Msg with its order n]: three copies, as well as the one on TCP
 // Acks also go out every 250 ms as a keepalive: they hold the NAT open and tell the host the path still works.
 
 public let videoPort: NWEndpoint.Port = 7421
@@ -257,6 +258,27 @@ public func nackDatagram(_ seq: UInt32, _ indices: [Int]) -> Data {
     return d
 }
 
+/// Messages that are input: numbered and sent over UDP too, so a loss on TCP doesn't hold a keystroke for a round trip.
+public let inputTypes: Set<String> = ["key", "text", "flags", "mouse", "scroll"]
+
+/// Host side: input arrives once over TCP and up to three times over UDP, in any order. Each is applied once, in the
+/// order it was made; one that's early waits for the ones before it, which TCP always brings.
+public struct InputOrder {
+    private var next: UInt32 = 1
+    private var held: [UInt32: Msg] = [:]
+    public init() {}
+
+    /// The messages now ready to apply, in order. Unnumbered ones (an older viewer) go straight through.
+    public mutating func take(_ m: Msg) -> [Msg] {
+        guard let n = m.n else { return [m] }
+        guard Int32(bitPattern: n &- next) >= 0, held[n] == nil else { return [] }   // a copy of one already in
+        held[n] = m
+        var out: [Msg] = []
+        while let m = held.removeValue(forKey: next) { out.append(m); next &+= 1 }
+        return out
+    }
+}
+
 /// HITHER_DROP=0.05 drops that share of video datagrams at random (outgoing on the host, incoming on a viewer), to
 /// test recovery without touching the system's network shaping.
 public let dropRate = Double(ProcessInfo.processInfo.environment["HITHER_DROP"] ?? "") ?? 0
@@ -323,6 +345,16 @@ public final class VideoLink {
         lastAckAt = ProcessInfo.processInfo.systemUptime
         let a = assembler.acked
         send(ackDatagram(a?.seq ?? 0, needKey: assembler.broken, repaired: a?.repaired ?? false, tokens: assembler.shownTokens))
+    }
+
+    /// An input message (with its `n`) as three datagrams, the copies 10 and 30 ms apart so one burst of loss
+    /// rarely takes all three. Anything too big for one goes by TCP alone.
+    public func sendInput(_ m: Msg) {
+        guard let json = try? JSONEncoder().encode(m), json.count < 1100 else { return }
+        let d = Data([4]) + json
+        queue.async { self.send(d) }
+        queue.asyncAfter(deadline: .now() + 0.01) { self.send(d) }
+        queue.asyncAfter(deadline: .now() + 0.03) { self.send(d) }
     }
 
     private func send(_ plain: Data) { conn.send(content: seal.seal(plain), completion: .idempotent) }
