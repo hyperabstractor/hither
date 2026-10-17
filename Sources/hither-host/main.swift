@@ -90,7 +90,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var encoder: VTCompressionSession?
     var encSize = (0, 0)
     var forceKey = true
-    var unacked = 0                  // frames sent but not yet acked by the viewer
+    var unacked: Int { inflight.count }   // frames sent but not yet acked by the viewer
     var window = FrameWindow()       // how many may be: grows over a long link, shrinks when it fills
     var held = false                 // a frame waited on the window since the last ack
     var pending: CVPixelBuffer?      // newest frame we skipped while the viewer was behind
@@ -99,7 +99,16 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // 5-second stats, logged from poll()
     var appName = ""
-    var inflight: [CFTimeInterval] = []   // submit times of unacked frames, oldest first
+    var inflight: [(seq: UInt32, at: CFTimeInterval, udp: Bool, retried: Bool)] = []   // unacked frames, oldest first
+    var frameSeq: UInt32 = 0
+    // video over UDP (the viewer's "udp" cap): this session's seal, and the flow its datagrams last came from
+    var seal: Seal?
+    var flow: NWConnection?
+    var heardAt: CFTimeInterval = 0
+    var frag = Fragmenter()
+    var lastKeyAt: CFTimeInterval = 0
+    var offeredAt: CFTimeInterval = 0   // "udp" sent: the first picture waits a moment for it rather than crawl through TCP
+    var nLost = 0, nResent = 0
     var nFrames = 0, nBytes = 0, nKeys = 0, nDelayed = 0, nRaises = 0
     var encMs = 0.0, raiseMs = 0.0, rtts: [Double] = []
     var lastEncode: CFTimeInterval = 0
@@ -162,17 +171,19 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             viewer422 = m.caps?.contains("hevc422") == true   // an iPhone may not decode 4:2:2
             viewerAudio = m.caps?.contains("audio") == true
             if m.caps?.contains("restore") == true { original = .zero }   // filled in once the window is known
+            if m.caps?.contains("udp") == true, seal == nil, let secret = wire.secret() {
+                let tag = UInt64.random(in: 1...UInt64.max)
+                seal = Seal(secret: secret, tag: tag, host: true)
+                udpLock.withLock { udpSessions[tag] = self }
+                offeredAt = CACurrentMediaTime()
+                var r = Msg("udp"); r.f = tag
+                wire.send(r)   // video stays on TCP until the viewer's datagrams get through
+            }
             inputQ.async { wake() }   // a sleeping display may give the new window no frames
             if m.app == desktopApp { Task { await openDesktop(CGDirectDisplayID(m.k ?? 0)) } }
             else { Task { await open(m.app ?? "", m.title, id: CGWindowID(m.k ?? 0)) } }
-        case "ack":
-            unacked -= 1
-            if !inflight.isEmpty {
-                let now = CACurrentMediaTime(), rtt = (now - inflight.removeFirst()) * 1000
-                rtts.append(rtt)
-                window.ack(rtt: rtt, at: now, held: held)
-                held = false
-            }
+        case "ack":   // a frame sent over TCP
+            if let i = inflight.firstIndex(where: { !$0.udp }) { acked(inflight.remove(at: i).at) }
             pump()
         case "keyframe": forceKey = true
         case "menu":
@@ -475,11 +486,13 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             wire.send(m)
         }
         ticks += 1
+        udpTimeouts()
         if ticks % 20 == 0 && (nFrames > 0 || nRaises > 0 || nAudio > 0) {
             let r = rtts.sorted()
-            log(String(format: "stats %@: %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms window=%d delayed=%d raises=%d (%.0fms avg) audio=%d/s peak=%.2f",
-                       appName, nFrames / 5, Double(nBytes) * 8 / 5e6, nKeys, nFrames > 0 ? encMs / Double(nFrames) : 0,
-                       r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, window.limit, nDelayed, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
+            log(String(format: "stats %@: %@ %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms window=%d delayed=%d lost=%d resent=%d raises=%d (%.0fms avg) audio=%d/s peak=%.2f",
+                       appName, flow != nil ? "udp" : "tcp", nFrames / 5, Double(nBytes) * 8 / 5e6, nKeys, nFrames > 0 ? encMs / Double(nFrames) : 0,
+                       r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, window.limit, nDelayed, nLost, nResent, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
+            nLost = 0; nResent = 0
             nAudio = 0; audioPeak = 0; nFrames = 0; nBytes = 0; nKeys = 0; nDelayed = 0; nRaises = 0; encMs = 0; raiseMs = 0; rtts = []
         }
         if ticks % 4 == 0 {  // new/closed sibling windows → refresh exclusions ~1/s
@@ -527,7 +540,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         guard type == .screen, let px = sb.imageBuffer,
               let info = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
               (info[.status] as? Int).flatMap({ SCFrameStatus(rawValue: $0) }) == .complete else { return }
-        if pending != nil { nDelayed += 1 }
+        if pending != nil && visible { nDelayed += 1 }   // hidden is paused on purpose: nothing is waiting on the viewer
         pending = px   // keep only the newest frame
         pump()
     }
@@ -539,7 +552,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         guard unacked < window.limit else { held = true; return }
         let busy = CACurrentMediaTime() - lastInputAt < 0.5
         let gap = desktop || windowID == lastRaised ? 0 : busy ? 0.5 : 0.1   // a desktop is always the one in front
-        let wait = lastEncode + gap - CACurrentMediaTime()
+        // a keyframe through cold TCP takes seconds at 300 ms; the viewer's first datagram is a round trip away
+        let udpSoon = seal != nil && flow == nil && frameSeq == 0 ? offeredAt + 1.5 - CACurrentMediaTime() : 0
+        let wait = max(lastEncode + gap - CACurrentMediaTime(), udpSoon)
         guard wait <= 0 else {
             if !pumpQueued {
                 pumpQueued = true
@@ -618,16 +633,19 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let encoder else { return }
         let props = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         forceKey = false
-        unacked += 1
-        let seq = inputSeq, t0 = CACurrentMediaTime()
+        frameSeq &+= 1
+        let seq = inputSeq, t0 = CACurrentMediaTime(), fseq = frameSeq, udp = flow != nil
         lastEncode = t0
-        inflight.append(t0)
+        inflight.append((fseq, t0, udp, false))
         VTCompressionSessionEncodeFrame(encoder, imageBuffer: px, presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
                                         duration: .invalid, frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
             guard let self else { return }
-            guard status == noErr, let sb else { self.q.async { self.unacked -= 1; _ = self.inflight.popLast() }; return }
+            guard status == noErr, let sb else {   // dropped: over UDP its number still goes, so the viewer doesn't wait for it
+                self.q.async { self.inflight.removeAll { $0.seq == fseq }; if udp { self.sendUDP(Data(), fseq) } }
+                return
+            }
             let p = packet(sb, seq), ms = (CACurrentMediaTime() - t0) * 1000
-            self.wire.sendVideo(p)
+            if udp { self.q.async { self.sendUDP(p, fseq) } } else { self.wire.sendVideo(p) }
             self.q.async { self.nFrames += 1; self.nBytes += p.count; self.encMs += ms; if p[4] & 0x7f != 0 { self.nKeys += 1 } }
         }
     }
@@ -786,8 +804,107 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    // MARK: video over UDP
+
+    /// A frame was acked `sent` after it went: a round trip for the window.
+    func acked(_ sent: CFTimeInterval) {
+        let now = CACurrentMediaTime(), rtt = (now - sent) * 1000
+        rtts.append(rtt)
+        window.ack(rtt: rtt, at: now, held: held)
+        held = false
+    }
+
+    func sendUDP(_ p: Data, _ seq: UInt32) {
+        let key = p.count > 4 && p[p.startIndex + 4] & 0x7f != 0
+        if key { lastKeyAt = CACurrentMediaTime() }
+        sendDatagrams(frag.fragments(p, seq: seq, key: key, at: CACurrentMediaTime()))
+    }
+
+    func sendDatagrams(_ plain: [Data]) {
+        guard let flow, seal != nil else { return }
+        for p in plain {
+            let d = seal!.seal(p)
+            if dropRate > 0, Double.random(in: 0..<1) < dropRate { continue }
+            flow.send(content: d, completion: .idempotent)
+        }
+    }
+
+    /// A datagram from the viewer (on q). The first that opens on a new flow moves video onto it.
+    func received(_ d: Data, on f: NWConnection) {
+        guard !ended, let plain = seal?.open(d) else { return }
+        heardAt = CACurrentMediaTime()
+        if flow !== f {
+            log("\(appName): video over UDP via \(f.endpoint)")
+            flow?.cancel()
+            flow = f
+            forceKey = true   // a fresh start on the new path
+            if pending == nil { pending = lastFrame }
+            pump()
+        }
+        var r = Reader(plain)
+        switch r.u8() {
+        case 2:   // ack: the newest whole frame, and whether to start again from a keyframe
+            let seq = r.u32(), flags = r.u8()
+            let done = inflight.filter { $0.udp && Int32(bitPattern: $0.seq &- seq) <= 0 }
+            if let f = done.last, f.seq == seq, !f.retried, flags & 2 == 0 { acked(f.at) }   // a repaired frame's round trip isn't the link's
+            inflight.removeAll { $0.udp && Int32(bitPattern: $0.seq &- seq) <= 0 }
+            if flags & 1 != 0, CACurrentMediaTime() - lastKeyAt > max(0.15, (window.base ?? 0) / 1000 + 0.1) {
+                forceKey = true   // at most one per round trip: the last one may still be on its way
+                lastKeyAt = CACurrentMediaTime()
+                if pending == nil { pending = lastFrame }
+            }
+            pump()
+        case 3:   // nack: fragments to send again
+            let seq = r.u32(), n = Int(r.u16())
+            guard plain.count >= 7 + 2 * n else { return }
+            let again = frag.resend(seq, (0..<n).map { _ in Int(r.u16()) }, at: CACurrentMediaTime(), gap: 0.9 * (window.base ?? 0) / 1000)
+            nResent += again.count
+            sendDatagrams(again)
+        default: break
+        }
+    }
+
+    /// Every poll: frames nothing acked within two round trips stop holding the window (the viewer repairs or drops
+    /// them itself). The newest is sent once more first, since no later frame would show the viewer it's missing.
+    /// And a viewer silent for 3 s gets video over TCP again.
+    func udpTimeouts() {
+        guard let f = flow else { return }
+        let now = CACurrentMediaTime()
+        if now - heardAt > 3 {
+            log("\(appName): no datagrams from the viewer for 3 s, video back on TCP")
+            f.cancel()
+            flow = nil
+            inflight.removeAll { $0.udp }
+            var m = Msg("udpoff"); m.seq = frameSeq
+            wire.send(m)
+            forceKey = true
+            if pending == nil { pending = lastFrame }
+            return pump()
+        }
+        let limit = 2 * (window.base ?? 300) / 1000 + 0.15
+        let before = inflight.count
+        if let last = inflight.last, last.udp, !last.retried, now - last.at > limit {
+            inflight[inflight.count - 1].retried = true
+            let again = frag.resend(last.seq, [], at: now, gap: 0.9 * (window.base ?? 0) / 1000)
+            nResent += again.count
+            sendDatagrams(again)
+        }
+        let gone = { (f: (seq: UInt32, at: CFTimeInterval, udp: Bool, retried: Bool)) in
+            f.udp && now - f.at > (f.retried ? 2 * limit : limit) && (f.retried || f.seq != self.frameSeq)
+        }
+        if let last = inflight.last, last.seq == frameSeq, gone(last), pending == nil {
+            forceKey = true   // the newest frame, sent twice, never acked: on a still screen nothing else would repaint it
+            pending = lastFrame
+        }
+        inflight.removeAll(where: gone)
+        nLost += before - inflight.count
+        if inflight.count < before { pump() }
+    }
+
     func stop() {
         ended = true
+        if let tag = seal?.tag { udpLock.withLock { udpSessions[tag] = nil } }
+        flow?.cancel(); flow = nil
         if let o = original, o != .zero, let ax, readFrame()?.size != o.size { place(ax, o.size, o.origin) }   // the phone let go
         let id = ObjectIdentifier(self)
         DispatchQueue.main.async { watchers[id] = nil }
@@ -990,6 +1107,28 @@ listener.newConnectionHandler = { conn in
 }
 listener.stateUpdateHandler = { log("listener: \($0)") }
 listener.start(queue: .main)
+
+/// Video datagrams for every session come in on one port; the tag on each says whose it is, and that session's key
+/// decides whether it's genuine.
+let udpLock = NSLock()
+var udpSessions: [UInt64: Session] = [:]
+let udpQ = DispatchQueue(label: "udp")
+let videoListener = try? NWListener(using: .udp, on: videoPort)
+videoListener?.newConnectionHandler = { flow in
+    flow.start(queue: udpQ)
+    func receive() {
+        flow.receiveMessage { d, _, _, err in
+            guard let d else { return err == nil ? receive() : flow.cancel() }
+            guard let tag = Seal.tag(of: d), let s = udpLock.withLock({ udpSessions[tag] }) else { return flow.cancel() }
+            s.q.async { s.received(d, on: flow) }
+            if err == nil { receive() }
+        }
+    }
+    receive()
+}
+videoListener?.stateUpdateHandler = { log("video listener: \($0)") }
+videoListener?.start(queue: .main)
+if videoListener == nil { log("video listener: UDP \(videoPort) unavailable, video stays on TCP") }
 Dark.start()
 
 /// New windows here show up on the client by themselves when they're plausibly the user's: they appeared within

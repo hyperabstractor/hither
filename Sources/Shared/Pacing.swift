@@ -34,6 +34,9 @@ public struct FrameWindow {
 
     public init() {}
 
+    /// The quickest round trip lately (ms): the link's own, without queueing.
+    public var base: Double? { samples.map(\.rtt).min() }
+
     /// A frame was acked `rtt` ms after it was sent. `held`: a newer frame waited on the window meanwhile, so more
     /// room would have been used.
     public mutating func ack(rtt: Double, at now: Double, held: Bool) {
