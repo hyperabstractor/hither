@@ -269,7 +269,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         wire = w
         activeWire.withLock { $0 = ObjectIdentifier(w) }
         w.start()
-        var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "hevc422", "audio", "udp"]
+        var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "hevc422", "audio", "udp", "ltr"]
         w.send(m)
     }
 

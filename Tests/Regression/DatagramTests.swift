@@ -38,6 +38,23 @@ func testFragments() throws {
     try expectEqual(frag.resend(1, [], at: 1.4, gap: 0.3).count, 1)
 }
 
+/// With LTR every frame is independent once the viewer confirmed one: a frame missing a piece is skipped the moment
+/// a newer frame arrives whole, it isn't asked for again, no keyframe is needed, and acks carry the shown tokens.
+func testIndependentFrames() throws {
+    var frag = Fragmenter(), asm = Reassembler()
+    var shown: [Data] = []
+    for d in frag.fragments(Data([1]), seq: 1, key: true, token: 10, at: 0) { shown += asm.receive(d, at: 0) }
+    let broken = frag.fragments(Data(count: 3000), seq: 2, key: false, independent: true, token: 11, at: 0)
+    for d in broken.dropLast() { shown += asm.receive(d, at: 0) }   // its last piece is lost
+    for d in frag.fragments(Data([3]), seq: 3, key: false, independent: true, token: 12, at: 0) { shown += asm.receive(d, at: 0.001) }
+    try expectEqual(shown, [Data([1]), Data([3])])
+    try expectFalse(asm.broken)
+    try expectEqual(asm.shownTokens, [10, 12])
+    try expectTrue(asm.tick(at: 1).nacks.isEmpty)
+    try expectEqual(asm.receive(frag.resend(2, [2])[0], at: 1), [])   // a late copy of the skipped frame is ignored…
+    try expectEqual(asm.spurious, 0)                                   // …and wasn't asked for, so isn't spurious either
+}
+
 /// Seeded, so a failure repeats.
 private struct LCG { var s: UInt64; mutating func next() -> Double { s = s &* 6364136223846793005 &+ 1442695040888963407; return Double(s >> 11) / Double(1 << 53) } }
 

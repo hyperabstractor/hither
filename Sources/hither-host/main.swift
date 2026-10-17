@@ -109,6 +109,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var lastKeyAt: CFTimeInterval = 0
     var offeredAt: CFTimeInterval = 0   // "udp" sent: the first picture waits a moment for it rather than crawl through TCP
     var nLost = 0, nResent = 0
+    // LTR (H.264 over UDP, the viewer's "ltr" cap): once the viewer has confirmed a frame, every frame is built only on
+    // confirmed ones, so a lost frame spoils itself and no other
+    var viewerLTR = false
+    var ltrOn = false                     // the encoder took kVTCompressionPropertyKey_EnableLTR
+    var tokenSeq: [UInt32: UInt32] = [:]  // LTR token → frame seq, for frames not yet confirmed
+    var newAcks: [Int] = []               // confirmed tokens for the next encode
+    var keySeq: UInt32 = 0                // the last keyframe: it drops every older reference
+    var confirmed = false                 // a frame since that keyframe was confirmed: refreshes can build on it
+    var srtt = 0.0, rttvar = 0.0          // seconds: resend timeouts follow the round trip and its jitter
     var nFrames = 0, nBytes = 0, nKeys = 0, nDelayed = 0, nRaises = 0
     var encMs = 0.0, raiseMs = 0.0, rtts: [Double] = []
     var lastEncode: CFTimeInterval = 0
@@ -170,6 +179,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             viewerHEVC = m.caps?.contains("hevc") == true   // older viewers only decode H.264
             viewer422 = m.caps?.contains("hevc422") == true   // an iPhone may not decode 4:2:2
             viewerAudio = m.caps?.contains("audio") == true
+            viewerLTR = m.caps?.contains("ltr") == true && m.caps?.contains("udp") == true
             if m.caps?.contains("restore") == true { original = .zero }   // filled in once the window is known
             if m.caps?.contains("udp") == true, seal == nil, let secret = wire.secret() {
                 let tag = UInt64.random(in: 1...UInt64.max)
@@ -490,7 +500,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         if ticks % 20 == 0 && (nFrames > 0 || nRaises > 0 || nAudio > 0) {
             let r = rtts.sorted()
             log(String(format: "stats %@: %@ %d fps %.1f Mbps keyframes=%d encode=%.1fms delivery med/max=%.0f/%.0fms window=%d delayed=%d lost=%d resent=%d raises=%d (%.0fms avg) audio=%d/s peak=%.2f",
-                       appName, flow != nil ? "udp" : "tcp", nFrames / 5, Double(nBytes) * 8 / 5e6, nKeys, nFrames > 0 ? encMs / Double(nFrames) : 0,
+                       appName, "\(flow != nil ? "udp" : "tcp") \(codec)\(ltrOn ? confirmed ? "+ltr" : "+ltr(waiting)" : "")", nFrames / 5, Double(nBytes) * 8 / 5e6, nKeys, nFrames > 0 ? encMs / Double(nFrames) : 0,
                        r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, window.limit, nDelayed, nLost, nResent, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
             nLost = 0; nResent = 0
             nAudio = 0; audioPeak = 0; nFrames = 0; nBytes = 0; nKeys = 0; nDelayed = 0; nRaises = 0; encMs = 0; raiseMs = 0; rtts = []
@@ -622,6 +632,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// The chosen codec, stepped down to what this viewer decodes.
     func viewerCodec() -> String {
+        if viewerLTR { return "h264" }   // VideoToolbox's HEVC encoder ignores LTR acks
         let c = currentCodec()
         return !viewerHEVC ? "h264" : c == "hevc422" && !viewer422 ? "hevc" : c
     }
@@ -631,9 +642,18 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         let size = (CVPixelBufferGetWidth(px), CVPixelBufferGetHeight(px))
         if encoder == nil || encSize != size { makeEncoder(size) }
         guard let encoder else { return }
-        let props = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
-        forceKey = false
         frameSeq &+= 1
+        var opts: [CFString: Any] = [:], independent = false
+        if forceKey {
+            opts[kVTEncodeFrameOptionKey_ForceKeyFrame] = true
+            keySeq = frameSeq; confirmed = false; newAcks = []
+        } else if ltrOn {
+            if !newAcks.isEmpty { opts[kVTEncodeFrameOptionKey_AcknowledgedLTRTokens] = newAcks; newAcks = [] }
+            // every frame, not just after a loss: a refresh after a loss costs the same round trip as a resend
+            if confirmed && flow != nil { opts[kVTEncodeFrameOptionKey_ForceLTRRefresh] = true; independent = true }
+        }
+        let props = opts.isEmpty ? nil : opts as CFDictionary
+        forceKey = false
         let seq = inputSeq, t0 = CACurrentMediaTime(), fseq = frameSeq, udp = flow != nil
         lastEncode = t0
         inflight.append((fseq, t0, udp, false))
@@ -641,11 +661,13 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                                         duration: .invalid, frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sb in
             guard let self else { return }
             guard status == noErr, let sb else {   // dropped: over UDP its number still goes, so the viewer doesn't wait for it
-                self.q.async { self.inflight.removeAll { $0.seq == fseq }; if udp { self.sendUDP(Data(), fseq) } }
+                self.q.async { self.inflight.removeAll { $0.seq == fseq }; if udp { self.sendUDP(Data(), fseq, independent: independent) } }
                 return
             }
             let p = packet(sb, seq), ms = (CACurrentMediaTime() - t0) * 1000
-            if udp { self.q.async { self.sendUDP(p, fseq) } } else { self.wire.sendVideo(p) }
+            let att = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[CFString: Any]])?.first
+            let token = (att?[kVTSampleAttachmentKey_RequireLTRAcknowledgementToken] as? NSNumber).map { UInt32(truncatingIfNeeded: $0.intValue) }
+            if udp { self.q.async { self.sendUDP(p, fseq, independent: independent, token: token) } } else { self.wire.sendVideo(p) }
             self.q.async { self.nFrames += 1; self.nBytes += p.count; self.encMs += ms; if p[4] & 0x7f != 0 { self.nKeys += 1 } }
         }
     }
@@ -680,6 +702,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
+        ltrOn = viewerLTR && codec == "h264" && VTSessionSetProperty(s, key: kVTCompressionPropertyKey_EnableLTR, value: kCFBooleanTrue) == noErr
+        if viewerLTR { log("encoder LTR: \(ltrOn ? "on" : "unavailable")") }
+        tokenSeq = [:]; newAcks = []; confirmed = false
         encoder = s
         encSize = size
         forceKey = true
@@ -809,15 +834,21 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     /// A frame was acked `sent` after it went: a round trip for the window.
     func acked(_ sent: CFTimeInterval) {
         let now = CACurrentMediaTime(), rtt = (now - sent) * 1000
+        if srtt == 0 { srtt = rtt / 1000; rttvar = srtt / 2 }
+        else { rttvar = 0.75 * rttvar + 0.25 * abs(srtt - rtt / 1000); srtt = 0.875 * srtt + 0.125 * rtt / 1000 }
         rtts.append(rtt)
         window.ack(rtt: rtt, at: now, held: held)
         held = false
     }
 
-    func sendUDP(_ p: Data, _ seq: UInt32) {
+    func sendUDP(_ p: Data, _ seq: UInt32, independent: Bool = false, token: UInt32? = nil) {
         let key = p.count > 4 && p[p.startIndex + 4] & 0x7f != 0
         if key { lastKeyAt = CACurrentMediaTime() }
-        sendDatagrams(frag.fragments(p, seq: seq, key: key, at: CACurrentMediaTime()))
+        if let token {
+            tokenSeq[token] = seq
+            if tokenSeq.count > 1000 { tokenSeq = tokenSeq.filter { Int32(bitPattern: seq &- $0.value) < 600 } }
+        }
+        sendDatagrams(frag.fragments(p, seq: seq, key: key, independent: independent && !key, token: token, at: CACurrentMediaTime()))
     }
 
     func sendDatagrams(_ plain: [Data]) {
@@ -848,6 +879,14 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             let done = inflight.filter { $0.udp && Int32(bitPattern: $0.seq &- seq) <= 0 }
             if let f = done.last, f.seq == seq, !f.retried, flags & 2 == 0 { acked(f.at) }   // a repaired frame's round trip isn't the link's
             inflight.removeAll { $0.udp && Int32(bitPattern: $0.seq &- seq) <= 0 }
+            if plain.count >= 7 {   // LTR tokens of frames shown: once one is newer than the last keyframe, build on them
+                for _ in 0..<min(Int(r.u8()), (plain.count - 7) / 4) {
+                    let t = r.u32()
+                    guard let s = tokenSeq.removeValue(forKey: t), Int32(bitPattern: s &- keySeq) >= 0 else { continue }
+                    newAcks.append(Int(t))
+                    confirmed = true
+                }
+            }
             if flags & 1 != 0, CACurrentMediaTime() - lastKeyAt > max(0.15, (window.base ?? 0) / 1000 + 0.1) {
                 forceKey = true   // at most one per round trip: the last one may still be on its way
                 lastKeyAt = CACurrentMediaTime()
@@ -881,7 +920,8 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             if pending == nil { pending = lastFrame }
             return pump()
         }
-        let limit = 2 * (window.base ?? 300) / 1000 + 0.15
+        // a frame is overdue after the round trip and four times its jitter (as TCP's RTO), so a slow ack isn't a loss
+        let limit = srtt > 0 ? srtt + max(4 * rttvar, 0.02) + 0.02 : 2 * (window.base ?? 300) / 1000 + 0.15
         let before = inflight.count
         if let last = inflight.last, last.udp, !last.retried, now - last.at > limit {
             inflight[inflight.count - 1].retried = true

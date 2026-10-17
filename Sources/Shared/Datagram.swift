@@ -9,13 +9,16 @@ import Network
 //
 // Datagram: [tag u64][counter u64][ChaChaPoly ciphertext][tag 16]. The tag names the session (the host has one UDP
 // port for all of them), the counter is the nonce and the replay check. Plaintext starts with a type byte:
-//   host → viewer  1 fragment  [seq u32][index u16][count u16][flags u8: 1 keyframe, 2 resent][bytes]
+//   host → viewer  1 fragment  [seq u32][index u16][count u16][flags u8][token u32][bytes]
+//                     flags: 1 keyframe, 2 resent, 4 independent (built only on frames the viewer confirmed, so it
+//                     decodes whatever was lost before it), 8 the token is the frame's long-term reference (LTR)
 //   viewer → host  2 ack       [seq u32: newest whole frame][flags u8: 1 need a keyframe, 2 that frame was repaired]
+//                              [n u8]([token u32])*n: the LTR tokens of the last frames shown, for the encoder
 //                  3 nack      [seq u32][n u16]([index u16])*n   n = 0: the whole frame
 // Acks also go out every 250 ms as a keepalive: they hold the NAT open and tell the host the path still works.
 
 public let videoPort: NWEndpoint.Port = 7421
-/// Each datagram stays under Tailscale's 1280-byte MTU with IP/UDP, the seal (32) and the fragment header (10).
+/// Each datagram stays under Tailscale's 1280-byte MTU with IP/UDP, the seal (32) and the fragment header (14).
 public let fragmentSize = 1150
 
 /// One direction pair of sealed datagrams for a session. Not thread-safe: keep it on one queue.
@@ -71,10 +74,12 @@ public struct Fragmenter {
     private var sent: [UInt32: (at: Double, parts: [Data], resent: [Double])] = [:]
     public init() {}
 
-    public mutating func fragments(_ packet: Data, seq: UInt32, key: Bool, at now: Double) -> [Data] {
+    public mutating func fragments(_ packet: Data, seq: UInt32, key: Bool, independent: Bool = false, token: UInt32? = nil,
+                                   at now: Double) -> [Data] {
         let count = max(1, (packet.count + fragmentSize - 1) / fragmentSize)
+        let flags: UInt8 = (key ? 1 : 0) | (independent ? 4 : 0) | (token != nil ? 8 : 0)
         let parts = (0..<count).map { i in
-            fragment(seq, i, count, key ? 1 : 0, packet.dropFirst(i * fragmentSize).prefix(fragmentSize))
+            fragment(seq, i, count, flags, token ?? 0, packet.dropFirst(i * fragmentSize).prefix(fragmentSize))
         }
         sent = sent.filter { now - $0.value.at < 2 }
         sent[seq] = (now, parts, Array(repeating: -.infinity, count: count))
@@ -96,9 +101,9 @@ public struct Fragmenter {
         }
     }
 
-    private func fragment(_ seq: UInt32, _ i: Int, _ count: Int, _ flags: UInt8, _ bytes: Data) -> Data {
-        var d = Data(capacity: 10 + bytes.count)
-        d.put(UInt8(1)); d.put(seq); d.put(UInt16(i)); d.put(UInt16(count)); d.put(flags); d.append(bytes)
+    private func fragment(_ seq: UInt32, _ i: Int, _ count: Int, _ flags: UInt8, _ token: UInt32, _ bytes: Data) -> Data {
+        var d = Data(capacity: 14 + bytes.count)
+        d.put(UInt8(1)); d.put(seq); d.put(UInt16(i)); d.put(UInt16(count)); d.put(flags); d.put(token); d.append(bytes)
         return d
     }
 }
@@ -106,10 +111,11 @@ public struct Fragmenter {
 /// Viewer side: fragments back into whole video packets, in order. A missing fragment is asked for again (a nack)
 /// rather than waited out; a frame that can't be repaired in time is dropped, and since every later P-frame would
 /// decode to garbage, nothing more is shown until a keyframe, which the acks ask for. A keyframe that arrives whole
-/// skips over anything older still being repaired.
+/// skips over anything older still being repaired, and so does an independent frame (LTR): it was built only on
+/// frames shown here, so nothing lost before it matters. With those, only the newest frame is ever asked for again.
 public struct Reassembler {
     struct Partial {
-        var parts: [Data?], key = false, repaired = false
+        var parts: [Data?], key = false, repaired = false, independent = false, token: UInt32? = nil
         var heard: Double, nacked: Double?   // last fragment in; last nack out
         var nacks = 0
         var started: Double                  // first noticed: it gives up a while after this
@@ -126,20 +132,34 @@ public struct Reassembler {
     /// Time to wait for a resend before asking again: a round trip, learned from resends, and a margin.
     public private(set) var resendWait = 0.4
     public private(set) var lost = 0, repairedCount = 0
+    /// Resent fragments that weren't needed: a copy was already here, or the frame was already shown. Near zero
+    /// unless the viewer asks too soon.
+    public private(set) var spurious = 0
+    private var passed: Set<UInt32> = []   // recent frames given up or skipped: resends for them came late, not spuriously
+    private var newestIndependent = false  // the newest frame heard was independent: older ones will never be needed
+    /// LTR tokens of the last few frames handed on, newest last: acks carry them so the encoder can build on them.
+    public private(set) var shownTokens: [UInt32] = []
 
     public init() {}
 
     /// A fragment in. Returns the packets now ready to decode, oldest first.
     public mutating func receive(_ d: Data, at now: Double) -> [Data] {
         var r = Reader(d)
-        guard d.count >= 10, r.u8() == 1 else { return [] }
-        let seq = r.u32(), i = Int(r.u16()), count = Int(r.u16()), flags = r.u8()
+        guard d.count >= 14, r.u8() == 1 else { return [] }
+        let seq = r.u32(), i = Int(r.u16()), count = Int(r.u16()), flags = r.u8(), token = r.u32()
         guard count > 0, i < count else { return [] }
         if next == nil { next = seq }
-        guard let n = next, !before(seq, n) else { return [] }   // delivered or given up
-        if newest.map({ before($0.seq, seq) || ($0.seq == seq && $0.index < i) }) ?? true { newest = (seq, i) }
+        guard let n = next, !before(seq, n) else {   // delivered or given up
+            if flags & 2 != 0, !passed.contains(seq) { spurious += 1 }
+            return []
+        }
+        if newest.map({ before($0.seq, seq) || ($0.seq == seq && $0.index < i) }) ?? true {
+            newest = (seq, i)
+            newestIndependent = flags & 4 != 0
+        }
         var f = frames[seq] ?? Partial(parts: [], heard: now, nacked: nil, started: now)
         if f.parts.count != count { f.parts = Array(repeating: nil, count: count) }   // first heard of it (or a whole-frame nack placeholder)
+        if f.parts[i] != nil { spurious += 1 }
         if f.parts[i] == nil {
             f.parts[i] = r.rest()
             if flags & 2 != 0 {
@@ -149,13 +169,17 @@ public struct Reassembler {
             }
         }
         f.key = f.key || flags & 1 != 0
+        f.independent = f.independent || flags & 4 != 0
+        if flags & 8 != 0 { f.token = token }
         f.heard = now
         frames[seq] = f
         if f.complete {
             if let a = acked, !before(a.seq, seq) {} else { acked = (seq, f.repaired) }
             if f.repaired { repairedCount += 1 }
-            if f.key, seq != n {   // a whole new picture: nothing older matters
+            if f.key || f.independent, seq != n {   // a picture that needs nothing older: skip what's still missing
                 for s in frames.keys where before(s, seq) { frames[s] = nil }
+                var s = n
+                while before(s, seq) { pass(s); s = s &+ 1 }
                 next = seq
             }
         }
@@ -176,10 +200,13 @@ public struct Reassembler {
             if s == next, (broken && !f.key) || now - f.started > max(1, 3 * resendWait) {
                 frames[s] = nil
                 lost += 1
-                broken = true
+                pass(s)
+                if !newestIndependent { broken = true }   // with LTR a newer frame repairs the picture by itself
                 next = s &+ 1
                 continue
             }
+            // a newer independent frame is coming: it will show instead, so this one isn't worth a round trip
+            if newestIndependent, s != top.seq { frames[s] = f; continue }
             // late: sent before something that already came, or anything once the frame went quiet. (A big frame
             // takes a while to arrive: what's after the newest fragment heard is still on its way.)
             let quiet = now - f.heard > 0.03
@@ -201,19 +228,26 @@ public struct Reassembler {
             next = n &+ 1
             let p = f.parts.reduce(into: Data()) { $0.append($1!) }
             if p.isEmpty { continue }          // the encoder dropped it: nothing to show, and nothing lost
-            if broken && !f.key { continue }   // can't decode without the reference that was lost
+            if broken && !f.key && !f.independent { continue }   // can't decode without the reference that was lost
             broken = false
+            if let t = f.token { shownTokens = (shownTokens + [t]).suffix(4) }
             out.append(p)
         }
         return out
+    }
+
+    private mutating func pass(_ s: UInt32) {
+        passed.insert(s)
+        if passed.count > 256 { passed.remove(passed.min { before($0, $1) }!) }
     }
 
     /// Sequence order that survives the u32 wrapping.
     func before(_ a: UInt32, _ b: UInt32) -> Bool { Int32(bitPattern: a &- b) < 0 }
 }
 
-public func ackDatagram(_ seq: UInt32, needKey: Bool, repaired: Bool) -> Data {
+public func ackDatagram(_ seq: UInt32, needKey: Bool, repaired: Bool, tokens: [UInt32] = []) -> Data {
     var d = Data(); d.put(UInt8(2)); d.put(seq); d.put(UInt8((needKey ? 1 : 0) | (repaired ? 2 : 0)))
+    d.put(UInt8(tokens.count)); for t in tokens { d.put(t) }
     return d
 }
 
@@ -238,6 +272,8 @@ public final class VideoLink {
     /// A packet ready to decode, on the link's queue.
     public var onFrame: (Data) -> Void = { _ in }
     public private(set) var frames = 0
+    /// For logs and tests, read on any queue (approximate).
+    public var counts: (lost: Int, repaired: Int, spurious: Int) { (assembler.lost, assembler.repairedCount, assembler.spurious) }
 
     public init(secret: Data, tag: UInt64, to host: NWEndpoint.Host, port: NWEndpoint.Port) {
         seal = Seal(secret: secret, tag: tag, host: false)
@@ -286,7 +322,7 @@ public final class VideoLink {
     private func ack() {
         lastAckAt = ProcessInfo.processInfo.systemUptime
         let a = assembler.acked
-        send(ackDatagram(a?.seq ?? 0, needKey: assembler.broken, repaired: a?.repaired ?? false))
+        send(ackDatagram(a?.seq ?? 0, needKey: assembler.broken, repaired: a?.repaired ?? false, tokens: assembler.shownTokens))
     }
 
     private func send(_ plain: Data) { conn.send(content: seal.seal(plain), completion: .idempotent) }
