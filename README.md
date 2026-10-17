@@ -26,6 +26,8 @@ local network.
 - **Keep Screen Dark.** While you use a Mac from here, its own monitors show black, so whoever sits near it
   doesn't see what you're doing. Two minutes after you close its last window, it locks and the monitors come
   back showing the lock screen. **Lock** locks it right away.
+- **Clipboard, when you ask.** **Send Clipboard** puts what you copied here on the other Mac's clipboard;
+  **Get Clipboard** brings theirs back. Nothing moves until you choose it. Text, rich text and images, up to 8 MB.
 - **Screen Sharing.** The menu still hands off to macOS Screen Sharing when you want it.
 
 ## Requirements
@@ -69,6 +71,8 @@ Sharing open. Pair as many Macs as you like; each gets its own section in the me
 - Pick a window or app from the menu bar icon, or type an app's name in Spotlight (`Safari · mini`).
 - Cmd-H and Cmd-M hide or minimise the window on this Mac. Ctrl-Cmd-F makes it full screen here. Every other key
   goes to the app.
+- Ctrl-Option-Cmd-C in a remote window sends your clipboard there; Ctrl-Option-Cmd-V gets theirs. Both are also at
+  the bottom of the window's Edit menu, and in each Mac's section of the menu bar icon.
 - **Video Codec** in the menu switches every window between H.264, HEVC and HEVC 4:2:2.
 
 ## iPhone
@@ -115,7 +119,8 @@ the menu bar app, so only Hither itself needs Local Network access.
 - Keep Screen Dark blacks out the picture, not the Mac: its own keyboard and mouse still work while you use it.
   It only covers the session on the monitors; another user can't log in there at the same time.
 - Audio is captured before the host's volume control. Mute the host if you only want sound on this Mac.
-- There's no clipboard sync. Universal Clipboard already covers it.
+- The clipboard only moves on Send or Get Clipboard, never by itself. Copied Finder files aren't carried yet.
+  macOS may ask once whether Hither can read the clipboard; allow it in Privacy & Security › Paste from Other Apps.
 - It isn't notarized, and it uses one private but widely used Accessibility call (`_AXUIElementGetWindow`) to match
   windows with their IDs.
 

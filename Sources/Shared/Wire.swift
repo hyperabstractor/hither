@@ -168,13 +168,15 @@ public func tcpOptions() -> NWProtocolTCP.Options {
     return tcp
 }
 
-/// Framing: [kind u8][len u32][body]. kind 1 = JSON Msg, 2 = video packet, 3 = audio (48 kHz stereo Int16 PCM).
+/// Framing: [kind u8][len u32][body]. kind 1 = JSON Msg, 2 = video packet, 3 = audio (48 kHz stereo Int16 PCM),
+/// 4 = clipboard (Clip).
 public final class Wire {
     public let conn: NWConnection
     public let queue: DispatchQueue
     public var onMsg: (Msg) -> Void = { _ in }
     public var onVideo: (Data) -> Void = { _ in }
     public var onAudio: (Data) -> Void = { _ in }
+    public var onClip: (Data) -> Void = { _ in }
     public var onClose: () -> Void = {}
     public var maxLen = Int.max   // cap it where the peer isn't authenticated yet (pairing)
     private let sendLock = NSLock()  // audio, encoder and control messages arrive from different queues
@@ -222,6 +224,8 @@ public final class Wire {
                     self.onVideo(body)
                 } else if kind == 3 {
                     self.onAudio(body)
+                } else if kind == 4 {
+                    self.onClip(body)
                 }
                 self.read()
             }
@@ -231,6 +235,7 @@ public final class Wire {
     public func send(_ m: Msg) { frame(1, try! JSONEncoder().encode(m)) }
     public func sendVideo(_ d: Data) { frame(2, d) }
     public func sendAudio(_ d: Data) { frame(3, d) }
+    public func sendClip(_ d: Data) { frame(4, d) }
 
     /// Send the last control message and a TCP/TLS finish. Keep receiving until the peer closes,
     /// with a bounded fallback for peers that never acknowledge the end of the stream.

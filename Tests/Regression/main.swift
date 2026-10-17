@@ -34,6 +34,8 @@ do {
     print("PASS frame window opens up over a long link and backs off when it fills")
     try testDisplayFit()
     print("PASS a dark display takes the mode the viewer's screen shows best")
+    try testClip()
+    print("PASS a clipboard crosses the wire; screenshots go as PNG; Finder files are refused")
     let arguments = CommandLine.arguments
     if arguments.count == 4, arguments[1] == "--remote" {
         try testMissingRemoteWindow(host: arguments[2], app: arguments[3], throughRelay: false)

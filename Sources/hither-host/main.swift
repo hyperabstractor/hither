@@ -26,6 +26,7 @@ let inputQ = DispatchQueue(label: "input")
 /// Menu reads and presses: AX calls into the app can block (a menu item that runs a modal panel), so keep them
 /// off both the session and input queues.
 let menuQ = DispatchQueue(label: "menu")
+let clipQ = DispatchQueue(label: "clipboard")
 var lastInputAt: CFTimeInterval = 0
 /// Input through a window proxy (not a desktop): a new window soon after is the user's doing, so it follows them.
 /// Through a desktop they already see it there.
@@ -118,6 +119,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         wire = Wire(conn, queue: q)
         super.init()
         wire.onMsg = { [unowned self] in handle($0) }
+        wire.onClip = { [unowned self] d in   // Send Clipboard on the viewer: this becomes our clipboard
+            DispatchQueue.main.async {
+                guard let c = Clip(decoding: d) else { return log("clipboard: unreadable") }
+                c.write()
+                log("clipboard set: \(c.summary)")
+                var r = Msg("clipset"); r.text = c.summary
+                self.wire.send(r)
+            }
+        }
         wire.onClose = { [unowned self] in log("connection closed (\(conn.endpoint))"); stop() }
         log("connection from \(conn.endpoint)")
         wire.start()
@@ -137,6 +147,16 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             DispatchQueue.main.async { Dark.enabled = on }
             Task { await list() }   // reply with the new state
         case "lock": DispatchQueue.main.async { Dark.lock() }
+        case "clipget":   // Get Clipboard on the viewer. Off the main queue: macOS may hold the read for a privacy prompt
+            clipQ.async {
+                if #available(macOS 15.4, *), NSPasteboard.general.accessBehavior == .alwaysDeny {
+                    var r = Msg("cliperr"); r.text = "Hither isn't allowed to read the clipboard (Privacy & Security › Paste from Other Apps)"
+                    return self.wire.send(r)
+                }
+                let c = Clip.read()
+                log("clipboard sent: \(c.parts.isEmpty ? c.files ? "files (not carried)" : "empty" : c.summary)")
+                self.wire.sendClip(c.encoded())
+            }
         case "open":
             viewerHEVC = m.caps?.contains("hevc") == true   // older viewers only decode H.264
             viewer422 = m.caps?.contains("hevc422") == true   // an iPhone may not decode 4:2:2

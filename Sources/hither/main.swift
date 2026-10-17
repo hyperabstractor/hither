@@ -31,6 +31,29 @@ func dial(_ host: String) -> Wire {
 /// Runs on the main thread even while a menu is open (plain main-queue blocks wait for tracking to end).
 func onMain(_ f: @escaping () -> Void) { RunLoop.main.perform(inModes: [.common], block: f); CFRunLoopWakeUp(CFRunLoopGetMain()) }
 
+/// What the user calls `host`: its paired name, even when it's reached by address.
+func macName(_ host: String) -> String { Pairings.load().peer(for: host)?.name ?? short(host) }
+
+// Clipboard, only on request: Send Clipboard puts this Mac's on `name`'s (it confirms with "clipset"),
+// Get Clipboard asks for theirs ("clipget", answered with a clipboard frame or "cliperr").
+/// Sends this Mac's clipboard; nil when it went, or why it didn't.
+func pushClipboard(over wire: Wire?, to name: String) -> String? {
+    guard let wire else { return "Not connected to \(name)" }
+    let c = Clip.read()
+    if c.parts.isEmpty { return c.files ? "Copying files isn't supported yet" : "Your clipboard is empty" }
+    wire.sendClip(c.encoded())
+    return nil
+}
+/// `name`'s clipboard arrived: it becomes this Mac's. Returns what to tell the user.
+func receivedClipboard(_ d: Data, from name: String) -> String {
+    guard let c = Clip(decoding: d) else { return "Couldn't read \(name)'s clipboard" }
+    if c.parts.isEmpty { return c.files ? "Files on \(name)'s clipboard can't be copied yet" : "\(name)'s clipboard is empty" }
+    c.write()
+    return "Got \(c.summary) from \(name)"
+}
+/// ⌃⌥⌘C / ⌃⌥⌘V in a remote window, shown on the Edit menu items too.
+let clipMods: NSEvent.ModifierFlags = [.control, .option, .command]
+
 // NSEvent.Phase → CGScrollPhase / CGMomentumScrollPhase raw values
 func cgPhase(_ p: NSEvent.Phase) -> Int {
     p.contains(.began) ? 1 : p.contains(.changed) ? 2 : p.contains(.ended) ? 4 : p.contains(.cancelled) ? 8 : p.contains(.mayBegin) ? 128 : 0
@@ -48,6 +71,7 @@ final class StreamView: NSView {
     var allSamples: [Double] = []
     var onLatency: (Int) -> Void = { _ in }
     var send: (Msg) -> Void = { _ in }
+    var onClipboard: (_ send: Bool) -> Void = { _ in }   // ⌃⌥⌘C sends this Mac's clipboard, ⌃⌥⌘V gets theirs
     var remoteSize = CGSize.zero   // the host window's size in points
 
     override init(frame: NSRect) {
@@ -161,6 +185,8 @@ final class StreamView: NSView {
         case (true, "m"): window?.miniaturize(nil)
         case (false, "f") where e.modifierFlags.intersection(.deviceIndependentFlagsMask) == [.control, .command]:
             window?.toggleFullScreen(nil)   // full screen is about this proxy window, not the host's
+        case (false, _) where e.modifierFlags.intersection(.deviceIndependentFlagsMask) == clipMods && [8, 9].contains(e.keyCode):
+            onClipboard(e.keyCode == 8)   // kVK_ANSI_C, kVK_ANSI_V
         case (true, "`"):   // cycle this proxy app's windows, like any local app
             let ws = NSApp.windows.filter { $0.isVisible && $0.canBecomeMain }
             if let i = ws.firstIndex(where: { $0 === window }) { ws[(i + 1) % ws.count].makeKeyAndOrderFront(nil) }
@@ -183,6 +209,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     var wire: Wire?
     let activeWire = OSAllocatedUnfairLock<ObjectIdentifier?>(initialState: nil)
     var appName = "", remoteTitle = "", latency = ""
+    var note: String?   // a passing status ("Sent text to mini-pb") shown in place of the latency
     var remoteSize = CGSize.zero { didSet { view.remoteSize = remoteSize } }
     var retries = 0
     var done = false
@@ -192,6 +219,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         super.init()
         view.send = { [weak self] in self?.wire?.send($0) }
         view.onLatency = { [weak self] ms in self?.latency = "\(ms) ms"; self?.updateTitle() }
+        view.onClipboard = { [weak self] send in send ? self?.sendClipboard() : self?.getClipboard() }
         proxies.append(self)
         connect()
     }
@@ -219,6 +247,12 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         w.onAudio = { [weak self, weak w] data in
             guard let self, let w, self.activeWire.withLock({ $0 == ObjectIdentifier(w) }) else { return }
             AudioOut.shared.play(data, from: me)
+        }
+        w.onClip = { [weak self] d in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                flash(receivedClipboard(d, from: macName(host)))
+            }
         }
         w.onMsg = { [weak self, weak w] m in
             guard let self, let w, self.activeWire.withLock({ $0 == ObjectIdentifier(w) }) else { return }
@@ -254,6 +288,8 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         switch m.t {
         case "closed": log(m.title ?? "closed"); finish()
         case "title": remoteTitle = m.title ?? ""; updateTitle()
+        case "clipset": flash("Sent \(m.text ?? "clipboard") to \(macName(host))")
+        case "cliperr": flash(m.text ?? "Couldn't get the clipboard")
         case "opened":
             let receivedID = m.k ?? 0
             guard receivedID > 0, windowID == 0 || receivedID == windowID else {
@@ -360,11 +396,30 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         }
     }
 
+    @objc func sendClipboard() { if let why = pushClipboard(over: wire, to: macName(host)) { flash(why) } }
+    @objc func getClipboard() {
+        guard let wire else { return flash("Not connected to \(macName(host))") }
+        flash("Getting \(macName(host))'s clipboard…")
+        wire.send(Msg("clipget"))
+    }
+
+    /// Show `s` in the subtitle for a few seconds.
+    func flash(_ s: String) {
+        log(s)
+        note = s
+        updateTitle()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, note == s else { return }
+            note = nil
+            updateTitle()
+        }
+    }
+
     /// Title mirrors the remote window; the subtitle says where it really runs.
     func updateTitle(status: String? = nil) {
         guard let window else { return }
         window.title = remoteTitle.isEmpty ? appName : remoteTitle
-        let extra = status ?? latency
+        let extra = status ?? note ?? latency
         window.subtitle = "\(appName) on \(short(host))" + (extra.isEmpty ? "" : " · \(extra)")
     }
 
@@ -471,14 +526,36 @@ final class RemoteMenus: NSObject, NSMenuDelegate {
     }
 
     /// Top level: the host's bar minus its Apple menu. The first item becomes our app menu (shown as "Cursor · mini").
+    /// A desktop has no app of its own over there (its menu bar is in the picture): it gets an Edit menu here just for
+    /// the clipboard items.
     func install() {
-        guard let bar = fetch([]), bar.count > 1 else { return }
+        guard let bar = fetch([]) else { return }
         let main = NSMenu()
-        for (i, e) in bar.enumerated() where i > 0 {
-            let item = main.addItem(withTitle: e.title, action: nil, keyEquivalent: "")
-            item.submenu = submenu(e.title, [i])
-        }
+        if bar.count > 1 {
+            for (i, e) in bar.enumerated() where i > 0 {
+                let item = main.addItem(withTitle: e.title, action: nil, keyEquivalent: "")
+                item.submenu = submenu(e.title, [i])
+            }
+        } else if link?.isDesktop == true {
+            main.addItem(withTitle: "", action: nil, keyEquivalent: "").submenu = NSMenu()   // the app menu
+            let edit = NSMenu(title: "Edit")
+            edit.delegate = self
+            main.addItem(withTitle: "Edit", action: nil, keyEquivalent: "").submenu = edit
+        } else { return }
         NSApp.mainMenu = main
+    }
+
+    /// Send/Get Clipboard, for the window you're in. The keys themselves are caught by StreamView.
+    func addClipboardItems(to menu: NSMenu) {
+        guard let p = link else { return }
+        let name = macName(p.host)
+        if menu.numberOfItems > 0 { menu.addItem(.separator()) }
+        for (title, key, action) in [("Send Clipboard to \(name)", "c", #selector(ProxyWindow.sendClipboard)),
+                                     ("Get Clipboard from \(name)", "v", #selector(ProxyWindow.getClipboard))] {
+            let mi = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+            mi.keyEquivalentModifierMask = clipMods
+            mi.target = p
+        }
     }
 
     func submenu(_ title: String, _ path: [Int]) -> RemoteMenu {
@@ -490,7 +567,11 @@ final class RemoteMenus: NSObject, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        guard let menu = menu as? RemoteMenu, let entries = fetch(menu.path) else { return }
+        guard let menu = menu as? RemoteMenu else {   // a desktop's own Edit menu
+            menu.removeAllItems()
+            return addClipboardItems(to: menu)
+        }
+        guard let entries = fetch(menu.path) else { return }
         menu.removeAllItems()
         for (j, e) in entries.enumerated() {
             if e.title.isEmpty { menu.addItem(.separator()); continue }
@@ -507,6 +588,7 @@ final class RemoteMenus: NSObject, NSMenuDelegate {
             item.representedObject = menu.path + [j]
             if e.sub { item.submenu = submenu(e.title, menu.path + [j]) }
         }
+        if menu.path.count == 1, menu.title == "Edit" { addClipboardItems(to: menu) }
     }
 
     @objc func pick(_ sender: NSMenuItem) {
@@ -668,8 +750,16 @@ final class Remote {
                     case "windows": Reach.worked(host, for: peer); codec = m.codec ?? "h264"; dark = m.dark ?? false; update(m.items ?? [])
                     case "apps": launcher.makeProxies(m.items ?? [], on: self)
                     case "appeared": launcher.appeared(m.items ?? [], on: self)
+                    case "clipset": launcher.flash("Sent \(m.text ?? "clipboard") to \(name)")
+                    case "cliperr": launcher.flash(m.text ?? "Couldn't get \(name)'s clipboard")
                     default: break
                     }
+                }
+            }
+            w.onClip = { [weak self] d in
+                onMain { [weak self] in
+                    guard let self, !gone else { return }
+                    launcher.flash(receivedClipboard(d, from: name))
                 }
             }
             wire = w
@@ -971,6 +1061,14 @@ final class Launcher: NSObject, NSMenuDelegate {
         for r in recent { add(r.app, Row(item: r, mac: mac), indent: 0, to: sub).image = icon(r.bundle) }
         recentItem.submenu = sub
         recentItem.isEnabled = !recent.isEmpty
+        let send = menu.addItem(withTitle: "Send Clipboard to \(mac.name)", action: #selector(sendClipboard(_:)), keyEquivalent: "")
+        send.target = self
+        send.representedObject = mac
+        send.toolTip = "Puts what you copied here on \(mac.name)'s clipboard, ready to paste there."
+        let get = menu.addItem(withTitle: "Get Clipboard from \(mac.name)", action: #selector(getClipboard(_:)), keyEquivalent: "")
+        get.target = self
+        get.representedObject = mac
+        get.toolTip = "Puts what you copied on \(mac.name) on this Mac's clipboard."
         let codecItem = menu.addItem(withTitle: "Video Codec", action: nil, keyEquivalent: "")
         let codecs = NSMenu()
         for (title, id) in [("H.264", "h264"), ("HEVC", "hevc"), ("HEVC 4:2:2 (sharpest color)", "hevc422")] {
@@ -1158,6 +1256,31 @@ final class Launcher: NSObject, NSMenuDelegate {
         mac.wire?.send(m)
     }
 
+    @objc func sendClipboard(_ sender: NSMenuItem) {
+        guard let mac = sender.representedObject as? Remote else { return }
+        if let why = pushClipboard(over: mac.wire, to: mac.name) { flash(why) }
+    }
+
+    @objc func getClipboard(_ sender: NSMenuItem) {
+        guard let mac = sender.representedObject as? Remote else { return }
+        guard let wire = mac.wire else { return flash("Not connected to \(mac.name)") }
+        wire.send(Msg("clipget"))
+    }
+
+    /// A passing status next to the menu bar icon ("Got text from mini-pb"), gone after a few seconds.
+    func flash(_ s: String) {
+        log(s)
+        status.length = NSStatusItem.variableLength
+        status.button?.imagePosition = .imageLeading
+        status.button?.title = " " + s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, status.button?.title == " " + s else { return }
+            status.button?.title = ""
+            status.button?.imagePosition = .imageOnly
+            status.length = NSStatusItem.squareLength
+        }
+    }
+
     @objc func lockMac(_ sender: NSMenuItem) { (sender.representedObject as? Remote)?.wire?.send(Msg("lock")) }
 
     @objc func screenShare(_ sender: NSMenuItem) {
@@ -1322,7 +1445,8 @@ default:
     if args.dropFirst().first == "--selftest" { pairSelfTest() }
     guard args.count >= 3 else {
         print("usage: hither <host> <app> [window-title-substring]\n       hither <host> --list\n       hither <host> --codec h264|hevc|hevc422"
-            + "\n       hither <host> --dark on|off\n       hither <host> --lock\n       hither <host> @desktop")
+            + "\n       hither <host> --dark on|off\n       hither <host> --lock\n       hither <host> @desktop"
+            + "\n       hither <host> --send-clipboard|--get-clipboard")
         exit(1)
     }
     if args[2] == "--dark", args.count > 3 {   // same as the launcher's Keep Screen Dark
@@ -1341,6 +1465,15 @@ default:
         w.start()
         w.send(Msg("lock"))
         w.send(Msg("list"))   // its reply means the lock went through first
+    } else if args[2] == "--send-clipboard" || args[2] == "--get-clipboard" {   // same as the launcher's clipboard items
+        let w = dial(args[1]), name = macName(args[1])
+        listWire = w
+        w.onMsg = { m in print(m.t == "clipset" ? "Sent \(m.text ?? "clipboard") to \(name)" : m.text ?? m.t); exit(m.t == "clipset" ? 0 : 1) }
+        w.onClip = { d in DispatchQueue.main.async { print(receivedClipboard(d, from: name)); exit(0) } }
+        w.onClose = { exit(1) }
+        w.start()
+        if args[2] == "--get-clipboard" { w.send(Msg("clipget")) }
+        else if let why = pushClipboard(over: w, to: name) { print(why); exit(1) }
     } else if args[2] == "--codec", args.count > 3 {   // same as the launcher's Video Codec menu
         let w = dial(args[1])
         listWire = w
