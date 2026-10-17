@@ -125,6 +125,28 @@ the menu bar app, so only Hither itself needs Local Network access.
 - It isn't notarized, and it uses one private but widely used Accessibility call (`_AXUIElementGetWindow`) to match
   windows with their IDs.
 
+## Troubleshooting
+
+**The picture freezes, but typing still reaches the other Mac.** Usually the network is losing packets between
+the two Macs. Video goes over TCP, which stops and waits for every lost packet, so the picture stalls. Keystrokes
+are tiny, so they still get through. The host log (`/tmp/hither-host.log` on the other Mac) shows `0 fps` while
+the screen is changing, with `delivery` times of several seconds.
+
+Over Tailscale between two networks, the cause can be a single bad route. Providers pick a route partly by the
+connection's port numbers, so after a restart one Mac's connection can land on a lossy path while another Mac
+reaching the same place is fine. To check, ping both of your Macs from the far one at the same time:
+
+```sh
+ping -c 60 -i 0.2 -q <this Mac's Tailscale IP> & ping -c 60 -i 0.2 -q <another Mac's Tailscale IP> & wait
+```
+
+If one shows real loss (10% or more) and the other doesn't, restart Tailscale on the far Mac. It gets new ports,
+and with them a different route. With Tailscale from Homebrew that's `sudo brew services restart tailscale`; with
+the Tailscale app, quit it and open it again. Nothing in Hither needs changing, and it reconnects by itself.
+
+**A Mac in someone else's tailnet doesn't connect.** Its name may not resolve here. Pair by address (its Tailscale
+IP) and Hither keeps that address as a fallback.
+
 ## Development
 
 ```bash
