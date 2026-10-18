@@ -128,6 +128,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var viewerHEVC = false
     var viewer422 = false
     var viewerAudio = false
+    var audioOn = true   // on audioQ. Off for viewer windows that wouldn't play it (another window of the app does)
     var original: CGRect?            // the window's frame before a viewer that asked for "restore" resized it
     let audioQ = DispatchQueue(label: "audio")
     var nAudio = 0
@@ -216,6 +217,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.focus(force: false)   // e.g. File › Save acts on the key window, so make it ours
                 menuQ.async { if let e = self.menuItems(at: path.dropLast())?[safe: path.last ?? -1] { AXUIElementPerformAction(e, kAXPressAction as CFString) } }
             }
+        case "audio":   // whether this is the viewer window that plays the app's sound; older viewers never say: on
+            let on = m.down ?? true
+            audioQ.async { self.audioOn = on }
+            log("\(appName) audio \(on ? "on" : "off (another window plays it)")")
         case "visible":   // proxy window fully hidden (minimized, other Space, covered, app hidden) → encode nothing
             visible = m.down ?? true
             log("\(appName) \(visible ? "visible" : "hidden — paused")")
@@ -578,9 +583,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         encode(p)
     }
 
-    /// App audio → 48 kHz stereo Int16, sent raw (~1.5 Mbps: nothing on a LAN, and no codec delay).
+    /// App audio → 48 kHz stereo Int16, sent raw (~1.5 Mbps: nothing on a LAN, and no codec delay). Silence isn't
+    /// sent, so an idle window costs nothing: the viewer runs dry, pauses, and re-buffers when sound comes back.
     func audio(_ sb: CMSampleBuffer) {
-        guard let fd = sb.formatDescription, let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee,
+        guard audioOn, let fd = sb.formatDescription, let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee,
               asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0 else { return }
         var size = 0
         CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sb, bufferListSizeNeededOut: &size, bufferListOut: nil, bufferListSize: 0,
@@ -605,6 +611,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 peak = max(peak, abs(v))
             }
         }
+        guard peak >= 1e-4 else { return }   // below -80 dBFS (~3 LSB of Int16): inaudible
         wire.sendAudio(out.withUnsafeBytes { Data($0) })
         q.async { self.nAudio += 1; self.audioPeak = max(self.audioPeak, peak) }
     }

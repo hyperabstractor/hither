@@ -353,6 +353,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
                 if let icon = m.icon.flatMap(NSImage.init(data:)) { NSApp.applicationIconImage = icon }
                 if window?.isKeyWindow == true { wire?.send(Msg("focus")) }
                 sendVisibility()
+                sendAudioOwner()
                 remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
                 updateTitle()
                 windowDidResize(Notification(name: NSWindow.didResizeNotification))
@@ -394,6 +395,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         if let last = proxies.last(where: { $0.window != nil })?.window { w.setFrameTopLeftPoint(last.cascadeTopLeft(from: .zero)) } else { w.center() }
         window = w
         AudioOut.shared.claim(ObjectIdentifier(self))
+        sendAudioOwner()
         updateTitle()
         w.makeKeyAndOrderFront(nil)
         if let icon = m.icon.flatMap(NSImage.init(data:)) { NSApp.applicationIconImage = icon }
@@ -510,6 +512,12 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         wire?.send(m)
     }
 
+    /// Only the window that plays the app's sound needs it: the host stops sending it to the others.
+    func sendAudioOwner() {
+        var m = Msg("audio"); m.down = AudioOut.shared.owns(ObjectIdentifier(self))
+        wire?.send(m)
+    }
+
     func windowWillClose(_ n: Notification) { window = nil; finish() }
 
     func finish() {
@@ -521,7 +529,9 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         window?.close()
         window = nil
         proxies.removeAll { $0 === self }
-        AudioOut.shared.release(ObjectIdentifier(self), next: proxies.first { $0.window != nil }.map(ObjectIdentifier.init))
+        let next = proxies.first { $0.window != nil }
+        AudioOut.shared.release(ObjectIdentifier(self), next: next.map(ObjectIdentifier.init))
+        next?.sendAudioOwner()
         if proxies.isEmpty && role != "launcher" { NSApp.terminate(nil) }
     }
 }

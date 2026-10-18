@@ -23,6 +23,7 @@ public final class AudioOut {
     }
 
     public func claim(_ id: ObjectIdentifier) { lock.lock(); if owner == nil { owner = id }; lock.unlock() }
+    public func owns(_ id: ObjectIdentifier) -> Bool { lock.lock(); defer { lock.unlock() }; return owner == id }
     public func release(_ id: ObjectIdentifier, next: ObjectIdentifier?) { lock.lock(); if owner == id { owner = next }; lock.unlock() }
 
     /// Int16 interleaved stereo in. Start once ~30 ms is buffered (absorbs Wi-Fi jitter). Sound arrives and plays in
