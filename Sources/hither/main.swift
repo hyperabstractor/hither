@@ -220,19 +220,110 @@ final class StreamView: NSView {
     var onLatency: (Int) -> Void = { _ in }
     var send: (Msg) -> Void = { _ in }
     var onClipboard: (_ send: Bool) -> Void = { _ in }   // ⌃⌥⌘C sends this Mac's clipboard, ⌃⌥⌘V gets theirs
-    var remoteSize = CGSize.zero   // the host window's size in points
+    var onZoom: () -> Void = {}
+    var zoomKeys = false   // Native Desktop: ⌃⌥⌘= / − / 0 / 9 zoom here instead of going to the host
+    var remoteSize = CGSize.zero { didSet { if remoteSize != oldValue { place() } } }   // the host window's size in points
+    /// Native Desktop: nil = fit the window; else remote points × zoom, scrolled by `pan` where it's bigger than the window.
+    private(set) var zoom: CGFloat?
+    var pan = CGPoint.zero
+    private(set) var picture = CGRect.zero   // where the video is in this view
+    var panTimer: Timer?
+    var held = -1   // the mouse button down (-1: none), so edge scrolling while dragging keeps dragging
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        video.videoGravity = .resizeAspect
-        video.backgroundColor = NSColor.black.cgColor
-        layer = video
+        video.videoGravity = .resize   // `picture` keeps the shape
+        let root = CALayer()
+        root.backgroundColor = NSColor.black.cgColor
+        root.masksToBounds = true
+        root.isGeometryFlipped = true   // top-left origin, like this view
+        root.addSublayer(video)
+        layer = root
         wantsLayer = true
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }   // top-left origin, same as CG global coords on the host
+
+    override func setFrameSize(_ s: NSSize) { super.setFrameSize(s); place() }
+
+    func place() {
+        let r = pictureRect(view: bounds.size, remote: remoteSize, zoom: zoom, pan: pan)
+        pan = r.pan
+        picture = remoteSize == .zero ? bounds : r.rect
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        video.frame = picture
+        CATransaction.commit()
+    }
+
+    // MARK: zoom (Native Desktop)
+
+    static let zoomSteps: [CGFloat] = [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3]
+    /// The picture's scale now, fit included: remote points → points here.
+    var scaleNow: CGFloat { remoteSize.width > 0 ? picture.width / remoteSize.width : 1 }
+
+    /// The pointer, if it's over this view.
+    var pointerInside: CGPoint? {
+        guard let w = window else { return nil }
+        let p = convert(w.mouseLocationOutsideOfEventStream, from: nil)
+        return bounds.contains(p) ? p : nil
+    }
+
+    /// nil = fit. Keeps what's under `anchor` (the pointer, else the middle) where it is.
+    func setZoom(_ z: CGFloat?, around anchor: CGPoint? = nil) {
+        let a = anchor ?? pointerInside ?? CGPoint(x: bounds.midX, y: bounds.midY)
+        let spot = remotePoint(a, in: picture, remote: remoteSize)
+        zoom = z
+        if let z { pan = CGPoint(x: spot.x * z - a.x, y: spot.y * z - a.y) }
+        place()
+        onZoom()
+    }
+
+    func zoomStep(_ dir: Int) {
+        let now = scaleNow
+        if let next = dir > 0 ? Self.zoomSteps.first(where: { $0 > now + 0.005 }) : Self.zoomSteps.last(where: { $0 < now - 0.005 }) {
+            setZoom(next)
+        }
+    }
+
+    /// Zoomed in past the window: with the pointer near an edge the picture slides that way, faster the closer it is,
+    /// so the whole screen is in reach. The host hears where the pointer now is, as the spot under it changes.
+    func edgeScroll() {
+        guard zoom != nil, let p = pointerInside, speed(at: p) != .zero else { return }
+        guard panTimer == nil else { return }
+        var last = CACurrentMediaTime()
+        let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] t in
+            guard let self, let w = window else { return t.invalidate() }
+            var p = convert(w.mouseLocationOutsideOfEventStream, from: nil)
+            if held >= 0 { p = CGPoint(x: min(max(p.x, 0), bounds.width), y: min(max(p.y, 0), bounds.height)) }   // dragging past the edge
+            let now = CACurrentMediaTime(), v = bounds.contains(p) || held >= 0 ? speed(at: p) : .zero
+            defer { last = now }
+            guard v != .zero else { t.invalidate(); panTimer = nil; return }
+            let before = pan
+            pan.x += v.x * (now - last); pan.y += v.y * (now - last)
+            place()
+            guard pan != before else { return }   // at the end already
+            let r = remotePoint(p, in: picture, remote: remoteSize)
+            var m = Msg("mouse")
+            m.x = r.x; m.y = r.y; m.k = held >= 0 ? 3 : 0; m.b = max(held, 0)
+            m.f = UInt64(NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue)
+            send(m)
+        }
+        RunLoop.main.add(t, forMode: .common)
+        panTimer = t
+    }
+
+    /// Points per second to scroll with the pointer at `p`: within 40 pt of an edge the picture extends past.
+    func speed(at p: CGPoint) -> CGPoint {
+        let band: CGFloat = 40, fast: CGFloat = 1600
+        func axis(_ v: CGFloat, _ size: CGFloat) -> CGFloat {
+            v < band ? -fast * pow((band - max(v, 0)) / band, 2) : v > size - band ? fast * pow((min(v, size) - (size - band)) / band, 2) : 0
+        }
+        return CGPoint(x: picture.width > bounds.width + 0.5 ? axis(p.x, bounds.width) : 0,
+                       y: picture.height > bounds.height + 0.5 ? axis(p.y, bounds.height) : 0)
+    }
 
     // MARK: video
 
@@ -269,10 +360,13 @@ final class StreamView: NSView {
     /// A point in this view → the same spot in the host window (full screen here is taller than the host's display
     /// allows, so the video can be letterboxed).
     func remote(_ e: NSEvent) -> CGPoint {
-        remotePoint(convert(e.locationInWindow, from: nil), view: bounds.size, remote: remoteSize)
+        let p = convert(e.locationInWindow, from: nil)
+        return remoteSize == .zero ? p : remotePoint(p, in: picture, remote: remoteSize)
     }
 
     func mouse(_ e: NSEvent, _ kind: Int, _ button: Int) {
+        if kind == 1 { held = button } else if kind == 2 { held = -1 }
+        edgeScroll()
         let p = remote(e)
         var m = Msg("mouse")
         m.x = p.x; m.y = p.y; m.k = kind; m.b = button; m.f = flags(e)
@@ -335,6 +429,13 @@ final class StreamView: NSView {
             window?.toggleFullScreen(nil)   // full screen is about this proxy window, not the host's
         case (false, _) where e.modifierFlags.intersection(.deviceIndependentFlagsMask) == clipMods && [8, 9].contains(e.keyCode):
             onClipboard(e.keyCode == 8)   // kVK_ANSI_C, kVK_ANSI_V
+        case (false, _) where zoomKeys && e.modifierFlags.intersection(.deviceIndependentFlagsMask) == clipMods && [24, 27, 29, 25].contains(e.keyCode):
+            switch e.keyCode {   // kVK_ANSI_Equal, Minus, 0, 9
+            case 24: zoomStep(1)
+            case 27: zoomStep(-1)
+            case 29: setZoom(1)
+            default: setZoom(nil)
+            }
         case (true, "`"):   // cycle this proxy app's windows, like any local app
             let ws = NSApp.windows.filter { $0.isVisible && $0.canBecomeMain }
             if let i = ws.firstIndex(where: { $0 === window }) { ws[(i + 1) % ws.count].makeKeyAndOrderFront(nil) }
@@ -362,6 +463,13 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     var appName = "", remoteTitle = "", latency = ""
     var note: String?   // a passing status ("Sent text to mini-pb") shown in place of the latency
     var remoteSize = CGSize.zero { didSet { view.remoteSize = remoteSize } }
+    /// Desktop: Native keeps the host's screen at its own resolution (zoom and scroll here); Adaptive has a dark one
+    /// take the mode closest to this window. Remembered per Mac.
+    var native: Bool {
+        get { UserDefaults.standard.bool(forKey: "desktop.native.\(short(host))") }
+        set { UserDefaults.standard.set(newValue, forKey: "desktop.native.\(short(host))") }
+    }
+    var modeControl: NSSegmentedControl?, zoomControl: NSSegmentedControl?, fitItem: NSToolbarItem?
     var retries = 0
     var done = false
 
@@ -370,6 +478,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         super.init()
         view.send = { [weak self] in self?.send($0) }
         view.onLatency = { [weak self] ms in self?.latency = "\(ms) ms"; self?.updateTitle() }
+        view.onZoom = { [weak self] in self?.updateTitle() }
         view.onClipboard = { [weak self] send in send ? self?.sendClipboard() : self?.getClipboard() }
         proxies.append(self)
         connect()
@@ -420,6 +529,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         activeWire.withLock { $0 = ObjectIdentifier(w) }
         w.start()
         var m = Msg("open"); m.app = app; m.title = titleFilter; m.k = windowID; m.caps = ["hevc", "hevc422", "audio", "udp", "ltr", "twice"]
+        m.scale = (NSScreen.main ?? NSScreen.screens.first).map { Double($0.backingScaleFactor) }   // Retina here: the host may switch to HiDPI
         w.send(m)
     }
 
@@ -512,9 +622,11 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
             }
         case "size":
             remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
-            if isDesktop {   // the display changed shape (Keep Screen Dark fit it to this screen): follow it
-                window?.contentAspectRatio = remoteSize
-                if let w = window, !w.styleMask.contains(.fullScreen) { w.setContentSize(fitShape(remoteSize)) }
+            if isDesktop {   // the display changed mode (Adaptive fit it to this window): take its exact shape, no bigger
+                guard !native, let w = window, !w.styleMask.contains(.fullScreen), !w.inLiveResize, remoteSize.width > 0 else { return }
+                let cur = w.contentLayoutRect.size, k = min(cur.width / remoteSize.width, cur.height / remoteSize.height)
+                let snap = CGSize(width: (remoteSize.width * k).rounded(), height: (remoteSize.height * k).rounded())
+                if abs(snap.width - cur.width) > 1 || abs(snap.height - cur.height) > 1 { w.setContentSize(snap) }
                 return
             }
             guard let w = window, !w.inLiveResize, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) else { return }
@@ -539,7 +651,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         w.contentView = view
         w.delegate = self
         w.makeFirstResponder(view)
-        if isDesktop { w.contentAspectRatio = remoteSize }
+        if isDesktop { desktopToolbar(w) }
         if let last = proxies.last(where: { $0.window != nil })?.window { w.setFrameTopLeftPoint(last.cascadeTopLeft(from: .zero)) } else { w.center() }
         window = w
         AudioOut.shared.claim(ObjectIdentifier(self))
@@ -614,21 +726,27 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     func updateTitle(status: String? = nil) {
         guard let window else { return }
         window.title = remoteTitle.isEmpty ? appName : remoteTitle
-        let extra = status ?? note ?? latency
+        var extra = status ?? note ?? latency
+        if isDesktop && native && status == nil && note == nil { extra = "\(Int((view.scaleNow * 100).rounded()))%" + (extra.isEmpty ? "" : " · \(extra)") }
         window.subtitle = "\(appName) on \(short(host))" + (extra.isEmpty ? "" : " · \(extra)")
     }
 
-    /// A desktop: tell the host this screen's shape, which a dark display there takes on (an ultrawide becomes 16:10).
+    /// A desktop: Adaptive tells the host this window's size, which a dark display there takes the closest mode to;
+    /// Native says to keep its own.
     func sendShape() {
-        guard isDesktop, let screen = window?.screen ?? NSScreen.main else { return }
-        var m = Msg("resize"); m.w = screen.frame.width; m.h = screen.frame.height; m.scale = screen.backingScaleFactor
+        guard isDesktop, let w = window else { return }
+        var m = Msg("adapt")
+        if !native {
+            let s = w.contentLayoutRect.size
+            m.w = s.width.rounded(); m.h = s.height.rounded(); m.scale = Double((w.screen ?? NSScreen.main)?.backingScaleFactor ?? 2)
+        }
         wire?.send(m)
     }
 
-    /// `s` scaled down to fit the screen's usable area (title bar included), keeping its shape.
+    /// `s` scaled down to fit the screen's usable area (title bar and toolbar included), keeping its shape.
     func fitShape(_ s: CGSize, in screen: CGSize? = nil) -> CGSize {
         guard s.width > 0, s.height > 0, let v = screen ?? (window?.screen ?? NSScreen.main)?.visibleFrame.size else { return s }
-        let k = min(1, v.width / s.width, (v.height - 28) / s.height)
+        let k = min(1, v.width / s.width, (v.height - 52) / s.height)
         return CGSize(width: (s.width * k).rounded(), height: (s.height * k).rounded())
     }
 
@@ -639,6 +757,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     }
 
     func windowDidEndLiveResize(_ n: Notification) {
+        if isDesktop { return sendShape() }   // Adaptive: the host fits the new size once you let go
         // host may have clamped us (window can't exceed its display there) — snap to what it really is
         if !isDesktop, let w = window, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) { w.setContentSize(fit(remoteSize)) }
     }
@@ -647,6 +766,46 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     func fit(_ s: CGSize) -> CGSize {
         guard let v = (window?.screen ?? NSScreen.main)?.visibleFrame.size else { return s }
         return CGSize(width: min(s.width, v.width), height: min(s.height, v.height - 28))
+    }
+
+    func windowDidEnterFullScreen(_ n: Notification) { sendShape() }
+    func windowDidExitFullScreen(_ n: Notification) { sendShape() }
+    func windowDidChangeScreen(_ n: Notification) { sendShape() }   // Retina or not may have changed
+
+    // MARK: Desktop toolbar: Adaptive | Native, and Native's zoom
+
+    func desktopToolbar(_ w: NSWindow) {
+        let t = NSToolbar(identifier: "desktop")
+        t.delegate = self
+        t.displayMode = .iconOnly
+        w.toolbar = t
+        w.toolbarStyle = .unified
+        view.zoomKeys = native
+    }
+
+    @objc func modeChosen(_ c: NSSegmentedControl) {
+        native = c.selectedSegment == 1
+        view.zoomKeys = native
+        view.setZoom(nil)
+        updateZoomControls()
+        sendShape()
+    }
+
+    @objc func zoomChosen(_ c: NSSegmentedControl) {
+        switch c.selectedSegment {
+        case 0: view.zoomStep(-1)
+        case 1: view.setZoom(1)
+        default: view.zoomStep(1)
+        }
+    }
+
+    @objc func zoomFit() { view.setZoom(nil) }
+
+    func updateZoomControls() {
+        zoomControl?.isEnabled = native
+        fitItem?.isEnabled = native
+        modeControl?.selectedSegment = native ? 1 : 0
+        updateTitle()
     }
 
     /// Opened, Cmd-Tab, Dock click, Space swipe… whenever this proxy becomes key here, bring the real window
@@ -683,6 +842,47 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         AudioOut.shared.release(ObjectIdentifier(self), next: next.map(ObjectIdentifier.init))
         next?.sendAudioOwner()
         if proxies.isEmpty && role != "launcher" { NSApp.terminate(nil) }
+    }
+}
+
+extension ProxyWindow: NSToolbarDelegate {
+    static let modeItem = NSToolbarItem.Identifier("mode"), zoomItem = NSToolbarItem.Identifier("zoom"), fitID = NSToolbarItem.Identifier("fit")
+
+    func toolbarDefaultItemIdentifiers(_ t: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.zoomItem, Self.fitID, Self.modeItem] }
+    func toolbarAllowedItemIdentifiers(_ t: NSToolbar) -> [NSToolbarItem.Identifier] { toolbarDefaultItemIdentifiers(t) }
+
+    func toolbar(_ t: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar: Bool) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: id), name = short(host)
+        let symbol = { (n: String, label: String) in NSImage(systemSymbolName: n, accessibilityDescription: label) ?? NSImage() }
+        switch id {
+        case Self.modeItem:
+            let c = NSSegmentedControl(labels: ["Adaptive", "Native"], trackingMode: .selectOne, target: self, action: #selector(modeChosen(_:)))
+            c.setToolTip("\(name)'s screen takes the resolution closest to this window (while Keep Screen Dark is on)", forSegment: 0)
+            c.setToolTip("\(name)'s screen keeps its own resolution: zoom here, and the picture scrolls at the edges", forSegment: 1)
+            item.view = c
+            item.label = "Resolution"
+            modeControl = c
+        case Self.zoomItem:
+            let c = NSSegmentedControl(images: [symbol("minus.magnifyingglass", "Zoom Out"), symbol("1.magnifyingglass", "Actual Size"),
+                                                symbol("plus.magnifyingglass", "Zoom In")],
+                                       trackingMode: .momentary, target: self, action: #selector(zoomChosen(_:)))
+            for (i, tip) in ["Zoom Out (⌃⌥⌘−)", "Actual Size (⌃⌥⌘0)", "Zoom In (⌃⌥⌘=)"].enumerated() { c.setToolTip(tip, forSegment: i) }
+            item.view = c
+            item.label = "Zoom"
+            zoomControl = c
+        case Self.fitID:
+            item.image = symbol("arrow.up.left.and.down.right.magnifyingglass", "Fit in Window")
+            item.label = "Fit"
+            item.toolTip = "Fit in Window (⌃⌥⌘9)"
+            item.isBordered = true
+            item.autovalidates = false
+            item.target = self
+            item.action = #selector(zoomFit)
+            fitItem = item
+        default: return nil
+        }
+        DispatchQueue.main.async { [weak self] in self?.updateZoomControls() }
+        return item
     }
 }
 

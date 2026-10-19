@@ -23,6 +23,29 @@ public func bestMode(_ modes: [ModeSize], for viewer: CGSize, scale: Double) -> 
     }
 }
 
+/// Adaptive Desktop: the mode closest to the viewer's window (points, Retina or not), so the picture shows near 1:1
+/// instead of scaled. Shape counts most, then size; a bit bigger beats a bit smaller (scaled down stays sharp).
+public func closestMode(_ modes: [ModeSize], to window: CGSize, scale: Double) -> Int? {
+    guard window.width > 0, window.height > 0 else { return nil }
+    let usable = modes.indices.filter { modes[$0].width >= 800 }
+    let hiDPI = usable.filter { modes[$0].pixelWidth >= 2 * modes[$0].width }
+    let plain = usable.filter { modes[$0].pixelWidth < 2 * modes[$0].width }
+    let pool = scale >= 2 ? (hiDPI.isEmpty ? usable : hiDPI) : (plain.isEmpty ? usable : plain)
+    func cost(_ i: Int) -> Double {
+        let w = Double(modes[i].width), h = Double(modes[i].height)
+        let shape = abs(log((w / h) / (window.width / window.height)))
+        let size = log(w * h / (window.width * window.height))
+        return 4 * shape + (size < 0 ? -1.5 * size : size)
+    }
+    return pool.min { cost($0) < cost($1) }
+}
+
+/// App windows for a Retina viewer: the HiDPI mode with the most room, so their text is captured at 2x.
+public func largestRetina(_ modes: [ModeSize]) -> Int? {
+    modes.indices.filter { modes[$0].width >= 1024 && modes[$0].pixelWidth >= 2 * modes[$0].width }
+        .max { (modes[$0].width * modes[$0].height, modes[$0].pixelWidth) < (modes[$1].width * modes[$1].height, modes[$1].pixelWidth) }
+}
+
 /// How many encoded frames the host lets be in flight (sent, not yet acked by the viewer). Two keeps latency lowest on
 /// a home network, but over a long link (India to Florida, ~290 ms) two per round trip is about 7 fps. So the window
 /// grows while acks come back without queueing delay, and shrinks once they start to queue, which means the link is

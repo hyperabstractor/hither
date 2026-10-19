@@ -41,4 +41,22 @@ func testDisplayFit() throws {
     try expectEqual(bestMode(lg, for: air, scale: 2).map { lg[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
     try expectEqual(bestMode(lg, for: air, scale: 1).map { lg[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 1920))
     try expectEqual(bestMode(lg, for: CGSize(width: 1920, height: 1080), scale: 2).map { lg[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
+    // Adaptive Desktop: closest to the window, Retina for a Retina viewer
+    try expectEqual(closestMode(lg, to: CGSize(width: 1710, height: 1069), scale: 2).map { lg[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
+    try expectEqual(closestMode(lg, to: CGSize(width: 1700, height: 760), scale: 2).map { lg[$0] }, ModeSize(width: 1720, height: 720, pixelWidth: 3440))
+    try expectEqual(closestMode(lg, to: CGSize(width: 1700, height: 760), scale: 1).map { lg[$0] }, ModeSize(width: 1720, height: 720, pixelWidth: 1720))
+    try expectEqual(closestMode(lg, to: CGSize(width: 3440, height: 1440), scale: 1).map { lg[$0] }, ModeSize(width: 3440, height: 1440, pixelWidth: 3440))
+    // app windows for a Retina viewer: the roomiest HiDPI mode
+    try expectEqual(largestRetina(lg).map { lg[$0] }, ModeSize(width: 2048, height: 1080, pixelWidth: 4096))
+    try expectNil(largestRetina([ModeSize(width: 3440, height: 1440, pixelWidth: 3440)]))
+    // Native Desktop zoom: fit letterboxes; 100% of a 3440×1440 screen in a 1700×1000 view scrolls, clamped
+    let view = CGSize(width: 1700, height: 1000), lgSize = CGSize(width: 3440, height: 1440)
+    let fit = pictureRect(view: view, remote: lgSize, zoom: nil, pan: .zero).rect
+    try expectEqual(fit.width, 1700); try expectTrue(fit.minY > 0)
+    let full = pictureRect(view: view, remote: lgSize, zoom: 1, pan: CGPoint(x: 5000, y: -20))
+    try expectEqual(full.pan, CGPoint(x: 1740, y: 0))
+    try expectEqual(full.rect, CGRect(x: -1740, y: 0, width: 3440, height: 1440))
+    try expectEqual(remotePoint(CGPoint(x: 1700, y: 1000), in: full.rect, remote: lgSize), CGPoint(x: 3440, y: 1000))
+    try expectEqual(remotePoint(CGPoint(x: 850, y: 500), in: fit, remote: lgSize),
+                    remotePoint(CGPoint(x: 850, y: 500), view: view, remote: lgSize))
 }

@@ -75,6 +75,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var desktop = false              // a whole display, not one app's window
     var opened = false               // streaming something: keeps this Mac's screen dark (Dark)
     var viewer: (size: CGSize, scale: Double)?   // desktop: the viewer's screen, whose shape a dark display may take (Dark.fit)
+    var adapt: (size: CGSize, scale: Double)?    // desktop, Adaptive: the viewer's window, whose size a dark display takes
+    var nativeDesktop = false                    // desktop, Native: the display keeps its own mode, whatever else wants it
+    var viewerScale = 1.0                        // the viewer's screen: 2 = Retina (app windows get a HiDPI mode then)
     var ax: AXUIElement?
     var display: SCDisplay!
     var frame = CGRect.zero          // window frame, global points, top-left origin
@@ -187,6 +190,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             viewerHEVC = m.caps?.contains("hevc") == true   // older viewers only decode H.264
             viewer422 = m.caps?.contains("hevc422") == true   // an iPhone may not decode 4:2:2
             viewerAudio = m.caps?.contains("audio") == true
+            viewerScale = m.scale ?? 1
             viewerLTR = m.caps?.contains("ltr") == true && m.caps?.contains("udp") == true
             viewerTwice = m.caps?.contains("twice") == true
             if m.caps?.contains("restore") == true { original = .zero }   // filled in once the window is known
@@ -266,6 +270,12 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 viewer = (CGSize(width: w, height: h), m.scale ?? 1)
                 DispatchQueue.main.async { Dark.tick() }
             }
+        case "adapt" where desktop:   // the Mac viewer's Desktop: its window's size (Adaptive), or none (Native)
+            if let w = m.w, let h = m.h, w > 0, h > 0 { adapt = (CGSize(width: w, height: h), m.scale ?? 1); nativeDesktop = false }
+            else { adapt = nil; nativeDesktop = true }
+            viewer = nil
+            log("desktop \(adapt.map { "adaptive to \(Int($0.size.width))×\(Int($0.size.height))" } ?? "native")")
+            DispatchQueue.main.async { Dark.tick() }
         case "close": menuQ.async { pressClose(CGWindowID(m.k ?? 0)) }   // launcher menu's X; AX can block on a modal
         default: applyInput(m, udp: false)
         }
@@ -516,11 +526,22 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         return CGRect(dictionaryRepresentation: b as! CFDictionary)
     }
 
+    /// Pixels per point of the display the window is on now: a mode change (Dark.fit) can make it 1 or 2.
+    func displayScale() -> CGFloat? {
+        var id: CGDirectDisplayID = 0, n: UInt32 = 0
+        CGGetDisplaysWithPoint(CGPoint(x: frame.midX, y: frame.midY), 1, &id, &n)
+        guard n > 0, let m = CGDisplayCopyDisplayMode(id), m.width > 0 else { return nil }
+        return CGFloat(m.pixelWidth) / CGFloat(m.width)
+    }
+
     func poll() {
         guard !ended else { return }
         guard let r = readFrame() else { return desktop ? () : fail("window closed") }
-        if r != frame {
-            frame = r
+        let was = frame
+        frame = r
+        let px = displayScale() ?? scale
+        if r != was || px != scale {
+            if px != scale { log("\(appName): display now @\(px)x, capturing at that"); scale = px }
             // Moved where capture can't follow (partly off its display, onto another): the stream would keep the old
             // rect, now empty, and the viewer would see black. Set up capture again, which brings the window back.
             stream?.updateConfiguration(config()) { [weak self] e in
@@ -1097,13 +1118,26 @@ enum Dark {
     static var fittedTo: [CGDirectDisplayID: CGDisplayMode] = [:] // …and the mode they were switched to (macOS reports the
                                                                    // old one for a moment after a switch)
 
-    /// A dark monitor nobody looks at can take the shape of the screen a Desktop is viewed on, so the stream fills that
-    /// window instead of being a letterboxed strip (an ultrawide on a laptop). Back to its own mode once no dark Desktop
-    /// wants it; the change is the host's alone, so macOS undoes it if the host dies.
+    /// A dark monitor nobody looks at can change mode for whoever streams it: an Adaptive Desktop takes the mode closest
+    /// to its window (so it shows near 1:1, not a letterboxed strip of an ultrawide), an iPhone's the shape of its screen,
+    /// and app windows for a Retina viewer the roomiest HiDPI mode (captured at 2x, their text stays sharp). A Native
+    /// Desktop keeps the display's own mode. Back to its own mode once nothing wants it; the change is the host's alone,
+    /// so macOS undoes it if the host dies.
     static func fit() {
-        var want: [CGDirectDisplayID: (size: CGSize, scale: Double)] = [:]
+        enum Want { case shape(CGSize, Double), closest(CGSize, Double), retina }
+        var want: [CGDirectDisplayID: Want] = [:], native = Set<CGDirectDisplayID>()
         if enabled {
-            for s in sessions.values where s.desktop && s.opened && !s.ended { if let v = s.viewer { want[s.windowID] = v } }
+            let open = sessions.values.filter { $0.opened && !$0.ended }
+            for s in open where s.desktop {
+                if let a = s.adapt { want[s.windowID] = .closest(a.size, a.scale) }
+                else if s.nativeDesktop { native.insert(s.windowID) }
+                else if let v = s.viewer { want[s.windowID] = .shape(v.size, v.scale) }
+            }
+            // app windows for a Retina viewer: a HiDPI mode, so their text is as sharp there as here (unless a Desktop
+            // on that display wants something else, or wants it left alone)
+            for s in open where !s.desktop && s.viewerScale >= 2 {
+                if let d = s.display?.displayID, want[d] == nil, !native.contains(d) { want[d] = .retina }
+            }
         }
         for (d, own) in fitted where want[d] == nil {
             fitted[d] = nil
@@ -1111,10 +1145,16 @@ enum Dark {
             set(d, own)
         }
         let physical = physicalDisplays()
-        for (d, viewer) in want where physical.contains(d) {
-            guard let current = CGDisplayCopyDisplayMode(d), let best = bestMode(d, for: viewer.size, scale: viewer.scale),
-                  best.width != current.width || best.height != current.height,
-                  fittedTo[d].map({ $0.width != best.width || $0.height != best.height }) ?? true else { continue }
+        let same = { (a: CGDisplayMode, b: CGDisplayMode) in a.width == b.width && a.height == b.height && a.pixelWidth == b.pixelWidth }
+        for (d, w) in want where physical.contains(d) {
+            let best: CGDisplayMode?
+            switch w {
+            case .shape(let size, let scale): best = bestMode(d, for: size, scale: scale)
+            case .closest(let size, let scale): best = pick(d) { closestMode($0, to: size, scale: scale) }
+            case .retina: best = pick(d) { largestRetina($0) }
+            }
+            guard let current = CGDisplayCopyDisplayMode(d), let best, !same(best, current),
+                  fittedTo[d].map({ !same($0, best) }) ?? true else { continue }
             if fitted[d] == nil { fitted[d] = current }
             fittedTo[d] = best
             set(d, best)
@@ -1122,10 +1162,14 @@ enum Dark {
     }
 
     static func bestMode(_ d: CGDirectDisplayID, for viewer: CGSize, scale: Double) -> CGDisplayMode? {
+        pick(d) { Shared.bestMode($0, for: viewer, scale: scale) }
+    }
+
+    /// One of display `d`'s modes, chosen by `choose` from their sizes.
+    static func pick(_ d: CGDirectDisplayID, _ choose: ([ModeSize]) -> Int?) -> CGDisplayMode? {
         let modes = (CGDisplayCopyAllDisplayModes(d, [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary) as? [CGDisplayMode] ?? [])
             .filter { $0.isUsableForDesktopGUI() }
-        return Shared.bestMode(modes.map { ModeSize(width: $0.width, height: $0.height, pixelWidth: $0.pixelWidth) },
-                               for: viewer, scale: scale).map { modes[$0] }
+        return choose(modes.map { ModeSize(width: $0.width, height: $0.height, pixelWidth: $0.pixelWidth) }).map { modes[$0] }
     }
 
     static func set(_ d: CGDirectDisplayID, _ m: CGDisplayMode) {
@@ -1133,7 +1177,7 @@ enum Dark {
         CGBeginDisplayConfiguration(&c)
         CGConfigureDisplayWithDisplayMode(c, d, m, nil)
         let err = CGCompleteDisplayConfiguration(c, .forAppOnly)
-        log("display \(d) → \(m.width)×\(m.height): \(err == .success ? "ok" : "error \(err.rawValue)")")
+        log("display \(d) → \(m.width)×\(m.height)\(m.pixelWidth >= 2 * m.width ? " Retina" : ""): \(err == .success ? "ok" : "error \(err.rawValue)")")
         if dark { blackOut() }   // a mode change resets gamma: black again before anyone sees the desktop
     }
 

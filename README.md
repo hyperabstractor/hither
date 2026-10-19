@@ -22,7 +22,13 @@ local network.
   network. Hidden windows are paused and background windows are throttled.
 - **Both directions.** Every Mac runs the same app: it shares its own windows and shows the other Mac's.
 - **Whole desktop.** Desktop, at the top of each Mac's section, streams its whole screen the same smooth way:
-  menu bar, Dock and every window. You can unlock a locked Mac from there too.
+  menu bar, Dock and every window. You can unlock a locked Mac from there too. Its toolbar picks how:
+  **Adaptive** has the other Mac's dark screen take the resolution closest to this window (Retina on a Retina
+  screen), so it shows about 1:1; resize the window and it re-fits when you let go. **Native** leaves its resolution
+  alone: zoom out, 1:1 and in (⌃⌥⌘−, ⌃⌥⌘0, ⌃⌥⌘=) or fit (⌃⌥⌘9), and when it's bigger than the window, the picture
+  scrolls as the pointer nears an edge.
+- **Sharp text.** While its screen is dark, the other Mac switches to its roomiest Retina mode as long as you're
+  viewing its windows on a Retina screen, so they're captured at 2x (a Native Desktop leaves it as it is).
 - **Keep Screen Dark.** While you use a Mac from here, its own monitors show black, so whoever sits near it
   doesn't see what you're doing. Two minutes after you close its last window, it locks and the monitors come
   back showing the lock screen. **Lock** locks it right away.
