@@ -26,7 +26,7 @@ local network.
   **Adaptive** has the other Mac's dark screen take the resolution closest to this window (Retina on a Retina
   screen), so it shows about 1:1; resize the window and it re-fits when you let go. **Native** leaves its resolution
   alone: zoom out, 1:1 and in (⌃⌥⌘−, ⌃⌥⌘0, ⌃⌥⌘=) or fit (⌃⌥⌘9), and when it's bigger than the window, the picture
-  scrolls as the pointer nears an edge.
+  follows the pointer: where it is across the window is where it is across that screen.
 - **Sharp text.** While its screen is dark, the other Mac switches to its roomiest Retina mode as long as you're
   viewing its windows on a Retina screen, so they're captured at 2x (a Native Desktop leaves it as it is).
 - **Keep Screen Dark.** While you use a Mac from here, its own monitors show black, so whoever sits near it

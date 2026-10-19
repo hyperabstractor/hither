@@ -227,8 +227,6 @@ final class StreamView: NSView {
     private(set) var zoom: CGFloat?
     var pan = CGPoint.zero
     private(set) var picture = CGRect.zero   // where the video is in this view
-    var panTimer: Timer?
-    var held = -1   // the mouse button down (-1: none), so edge scrolling while dragging keeps dragging
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -278,6 +276,7 @@ final class StreamView: NSView {
         zoom = z
         if let z { pan = CGPoint(x: spot.x * z - a.x, y: spot.y * z - a.y) }
         place()
+        if let p = pointerInside { follow(p) }   // the pointer leads, once it's over the picture
         onZoom()
     }
 
@@ -288,41 +287,13 @@ final class StreamView: NSView {
         }
     }
 
-    /// Zoomed in past the window: with the pointer near an edge the picture slides that way, faster the closer it is,
-    /// so the whole screen is in reach. The host hears where the pointer now is, as the spot under it changes.
-    func edgeScroll() {
-        guard zoom != nil, let p = pointerInside, speed(at: p) != .zero else { return }
-        guard panTimer == nil else { return }
-        var last = CACurrentMediaTime()
-        let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] t in
-            guard let self, let w = window else { return t.invalidate() }
-            var p = convert(w.mouseLocationOutsideOfEventStream, from: nil)
-            if held >= 0 { p = CGPoint(x: min(max(p.x, 0), bounds.width), y: min(max(p.y, 0), bounds.height)) }   // dragging past the edge
-            let now = CACurrentMediaTime(), v = bounds.contains(p) || held >= 0 ? speed(at: p) : .zero
-            defer { last = now }
-            guard v != .zero else { t.invalidate(); panTimer = nil; return }
-            let before = pan
-            pan.x += v.x * (now - last); pan.y += v.y * (now - last)
-            place()
-            guard pan != before else { return }   // at the end already
-            let r = remotePoint(p, in: picture, remote: remoteSize)
-            var m = Msg("mouse")
-            m.x = r.x; m.y = r.y; m.k = held >= 0 ? 3 : 0; m.b = max(held, 0)
-            m.f = UInt64(NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue)
-            send(m)
-        }
-        RunLoop.main.add(t, forMode: .common)
-        panTimer = t
-    }
-
-    /// Points per second to scroll with the pointer at `p`: within 40 pt of an edge the picture extends past.
-    func speed(at p: CGPoint) -> CGPoint {
-        let band: CGFloat = 40, fast: CGFloat = 4400   // at the very edge; a quarter of that halfway in
-        func axis(_ v: CGFloat, _ size: CGFloat) -> CGFloat {
-            v < band ? -fast * pow((band - max(v, 0)) / band, 2) : v > size - band ? fast * pow((min(v, size) - (size - band)) / band, 2) : 0
-        }
-        return CGPoint(x: picture.width > bounds.width + 0.5 ? axis(p.x, bounds.width) : 0,
-                       y: picture.height > bounds.height + 0.5 ? axis(p.y, bounds.height) : 0)
+    /// Zoomed in past the window, the picture follows the pointer: where the pointer is across the window is where it
+    /// is across the host's screen (left edge shows the left edge), so the picture slides with every move.
+    func follow(_ p: CGPoint) {
+        guard zoom != nil else { return }
+        let f = { (v: CGFloat, size: CGFloat) in min(max(v / size, 0), 1) }
+        pan = CGPoint(x: f(p.x, bounds.width) * (picture.width - bounds.width), y: f(p.y, bounds.height) * (picture.height - bounds.height))
+        place()
     }
 
     // MARK: video
@@ -365,8 +336,7 @@ final class StreamView: NSView {
     }
 
     func mouse(_ e: NSEvent, _ kind: Int, _ button: Int) {
-        if kind == 1 { held = button } else if kind == 2 { held = -1 }
-        edgeScroll()
+        follow(convert(e.locationInWindow, from: nil))
         let p = remote(e)
         var m = Msg("mouse")
         m.x = p.x; m.y = p.y; m.k = kind; m.b = button; m.f = flags(e)
@@ -786,7 +756,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         fit.toolTip = "Fit in Window (⌃⌥⌘9)"
         let mode = NSSegmentedControl(labels: ["Adaptive", "Native"], trackingMode: .selectOne, target: self, action: #selector(modeChosen(_:)))
         mode.setToolTip("\(name)'s screen takes the resolution closest to this window (while Keep Screen Dark is on)", forSegment: 0)
-        mode.setToolTip("\(name)'s screen keeps its own resolution: zoom here, and the picture scrolls at the edges", forSegment: 1)
+        mode.setToolTip("\(name)'s screen keeps its own resolution: zoom here; zoomed in, the picture follows the pointer", forSegment: 1)
         for c in [zoom, fit, mode] as [NSControl] { c.controlSize = .small; c.font = .systemFont(ofSize: NSFont.smallSystemFontSize) }
         fit.bezelStyle = .accessoryBarAction
         let bar = NSStackView(views: [zoom, fit, mode])
