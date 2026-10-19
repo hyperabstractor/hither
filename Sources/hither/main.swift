@@ -4,6 +4,7 @@ import Network
 import os
 import ServiceManagement
 import UniformTypeIdentifiers
+import UserNotifications
 import Shared
 
 // One binary, three roles, picked by the bundle it runs from:
@@ -66,10 +67,21 @@ func receivedClipboard(_ d: Data, from host: String, status: @escaping ClipStatu
 /// One copy of Finder files to or from `host`, on its own connection so a big one never holds up a window's input
 /// or video. What arrives goes into Downloads and onto the clipboard, ready to paste in Finder.
 final class FileCopy {
-    static var running: [ObjectIdentifier: FileCopy] = [:]   // main thread; a copy lives until it ends
+    static var running: [FileCopy] = []   // main thread, oldest first; a copy lives until it ends
+    /// Main thread: a copy started, moved on (twice a second at most) or ended. The launcher shows it in the menu bar.
+    static var changed: (FileCopy) -> Void = { _ in }
     let host: String, name: String, wire: Wire, status: ClipStatus
-    var inbox: FileInbox?   // on the wire's queue
-    var shown = 0.0, ended = false
+    let started = CACurrentMediaTime()
+    // main thread
+    var outgoing = true
+    var what = "files"                          // "Spock3.app", "3 items"
+    var done: UInt64 = 0, total: UInt64 = 0
+    var result: (ok: Bool, text: String)?       // once it ended
+    var cancelled = false
+    var landed: [URL] = []                      // where received files went
+    // the wire's queue (get) or the sending thread (send)
+    var inbox: FileInbox?
+    var shown = 0.0
 
     init(_ host: String, status: @escaping ClipStatus) {
         self.host = host
@@ -78,8 +90,27 @@ final class FileCopy {
         self.status = status
     }
 
+    /// "↓ Spock3.app from mini-pb"
+    var heading: String { "\(outgoing ? "↑" : "↓") \(what) \(outgoing ? "to" : "from") \(name)" }
+
+    /// "51% of 60.5 MB · 4.2 MB/s · about 10 s left"
+    var detail: String {
+        let f = { (n: UInt64) in ByteCountFormatter.string(fromByteCount: Int64(clamping: n), countStyle: .file) }
+        guard total > 0 else { return "Starting…" }
+        var s = "\(percent)% of \(f(total))"
+        let t = CACurrentMediaTime() - started
+        if t >= 1, done > 0 {
+            let rate = Double(done) / t, left = Double(total - done) / rate
+            s += " · \(f(UInt64(rate)))/s"
+            if left >= 1 { s += " · about " + (left < 60 ? "\(Int(left)) s" : left < 3600 ? "\(Int(left / 60)) min" : String(format: "%.1f h", left / 3600)) + " left" }
+        }
+        return s
+    }
+
+    var percent: Int { total > 0 ? Int(done * 100 / total) : 0 }
+
     func send(_ urls: [URL]) {
-        let what = urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) items"
+        what = urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) items"
         start { [self] m in
             switch m.t {
             case "filesgot": end("Sent \(m.text ?? what) to \(name)'s Downloads (on its clipboard)", ok: true)
@@ -87,21 +118,23 @@ final class FileCopy {
             default: break
             }
         }
-        report("Sending \(what) to \(name)…")
-        Files.send(urls, over: wire) { [self] sent, total in progress("Sending \(what) to \(name)", sent, total) }
+        Files.send(urls, over: wire) { [self] sent, total in progress(sent, total) }
     }
 
     func get() {
+        outgoing = false
         start { [self] m in
             switch m.t {
             case "files":
-                do { inbox = try FileInbox(m.files ?? [], into: Files.downloads) } catch { fail(error) }
+                let entries = m.files ?? []
+                onMain { [self] in what = Files.name(entries); total = Files.total(entries) }
+                do { inbox = try FileInbox(entries, into: Files.downloads) } catch { fail(error) }
             case "filesend":
                 guard let box = inbox else { return }
                 inbox = nil
                 do {
                     let urls = try box.finish()
-                    onMain { Files.putOnClipboard(urls) }
+                    onMain { [self] in landed = urls; Files.putOnClipboard(urls) }
                     var r = Msg("filesgot"); r.text = Files.summary(box.entries)
                     wire.send(r)
                     end("Got \(Files.summary(box.entries)) from \(name): in Downloads and on the clipboard", ok: true)
@@ -113,29 +146,41 @@ final class FileCopy {
         wire.onFileData = { [self] d in
             guard let box = inbox else { return }
             do { try box.take(d) } catch { return fail(error) }
-            progress("Getting \(Files.summary(box.entries)) from \(name)", box.received, box.total)
+            progress(box.received, box.total)
         }
-        report("Getting files from \(name)…")
         wire.send(Msg("filesget"))
     }
 
+    /// Main thread: stop it; the other end throws away what it had of it.
+    func cancel() {
+        cancelled = true
+        var e = Msg("fileserr"); e.text = "Cancelled on \(localName())"
+        wire.send(e)
+        end("Cancelled", ok: false)
+    }
+
     private func start(_ onMsg: @escaping (Msg) -> Void) {
-        onMain { FileCopy.running[ObjectIdentifier(self)] = self }
+        onMain { [self] in
+            FileCopy.running.append(self)
+            FileCopy.changed(self)
+            status("\(heading)…", nil)
+        }
         wire.onMsg = onMsg
         wire.onClose = { [self] in end("Copy with \(name) stopped: connection lost", ok: false) }
         wire.start()
     }
 
-    /// At most once a second: "Sending Photos to mini-pb: 45% of 2.4 GB".
-    private func progress(_ what: String, _ done: UInt64, _ total: UInt64) {
+    private func progress(_ sent: UInt64, _ of: UInt64) {
         let now = CACurrentMediaTime()
-        guard now - shown >= 1, total > 0 else { return }
+        guard now - shown >= 0.5 else { return }
         shown = now
-        let size = ByteCountFormatter.string(fromByteCount: Int64(clamping: total), countStyle: .file)
-        report("\(what): \(done * 100 / total)% of \(size)")
+        onMain { [self] in
+            guard result == nil else { return }
+            done = sent; total = of
+            FileCopy.changed(self)
+            status("\(heading): \(detail)", nil)
+        }
     }
-
-    private func report(_ s: String, done: Bool? = nil) { onMain { [self] in status(s, done) } }
 
     private func fail(_ error: Error) {
         var e = Msg("fileserr"); e.text = error.localizedDescription
@@ -145,12 +190,14 @@ final class FileCopy {
 
     private func end(_ s: String, ok: Bool) {
         onMain { [self] in
-            guard !ended else { return }
-            ended = true
+            guard result == nil else { return }
+            result = (ok, s)
+            if ok { done = total }
             wire.queue.async { [self] in inbox?.abort(); inbox = nil }   // a copy cut off partway leaves nothing behind
-            status(s, ok)
             wire.close()
-            FileCopy.running[ObjectIdentifier(self)] = nil
+            FileCopy.running.removeAll { $0 === self }
+            status(s, ok)
+            FileCopy.changed(self)
         }
     }
 }
@@ -924,7 +971,7 @@ final class Remote {
                 onMain { [weak self] in
                     guard let self, !gone else { return }
                     let launcher = launcher
-                    if let s = receivedClipboard(d, from: self.host, status: { s, _ in launcher.flash(s) }) { launcher.flash(s) }
+                    if let s = receivedClipboard(d, from: self.host, status: { _, _ in }) { launcher.flash(s) }
                 }
             }
             wire = w
@@ -1031,7 +1078,7 @@ func forward(_ from: NWConnection, to: NWConnection, heard: @escaping () -> Void
     }
 }
 
-final class Launcher: NSObject, NSMenuDelegate {
+final class Launcher: NSObject, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var remotes: [Remote] = []   // the paired Macs whose windows this menu shows (iPhones only view)
     var nearby: [(id: String, name: String, endpoint: NWEndpoint)] = []   // other Macs running Hither (Bonjour)
     var pairListener: NWListener?
@@ -1043,10 +1090,15 @@ final class Launcher: NSObject, NSMenuDelegate {
     let menu = NSMenu()
     var icons: [String: Data] = [:]
     let buildQ = DispatchQueue(label: "proxies")   // all proxy-bundle writes, in order
+    var flashing: String?   // a passing status, shown instead of a copy's percentage for a few seconds
+    var copyRows: [ObjectIdentifier: (heading: NSMenuItem, detail: NSMenuItem)] = [:]   // updated in place as copies move on
 
     func start() {
         status.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Hither")
+        status.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)   // "↓51%" doesn't jiggle
         menu.delegate = self
+        FileCopy.changed = { [weak self] in self?.copyChanged($0) }
+        UNUserNotificationCenter.current().delegate = self
         status.menu = menu
         icons[desktopApp] = NSImage(systemSymbolName: "display", accessibilityDescription: "Desktop").flatMap(desktopIcon)
         remotes = Pairings.load().peers.filter { $0.viewer != true }.map { Remote($0, launcher: self) }
@@ -1218,6 +1270,16 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     func rebuild() {
         menu.removeAllItems()
+        copyRows = [:]
+        for c in FileCopy.running {   // copies under way, at the top: what, how far, and a way out
+            let h = menu.addItem(withTitle: c.heading, action: nil, keyEquivalent: "")
+            let d = menu.addItem(withTitle: c.detail, action: nil, keyEquivalent: "")
+            h.isEnabled = false; d.isEnabled = false; d.indentationLevel = 1
+            let x = menu.addItem(withTitle: "Cancel", action: #selector(cancelCopy(_:)), keyEquivalent: "")
+            x.target = self; x.representedObject = c; x.indentationLevel = 1
+            copyRows[ObjectIdentifier(c)] = (h, d)
+        }
+        if !FileCopy.running.isEmpty { menu.addItem(.separator()) }
         if remotes.isEmpty { menu.addItem(withTitle: "Not paired", action: nil, keyEquivalent: "").isEnabled = false }
         for (n, mac) in remotes.enumerated() {
             if n > 0 { menu.addItem(.separator()) }
@@ -1465,7 +1527,7 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     @objc func sendClipboard(_ sender: NSMenuItem) {
         guard let mac = sender.representedObject as? Remote else { return }
-        if let why = pushClipboard(over: mac.wire, to: mac.host, status: { [weak self] s, _ in self?.flash(s) }) { flash(why) }
+        if let why = pushClipboard(over: mac.wire, to: mac.host, status: { _, _ in }) { flash(why) }
     }
 
     @objc func getClipboard(_ sender: NSMenuItem) {
@@ -1477,15 +1539,70 @@ final class Launcher: NSObject, NSMenuDelegate {
     /// A passing status next to the menu bar icon ("Got text from mini-pb"), gone after a few seconds.
     func flash(_ s: String) {
         log(s)
-        status.length = NSStatusItem.variableLength
-        status.button?.imagePosition = .imageLeading
-        status.button?.title = " " + s
+        flashing = s
+        refreshStatus()
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-            guard let self, status.button?.title == " " + s else { return }
-            status.button?.title = ""
-            status.button?.imagePosition = .imageOnly
-            status.length = NSStatusItem.squareLength
+            guard let self, flashing == s else { return }
+            flashing = nil
+            refreshStatus()
         }
+    }
+
+    /// Next to the icon: a passing status, else how far the file copies are ("↓51%"), else nothing.
+    func refreshStatus() {
+        var text = flashing ?? ""
+        if text.isEmpty, !FileCopy.running.isEmpty {
+            let cs = FileCopy.running, done = cs.reduce(0) { $0 + $1.done }, total = cs.reduce(0) { $0 + $1.total }
+            let arrow = cs.allSatisfy(\.outgoing) ? "↑" : cs.allSatisfy { !$0.outgoing } ? "↓" : "↕"
+            text = arrow + (total > 0 ? "\(done * 100 / total)%" : "…")
+        }
+        status.button?.title = text.isEmpty ? "" : " " + text
+        status.button?.imagePosition = text.isEmpty ? .imageOnly : .imageLeading
+        status.length = text.isEmpty ? NSStatusItem.squareLength : NSStatusItem.variableLength
+    }
+
+    /// A file copy started, moved on or ended.
+    func copyChanged(_ c: FileCopy) {
+        if let r = c.result {
+            log(r.text)
+            rebuild()
+            flash(r.ok ? "✓" : "⚠")
+            if !c.cancelled { notify(c, r) }
+        } else if let rows = copyRows[ObjectIdentifier(c)] {
+            rows.heading.title = c.heading   // updated in place, so an open menu shows it moving
+            rows.detail.title = c.detail
+            refreshStatus()
+        } else {
+            rebuild()
+            refreshStatus()
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }   // asks once
+        }
+    }
+
+    @objc func cancelCopy(_ sender: NSMenuItem) { (sender.representedObject as? FileCopy)?.cancel() }
+
+    /// "Got Spock3.app (60.5 MB) from mini-pb: in Downloads and on the clipboard"; clicking it shows the files.
+    func notify(_ c: FileCopy, _ r: (ok: Bool, text: String)) {
+        let n = UNMutableNotificationContent()
+        n.title = r.ok ? "Copy finished" : "Copy \(c.outgoing ? "to" : "from") \(c.name) failed"
+        n.body = r.text
+        if !c.landed.isEmpty { n.userInfo = ["paths": c.landed.map(\.path)] }
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: n, trigger: nil))
+    }
+
+    // A menu-bar app is always "in front": show banners anyway.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner, .list])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        if let paths = response.notification.request.content.userInfo["paths"] as? [String] {
+            let urls = paths.map { URL(fileURLWithPath: $0) }
+            DispatchQueue.main.async { NSWorkspace.shared.activateFileViewerSelecting(urls) }
+        }
+        done()
     }
 
     @objc func lockMac(_ sender: NSMenuItem) { (sender.representedObject as? Remote)?.wire?.send(Msg("lock")) }

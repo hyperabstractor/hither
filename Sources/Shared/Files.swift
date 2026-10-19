@@ -56,9 +56,13 @@ public enum Files {
 
     /// "report.pdf (12 MB)", "Photos (1.2 GB)", "3 items (40 MB)": what a status line says was moved.
     public static func summary(_ entries: [FileEntry]) -> String {
+        "\(name(entries)) (\(ByteCountFormatter.string(fromByteCount: Int64(clamping: total(entries)), countStyle: .file)))"
+    }
+
+    /// "report.pdf", "Photos", "3 items".
+    public static func name(_ entries: [FileEntry]) -> String {
         let top = entries.filter { !$0.path.contains("/") }
-        let size = ByteCountFormatter.string(fromByteCount: Int64(clamping: total(entries)), countStyle: .file)
-        return top.count == 1 ? "\(top[0].path) (\(size))" : "\(top.count) items (\(size))"
+        return top.count == 1 ? top[0].path : "\(top.count) items"
     }
 
     public static func total(_ entries: [FileEntry]) -> UInt64 { entries.reduce(0) { $0 + $1.size } }

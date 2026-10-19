@@ -28,6 +28,9 @@ local network.
   back showing the lock screen. **Lock** locks it right away.
 - **Clipboard, when you ask.** **Send Clipboard** puts what you copied here on the other Mac's clipboard;
   **Get Clipboard** brings theirs back. Nothing moves until you choose it. Text, rich text and images, up to 8 MB.
+  Files and folders copied in Finder go too, at any size: they land in Downloads and on the clipboard, ready to
+  paste anywhere. While they move, the menu bar shows **↓51%** (↑ when sending); the menu shows the file, speed,
+  time left and **Cancel**, and a notification says when it's done (click it to show the files).
 - **Screen Sharing.** The menu still hands off to macOS Screen Sharing when you want it.
 
 ## Requirements
@@ -98,7 +101,8 @@ them with CGEvent and Accessibility. Each remote app's proxy is an APFS clone of
 bundle name and icon, which is what gives it a Dock and Cmd-Tab identity. Proxies connect through a loopback relay in
 the menu bar app, so only Hither itself needs Local Network access.
 
-Control, input, menus, audio and the clipboard go over TCP 7420. Video goes over UDP 7421 when both ends support
+Control, input, menus, audio and the clipboard go over TCP 7420. A file copy gets a TCP 7420 connection of its own
+(background traffic class), so a big one never holds up a window. Video goes over UDP 7421 when both ends support
 it, so a lost packet costs one frame's repair instead of holding up every frame behind it. Each frame is split into
 datagrams that fit Tailscale's MTU. The viewer asks again for any missing pieces, and when a frame can't be saved
 in time it waits for a keyframe instead of showing a broken picture. The datagrams are sealed with ChaChaPoly
@@ -133,7 +137,8 @@ applies each once and in order, whether its UDP or TCP copy arrives first.
 - Keep Screen Dark blacks out the picture, not the Mac: its own keyboard and mouse still work while you use it.
   It only covers the session on the monitors; another user can't log in there at the same time.
 - Audio is captured before the host's volume control. Mute the host if you only want sound on this Mac.
-- The clipboard only moves on Send or Get Clipboard, never by itself. Copied Finder files aren't carried yet.
+- The clipboard only moves on Send or Get Clipboard, never by itself. Copied files skip symlinks and special files,
+  and a copy that's cancelled or cut off leaves nothing behind.
   macOS may ask once whether Hither can read the clipboard; allow it in Privacy & Security › Paste from Other Apps.
 - It isn't notarized, and it uses one private but widely used Accessibility call (`_AXUIElementGetWindow`) to match
   windows with their IDs.
