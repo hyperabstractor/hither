@@ -768,6 +768,11 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         return CGSize(width: min(s.width, v.width), height: min(s.height, v.height - 28))
     }
 
+    /// Full screen hides the title bar and the Desktop toolbar until the pointer goes to the top, as Safari does.
+    func window(_ window: NSWindow, willUseFullScreenPresentationOptions proposed: NSApplication.PresentationOptions = []) -> NSApplication.PresentationOptions {
+        proposed.union([.fullScreen, .autoHideMenuBar, .autoHideToolbar])
+    }
+
     func windowDidEnterFullScreen(_ n: Notification) { sendShape() }
     func windowDidExitFullScreen(_ n: Notification) { sendShape() }
     func windowDidChangeScreen(_ n: Notification) { sendShape() }   // Retina or not may have changed
