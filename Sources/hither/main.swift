@@ -469,7 +469,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         get { UserDefaults.standard.bool(forKey: "desktop.native.\(short(host))") }
         set { UserDefaults.standard.set(newValue, forKey: "desktop.native.\(short(host))") }
     }
-    var modeControl: NSSegmentedControl?, zoomControl: NSSegmentedControl?, fitItem: NSToolbarItem?
+    var modeControl: NSSegmentedControl?, zoomControl: NSSegmentedControl?, fitButton: NSButton?
     var retries = 0
     var done = false
 
@@ -743,10 +743,10 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         wire?.send(m)
     }
 
-    /// `s` scaled down to fit the screen's usable area (title bar and toolbar included), keeping its shape.
+    /// `s` scaled down to fit the screen's usable area (title bar included), keeping its shape.
     func fitShape(_ s: CGSize, in screen: CGSize? = nil) -> CGSize {
         guard s.width > 0, s.height > 0, let v = screen ?? (window?.screen ?? NSScreen.main)?.visibleFrame.size else { return s }
-        let k = min(1, v.width / s.width, (v.height - 52) / s.height)
+        let k = min(1, v.width / s.width, (v.height - 28) / s.height)
         return CGSize(width: (s.width * k).rounded(), height: (s.height * k).rounded())
     }
 
@@ -768,24 +768,38 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         return CGSize(width: min(s.width, v.width), height: min(s.height, v.height - 28))
     }
 
-    /// Full screen hides the title bar and the Desktop toolbar until the pointer goes to the top, as Safari does.
-    func window(_ window: NSWindow, willUseFullScreenPresentationOptions proposed: NSApplication.PresentationOptions = []) -> NSApplication.PresentationOptions {
-        proposed.union([.fullScreen, .autoHideMenuBar, .autoHideToolbar])
-    }
-
     func windowDidEnterFullScreen(_ n: Notification) { sendShape() }
     func windowDidExitFullScreen(_ n: Notification) { sendShape() }
     func windowDidChangeScreen(_ n: Notification) { sendShape() }   // Retina or not may have changed
 
-    // MARK: Desktop toolbar: Adaptive | Native, and Native's zoom
+    // MARK: Desktop controls: Adaptive | Native, and Native's zoom
 
+    /// On the right of the ordinary thin title bar (a toolbar would make it twice as tall).
     func desktopToolbar(_ w: NSWindow) {
-        let t = NSToolbar(identifier: "desktop")
-        t.delegate = self
-        t.displayMode = .iconOnly
-        w.toolbar = t
-        w.toolbarStyle = .unified
+        let name = short(host)
+        let symbol = { (n: String, label: String) in NSImage(systemSymbolName: n, accessibilityDescription: label) ?? NSImage() }
+        let zoom = NSSegmentedControl(images: [symbol("minus.magnifyingglass", "Zoom Out"), symbol("1.magnifyingglass", "Actual Size"),
+                                               symbol("plus.magnifyingglass", "Zoom In")],
+                                      trackingMode: .momentary, target: self, action: #selector(zoomChosen(_:)))
+        for (i, tip) in ["Zoom Out (⌃⌥⌘−)", "Actual Size (⌃⌥⌘0)", "Zoom In (⌃⌥⌘=)"].enumerated() { zoom.setToolTip(tip, forSegment: i) }
+        let fit = NSButton(image: symbol("arrow.up.left.and.down.right.magnifyingglass", "Fit in Window"), target: self, action: #selector(zoomFit))
+        fit.toolTip = "Fit in Window (⌃⌥⌘9)"
+        let mode = NSSegmentedControl(labels: ["Adaptive", "Native"], trackingMode: .selectOne, target: self, action: #selector(modeChosen(_:)))
+        mode.setToolTip("\(name)'s screen takes the resolution closest to this window (while Keep Screen Dark is on)", forSegment: 0)
+        mode.setToolTip("\(name)'s screen keeps its own resolution: zoom here, and the picture scrolls at the edges", forSegment: 1)
+        for c in [zoom, fit, mode] as [NSControl] { c.controlSize = .small; c.font = .systemFont(ofSize: NSFont.smallSystemFontSize) }
+        fit.bezelStyle = .accessoryBarAction
+        let bar = NSStackView(views: [zoom, fit, mode])
+        bar.spacing = 6
+        bar.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 8)
+        bar.frame.size = bar.fittingSize
+        let acc = NSTitlebarAccessoryViewController()
+        acc.view = bar
+        acc.layoutAttribute = .trailing
+        w.addTitlebarAccessoryViewController(acc)
+        zoomControl = zoom; fitButton = fit; modeControl = mode
         view.zoomKeys = native
+        updateZoomControls()
     }
 
     @objc func modeChosen(_ c: NSSegmentedControl) {
@@ -808,7 +822,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
 
     func updateZoomControls() {
         zoomControl?.isEnabled = native
-        fitItem?.isEnabled = native
+        fitButton?.isEnabled = native
         modeControl?.selectedSegment = native ? 1 : 0
         updateTitle()
     }
@@ -847,47 +861,6 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         AudioOut.shared.release(ObjectIdentifier(self), next: next.map(ObjectIdentifier.init))
         next?.sendAudioOwner()
         if proxies.isEmpty && role != "launcher" { NSApp.terminate(nil) }
-    }
-}
-
-extension ProxyWindow: NSToolbarDelegate {
-    static let modeItem = NSToolbarItem.Identifier("mode"), zoomItem = NSToolbarItem.Identifier("zoom"), fitID = NSToolbarItem.Identifier("fit")
-
-    func toolbarDefaultItemIdentifiers(_ t: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.zoomItem, Self.fitID, Self.modeItem] }
-    func toolbarAllowedItemIdentifiers(_ t: NSToolbar) -> [NSToolbarItem.Identifier] { toolbarDefaultItemIdentifiers(t) }
-
-    func toolbar(_ t: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar: Bool) -> NSToolbarItem? {
-        let item = NSToolbarItem(itemIdentifier: id), name = short(host)
-        let symbol = { (n: String, label: String) in NSImage(systemSymbolName: n, accessibilityDescription: label) ?? NSImage() }
-        switch id {
-        case Self.modeItem:
-            let c = NSSegmentedControl(labels: ["Adaptive", "Native"], trackingMode: .selectOne, target: self, action: #selector(modeChosen(_:)))
-            c.setToolTip("\(name)'s screen takes the resolution closest to this window (while Keep Screen Dark is on)", forSegment: 0)
-            c.setToolTip("\(name)'s screen keeps its own resolution: zoom here, and the picture scrolls at the edges", forSegment: 1)
-            item.view = c
-            item.label = "Resolution"
-            modeControl = c
-        case Self.zoomItem:
-            let c = NSSegmentedControl(images: [symbol("minus.magnifyingglass", "Zoom Out"), symbol("1.magnifyingglass", "Actual Size"),
-                                                symbol("plus.magnifyingglass", "Zoom In")],
-                                       trackingMode: .momentary, target: self, action: #selector(zoomChosen(_:)))
-            for (i, tip) in ["Zoom Out (⌃⌥⌘−)", "Actual Size (⌃⌥⌘0)", "Zoom In (⌃⌥⌘=)"].enumerated() { c.setToolTip(tip, forSegment: i) }
-            item.view = c
-            item.label = "Zoom"
-            zoomControl = c
-        case Self.fitID:
-            item.image = symbol("arrow.up.left.and.down.right.magnifyingglass", "Fit in Window")
-            item.label = "Fit"
-            item.toolTip = "Fit in Window (⌃⌥⌘9)"
-            item.isBordered = true
-            item.autovalidates = false
-            item.target = self
-            item.action = #selector(zoomFit)
-            fitItem = item
-        default: return nil
-        }
-        DispatchQueue.main.async { [weak self] in self?.updateZoomControls() }
-        return item
     }
 }
 
