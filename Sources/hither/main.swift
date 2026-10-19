@@ -21,8 +21,10 @@ func short(_ host: String) -> String { host.split(separator: ".").first.map(Stri
 /// Proxies go through the launcher's loopback relay for their Mac (only the launcher needs Local Network access);
 /// TLS still runs end to end with the host, so the relay only ever sees ciphertext. No relay yet (the launcher isn't
 /// running): port 0 fails at once, and the proxy retries.
-func dial(_ host: String) -> Wire {
+/// `background`: a bulk copy, which macOS lets yield to the windows' own traffic.
+func dial(_ host: String, background: Bool = false) -> Wire {
     let tls = Pairings.load().tls(to: host)
+    if background { tls.serviceClass = .background }
     let c = role == "proxy"
         ? NWConnection(host: "127.0.0.1", port: relayPort(for: host) ?? .any, using: tls)
         : NWConnection(host: NWEndpoint.Host(host), port: port, using: tls)
@@ -35,21 +37,122 @@ func onMain(_ f: @escaping () -> Void) { RunLoop.main.perform(inModes: [.common]
 func macName(_ host: String) -> String { Pairings.load().peer(for: host)?.name ?? short(host) }
 
 // Clipboard, only on request: Send Clipboard puts this Mac's on `name`'s (it confirms with "clipset"),
-// Get Clipboard asks for theirs ("clipget", answered with a clipboard frame or "cliperr").
-/// Sends this Mac's clipboard; nil when it went, or why it didn't.
-func pushClipboard(over wire: Wire?, to name: String) -> String? {
+// Get Clipboard asks for theirs ("clipget", answered with a clipboard frame or "cliperr"). Files copied in Finder
+// go by FileCopy instead, on a connection of their own.
+/// What a clipboard action reports: progress (`done` nil), then once how it ended.
+typealias ClipStatus = (_ text: String, _ done: Bool?) -> Void
+
+/// Sends this Mac's clipboard to `host`; nil when it went (or a file copy started), or why it didn't.
+func pushClipboard(over wire: Wire?, to host: String, status: @escaping ClipStatus) -> String? {
+    let name = macName(host)
     guard let wire else { return "Not connected to \(name)" }
     let c = Clip.read()
-    if c.parts.isEmpty { return c.files ? "Copying files isn't supported yet" : "Your clipboard is empty" }
+    if c.files { FileCopy(host, status: status).send(Files.onClipboard()); return nil }
+    if c.parts.isEmpty { return "Your clipboard is empty" }
     wire.sendClip(c.encoded())
     return nil
 }
-/// `name`'s clipboard arrived: it becomes this Mac's. Returns what to tell the user.
-func receivedClipboard(_ d: Data, from name: String) -> String {
+/// `host`'s clipboard arrived: it becomes this Mac's. Returns what to tell the user, or nil when it holds files,
+/// which then come by FileCopy (reported through `status`).
+func receivedClipboard(_ d: Data, from host: String, status: @escaping ClipStatus) -> String? {
+    let name = macName(host)
     guard let c = Clip(decoding: d) else { return "Couldn't read \(name)'s clipboard" }
-    if c.parts.isEmpty { return c.files ? "Files on \(name)'s clipboard can't be copied yet" : "\(name)'s clipboard is empty" }
+    if c.files { FileCopy(host, status: status).get(); return nil }
+    if c.parts.isEmpty { return "\(name)'s clipboard is empty" }
     c.write()
     return "Got \(c.summary) from \(name)"
+}
+
+/// One copy of Finder files to or from `host`, on its own connection so a big one never holds up a window's input
+/// or video. What arrives goes into Downloads and onto the clipboard, ready to paste in Finder.
+final class FileCopy {
+    static var running: [ObjectIdentifier: FileCopy] = [:]   // main thread; a copy lives until it ends
+    let host: String, name: String, wire: Wire, status: ClipStatus
+    var inbox: FileInbox?   // on the wire's queue
+    var shown = 0.0, ended = false
+
+    init(_ host: String, status: @escaping ClipStatus) {
+        self.host = host
+        name = macName(host)
+        wire = dial(host, background: true)
+        self.status = status
+    }
+
+    func send(_ urls: [URL]) {
+        let what = urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) items"
+        start { [self] m in
+            switch m.t {
+            case "filesgot": end("Sent \(m.text ?? what) to \(name)'s Downloads (on its clipboard)", ok: true)
+            case "fileserr": end(m.text ?? "Couldn't copy to \(name)", ok: false)
+            default: break
+            }
+        }
+        report("Sending \(what) to \(name)…")
+        Files.send(urls, over: wire) { [self] sent, total in progress("Sending \(what) to \(name)", sent, total) }
+    }
+
+    func get() {
+        start { [self] m in
+            switch m.t {
+            case "files":
+                do { inbox = try FileInbox(m.files ?? [], into: Files.downloads) } catch { fail(error) }
+            case "filesend":
+                guard let box = inbox else { return }
+                inbox = nil
+                do {
+                    let urls = try box.finish()
+                    onMain { Files.putOnClipboard(urls) }
+                    var r = Msg("filesgot"); r.text = Files.summary(box.entries)
+                    wire.send(r)
+                    end("Got \(Files.summary(box.entries)) from \(name): in Downloads and on the clipboard", ok: true)
+                } catch { fail(error) }
+            case "fileserr": end(m.text ?? "Couldn't copy from \(name)", ok: false)
+            default: break
+            }
+        }
+        wire.onFileData = { [self] d in
+            guard let box = inbox else { return }
+            do { try box.take(d) } catch { return fail(error) }
+            progress("Getting \(Files.summary(box.entries)) from \(name)", box.received, box.total)
+        }
+        report("Getting files from \(name)…")
+        wire.send(Msg("filesget"))
+    }
+
+    private func start(_ onMsg: @escaping (Msg) -> Void) {
+        onMain { FileCopy.running[ObjectIdentifier(self)] = self }
+        wire.onMsg = onMsg
+        wire.onClose = { [self] in end("Copy with \(name) stopped: connection lost", ok: false) }
+        wire.start()
+    }
+
+    /// At most once a second: "Sending Photos to mini-pb: 45% of 2.4 GB".
+    private func progress(_ what: String, _ done: UInt64, _ total: UInt64) {
+        let now = CACurrentMediaTime()
+        guard now - shown >= 1, total > 0 else { return }
+        shown = now
+        let size = ByteCountFormatter.string(fromByteCount: Int64(clamping: total), countStyle: .file)
+        report("\(what): \(done * 100 / total)% of \(size)")
+    }
+
+    private func report(_ s: String, done: Bool? = nil) { onMain { [self] in status(s, done) } }
+
+    private func fail(_ error: Error) {
+        var e = Msg("fileserr"); e.text = error.localizedDescription
+        wire.send(e)
+        end(error.localizedDescription, ok: false)
+    }
+
+    private func end(_ s: String, ok: Bool) {
+        onMain { [self] in
+            guard !ended else { return }
+            ended = true
+            wire.queue.async { [self] in inbox?.abort(); inbox = nil }   // a copy cut off partway leaves nothing behind
+            status(s, ok)
+            wire.close()
+            FileCopy.running[ObjectIdentifier(self)] = nil
+        }
+    }
 }
 /// ⌃⌥⌘C / ⌃⌥⌘V in a remote window, shown on the Edit menu items too.
 let clipMods: NSEvent.ModifierFlags = [.control, .option, .command]
@@ -255,7 +358,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         w.onClip = { [weak self] d in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                flash(receivedClipboard(d, from: macName(host)))
+                if let s = receivedClipboard(d, from: host, status: { [weak self] s, _ in self?.flash(s) }) { flash(s) }
             }
         }
         w.onMsg = { [weak self, weak w] m in
@@ -441,7 +544,9 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         }
     }
 
-    @objc func sendClipboard() { if let why = pushClipboard(over: wire, to: macName(host)) { flash(why) } }
+    @objc func sendClipboard() {
+        if let why = pushClipboard(over: wire, to: host, status: { [weak self] s, _ in self?.flash(s) }) { flash(why) }
+    }
     @objc func getClipboard() {
         guard let wire else { return flash("Not connected to \(macName(host))") }
         flash("Getting \(macName(host))'s clipboard…")
@@ -746,6 +851,7 @@ final class Remote {
     unowned let launcher: Launcher
     let relayPeer: OSAllocatedUnfairLock<Peer>   // read on the relay queue
     var attempt = 0   // the control connection tries the peer's names (Reach.hosts) in turn
+    var host = ""     // the name or address the control connection last dialed: file copies go there too
     var wire: Wire?
     var items: [Item] = []
     var state = "connecting…"
@@ -787,6 +893,7 @@ final class Remote {
         if wire == nil {
             let peer = peer, hosts = Reach.hosts(peer), host = hosts[attempt % hosts.count]
             let w = dial(host), me = ObjectIdentifier(w)
+            self.host = host
             w.onClose = { [weak self] in
                 onMain { [weak self] in
                     guard let self, let cur = wire, ObjectIdentifier(cur) == me else { return }   // already replaced (re-paired)
@@ -816,7 +923,8 @@ final class Remote {
             w.onClip = { [weak self] d in
                 onMain { [weak self] in
                     guard let self, !gone else { return }
-                    launcher.flash(receivedClipboard(d, from: name))
+                    let launcher = launcher
+                    if let s = receivedClipboard(d, from: self.host, status: { s, _ in launcher.flash(s) }) { launcher.flash(s) }
                 }
             }
             wire = w
@@ -1357,7 +1465,7 @@ final class Launcher: NSObject, NSMenuDelegate {
 
     @objc func sendClipboard(_ sender: NSMenuItem) {
         guard let mac = sender.representedObject as? Remote else { return }
-        if let why = pushClipboard(over: mac.wire, to: mac.name) { flash(why) }
+        if let why = pushClipboard(over: mac.wire, to: mac.host, status: { [weak self] s, _ in self?.flash(s) }) { flash(why) }
     }
 
     @objc func getClipboard(_ sender: NSMenuItem) {
@@ -1568,11 +1676,12 @@ default:
         let w = dial(args[1]), name = macName(args[1])
         listWire = w
         w.onMsg = { m in print(m.t == "clipset" ? "Sent \(m.text ?? "clipboard") to \(name)" : m.text ?? m.t); exit(m.t == "clipset" ? 0 : 1) }
-        w.onClip = { d in DispatchQueue.main.async { print(receivedClipboard(d, from: name)); exit(0) } }
+        let status: ClipStatus = { s, done in print(s); if let done { exit(done ? 0 : 1) } }
+        w.onClip = { d in DispatchQueue.main.async { if let s = receivedClipboard(d, from: args[1], status: status) { print(s); exit(0) } } }
         w.onClose = { exit(1) }
         w.start()
         if args[2] == "--get-clipboard" { w.send(Msg("clipget")) }
-        else if let why = pushClipboard(over: w, to: name) { print(why); exit(1) }
+        else if let why = pushClipboard(over: w, to: args[1], status: status) { print(why); exit(1) }
     } else if args[2] == "--codec", args.count > 3 {   // same as the launcher's Video Codec menu
         let w = dial(args[1])
         listWire = w

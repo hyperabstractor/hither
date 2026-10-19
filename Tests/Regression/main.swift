@@ -36,6 +36,8 @@ do {
     print("PASS a dark display takes the mode the viewer's screen shows best")
     try testClip()
     print("PASS a clipboard crosses the wire; screenshots go as PNG; Finder files are refused")
+    try testFiles()
+    print("PASS Finder files cross on their own connection: folders, big files, safe names, nothing left half-done")
     try testSeal()
     try testFragments()
     try testIndependentFrames()

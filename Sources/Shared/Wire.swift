@@ -31,6 +31,7 @@ public struct Msg: Codable {
     public var dark: Bool?           // Keep Screen Dark on the host: its setting (in "windows"), or a new one ("dark")
     public var scale: Double?        // a desktop's "resize": the viewer's screen is Retina (2) or not (1)
     public var peer: String?, name: String?, key: Data?, nonce: Data?, commit: Data?   // pairing
+    public var files: [FileEntry]?   // "files": what a file copy holds (Files.swift)
     public init(_ t: String) { self.t = t }
 }
 
@@ -176,7 +177,7 @@ public func tcpOptions() -> NWProtocolTCP.Options {
 }
 
 /// Framing: [kind u8][len u32][body]. kind 1 = JSON Msg, 2 = video packet, 3 = audio (48 kHz stereo Int16 PCM),
-/// 4 = clipboard (Clip).
+/// 4 = clipboard (Clip), 5 = file data (Files.swift).
 public final class Wire {
     public let conn: NWConnection
     public let queue: DispatchQueue
@@ -184,6 +185,7 @@ public final class Wire {
     public var onVideo: (Data) -> Void = { _ in }
     public var onAudio: (Data) -> Void = { _ in }
     public var onClip: (Data) -> Void = { _ in }
+    public var onFileData: (Data) -> Void = { _ in }
     public var onClose: () -> Void = {}
     public var maxLen = Int.max   // cap it where the peer isn't authenticated yet (pairing)
     private let sendLock = NSLock()  // audio, encoder and control messages arrive from different queues
@@ -233,6 +235,8 @@ public final class Wire {
                     self.onAudio(body)
                 } else if kind == 4 {
                     self.onClip(body)
+                } else if kind == 5 {
+                    self.onFileData(body)   // returns once written: the next read waits, so a slow disk slows the sender
                 }
                 self.read()
             }
@@ -250,6 +254,15 @@ public final class Wire {
     public func sendVideo(_ d: Data) { frame(2, d) }
     public func sendAudio(_ d: Data) { frame(3, d) }
     public func sendClip(_ d: Data) { frame(4, d) }
+    /// File data, with `sent` called once the connection has taken it (false: it closed), so the sender can keep a
+    /// bounded amount in flight rather than reading a whole file into memory.
+    public func sendFileData(_ d: Data, sent: @escaping (Bool) -> Void) {
+        let f = framed(5, d)
+        sendLock.lock()
+        guard !closed, !closing else { sendLock.unlock(); return sent(false) }
+        conn.send(content: f, completion: .contentProcessed { sent($0 == nil) })
+        sendLock.unlock()
+    }
 
     /// Send the last control message and a TCP/TLS finish. Keep receiving until the peer closes,
     /// with a bounded fallback for peers that never acknowledge the end of the stream.

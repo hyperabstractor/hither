@@ -136,6 +136,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var lastFrame: CVPixelBuffer?   // re-sent on a codec switch
     var pumpQueued = false
     var visible = true
+    var inbox: FileInbox?   // files coming in on this connection (Send Clipboard with Finder files copied)
 
     init(_ conn: NWConnection) {
         wire = Wire(conn, queue: q)
@@ -149,6 +150,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 var r = Msg("clipset"); r.text = c.summary
                 self.wire.send(r)
             }
+        }
+        wire.onFileData = { [unowned self] d in
+            do { try inbox?.take(d) } catch { fileFailed(error) }
         }
         wire.onClose = { [unowned self] in log("connection closed (\(conn.endpoint))"); stop() }
         log("connection from \(conn.endpoint)")
@@ -217,6 +221,36 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.focus(force: false)   // e.g. File › Save acts on the key window, so make it ours
                 menuQ.async { if let e = self.menuItems(at: path.dropLast())?[safe: path.last ?? -1] { AXUIElementPerformAction(e, kAXPressAction as CFString) } }
             }
+        case "files":   // Send Clipboard with Finder files copied: they land in Downloads and on our clipboard
+            do {
+                inbox = try FileInbox(m.files ?? [], into: Files.downloads)
+                log("receiving \(Files.summary(m.files ?? []))")
+            } catch { fileFailed(error) }
+        case "filesend":
+            guard let box = inbox else { return }
+            inbox = nil
+            do {
+                let urls = try box.finish()
+                DispatchQueue.main.async { Files.putOnClipboard(urls) }
+                log("received \(Files.summary(box.entries)) into Downloads")
+                var r = Msg("filesgot"); r.text = Files.summary(box.entries)
+                wire.send(r)
+            } catch { fileFailed(error) }
+        case "fileserr":   // the other end gave up partway
+            log("file copy failed: \(m.text ?? "")")
+            inbox?.abort(); inbox = nil
+            wire.close()
+        case "filesget":   // Get Clipboard found files here (Clip's files flag): send them on this connection
+            clipQ.async {
+                let urls = Files.onClipboard()
+                guard !urls.isEmpty else {
+                    var e = Msg("fileserr"); e.text = "No files on \(localName())'s clipboard"
+                    return self.wire.send(e)
+                }
+                log("sending \(urls.count) clipboard item(s)")
+                Files.send(urls, over: self.wire)
+            }
+        case "filesgot": log("files sent: \(m.text ?? "")")
         case "audio":   // whether this is the viewer window that plays the app's sound; older viewers never say: on
             let on = m.down ?? true
             audioQ.async { self.audioOn = on }
@@ -968,8 +1002,16 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         if inflight.count < before { pump() }
     }
 
+    func fileFailed(_ error: Error) {
+        log("file copy failed: \(error.localizedDescription)")
+        inbox?.abort(); inbox = nil
+        var e = Msg("fileserr"); e.text = error.localizedDescription
+        wire.sendAndClose(e)
+    }
+
     func stop() {
         ended = true
+        inbox?.abort(); inbox = nil   // a copy cut off partway leaves nothing behind
         if let tag = seal?.tag { udpLock.withLock { udpSessions[tag] = nil } }
         flow?.cancel(); flow = nil
         if let o = original, o != .zero, let ax, readFrame()?.size != o.size { place(ax, o.size, o.origin) }   // the phone let go
