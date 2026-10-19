@@ -317,7 +317,7 @@ final class StreamView: NSView {
 
     /// Points per second to scroll with the pointer at `p`: within 40 pt of an edge the picture extends past.
     func speed(at p: CGPoint) -> CGPoint {
-        let band: CGFloat = 40, fast: CGFloat = 6400   // at the very edge; a quarter of that halfway in
+        let band: CGFloat = 40, fast: CGFloat = 4400   // at the very edge; a quarter of that halfway in
         func axis(_ v: CGFloat, _ size: CGFloat) -> CGFloat {
             v < band ? -fast * pow((band - max(v, 0)) / band, 2) : v > size - band ? fast * pow((min(v, size) - (size - band)) / band, 2) : 0
         }
