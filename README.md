@@ -101,8 +101,9 @@ them with CGEvent and Accessibility. Each remote app's proxy is an APFS clone of
 bundle name and icon, which is what gives it a Dock and Cmd-Tab identity. Proxies connect through a loopback relay in
 the menu bar app, so only Hither itself needs Local Network access.
 
-Control, input, menus, audio and the clipboard go over TCP 7420. A file copy gets a TCP 7420 connection of its own
-(background traffic class), so a big one never holds up a window. Video goes over UDP 7421 when both ends support
+Control, input, menus, audio and the clipboard go over TCP 7420. A file copy gets a TCP 7420 connection of its own,
+so a big one never waits behind a window's traffic or holds up its input. It runs at full speed, so windows may lag a
+little while it does; Cancel is in the menu. Video goes over UDP 7421 when both ends support
 it, so a lost packet costs one frame's repair instead of holding up every frame behind it. Each frame is split into
 datagrams that fit Tailscale's MTU. The viewer asks again for any missing pieces, and when a frame can't be saved
 in time it waits for a keyframe instead of showing a broken picture. The datagrams are sealed with ChaChaPoly

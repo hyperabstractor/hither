@@ -22,10 +22,8 @@ func short(_ host: String) -> String { host.split(separator: ".").first.map(Stri
 /// Proxies go through the launcher's loopback relay for their Mac (only the launcher needs Local Network access);
 /// TLS still runs end to end with the host, so the relay only ever sees ciphertext. No relay yet (the launcher isn't
 /// running): port 0 fails at once, and the proxy retries.
-/// `background`: a bulk copy, which macOS lets yield to the windows' own traffic.
-func dial(_ host: String, background: Bool = false) -> Wire {
+func dial(_ host: String) -> Wire {
     let tls = Pairings.load().tls(to: host)
-    if background { tls.serviceClass = .background }
     let c = role == "proxy"
         ? NWConnection(host: "127.0.0.1", port: relayPort(for: host) ?? .any, using: tls)
         : NWConnection(host: NWEndpoint.Host(host), port: port, using: tls)
@@ -86,7 +84,7 @@ final class FileCopy {
     init(_ host: String, status: @escaping ClipStatus) {
         self.host = host
         name = macName(host)
-        wire = dial(host, background: true)
+        wire = dial(host)   // not .background: macOS's delay-based throttling crawls on a 300 ms link (50 MB: >75 s vs 10 s)
         self.status = status
     }
 
@@ -1770,7 +1768,7 @@ default:
     guard args.count >= 3 else {
         print("usage: hither <host> <app> [window-title-substring]\n       hither <host> --list\n       hither <host> --codec h264|hevc|hevc422"
             + "\n       hither <host> --dark on|off\n       hither <host> --lock\n       hither <host> @desktop"
-            + "\n       hither <host> --send-clipboard|--get-clipboard")
+            + "\n       hither <host> --send-clipboard|--get-clipboard\n       hither <host> --send-files <path>…")
         exit(1)
     }
     if args[2] == "--dark", args.count > 3 {   // same as the launcher's Keep Screen Dark
@@ -1799,6 +1797,8 @@ default:
         w.start()
         if args[2] == "--get-clipboard" { w.send(Msg("clipget")) }
         else if let why = pushClipboard(over: w, to: args[1], status: status) { print(why); exit(1) }
+    } else if args[2] == "--send-files", args.count > 3 {   // as Send Clipboard with these copied in Finder
+        FileCopy(args[1], status: { s, done in print(s); if let done { exit(done ? 0 : 1) } }).send(args[3...].map { URL(fileURLWithPath: $0) })
     } else if args[2] == "--codec", args.count > 3 {   // same as the launcher's Video Codec menu
         let w = dial(args[1])
         listWire = w
