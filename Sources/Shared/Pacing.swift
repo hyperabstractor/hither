@@ -23,21 +23,21 @@ public func bestMode(_ modes: [ModeSize], for viewer: CGSize, scale: Double) -> 
     }
 }
 
-/// Adaptive Desktop: the mode closest to the viewer's window (points, Retina or not), so the picture shows near 1:1
-/// instead of scaled. Shape counts most, then size; a bit bigger beats a bit smaller (scaled down stays sharp).
-public func closestMode(_ modes: [ModeSize], to window: CGSize, scale: Double) -> Int? {
+/// Adaptive Desktop: a mode the viewer can show at exactly 1:1, so its pixels are the host's pixels. Its size in points
+/// fits `room` (the most the viewer has, title bar left out) and it's Retina for a Retina viewer, plain for one that
+/// isn't; of those, the nearest to the window's size, which the window then snaps to. If none fits, the smallest (shown
+/// scaled down).
+public func snapMode(_ modes: [ModeSize], to window: CGSize, within room: CGSize, scale: Double) -> Int? {
     guard window.width > 0, window.height > 0 else { return nil }
     let usable = modes.indices.filter { modes[$0].width >= 800 }
     let hiDPI = usable.filter { modes[$0].pixelWidth >= 2 * modes[$0].width }
     let plain = usable.filter { modes[$0].pixelWidth < 2 * modes[$0].width }
     let pool = scale >= 2 ? (hiDPI.isEmpty ? usable : hiDPI) : (plain.isEmpty ? usable : plain)
-    func cost(_ i: Int) -> Double {
-        let w = Double(modes[i].width), h = Double(modes[i].height)
-        let shape = abs(log((w / h) / (window.width / window.height)))
-        let size = log(w * h / (window.width * window.height))
-        return 4 * shape + (size < 0 ? -1.5 * size : size)
-    }
-    return pool.min { cost($0) < cost($1) }
+    let area = { (i: Int) in modes[i].width * modes[i].height }
+    let fits = pool.filter { Double(modes[$0].width) <= room.width && Double(modes[$0].height) <= room.height }
+    guard !fits.isEmpty else { return pool.min { area($0) < area($1) } }
+    func off(_ i: Int) -> Double { abs(log(Double(modes[i].width) / window.width)) + abs(log(Double(modes[i].height) / window.height)) }
+    return fits.min { (off($0), -area($0)) < (off($1), -area($1)) }
 }
 
 /// App windows for a Retina viewer: the HiDPI mode with the most room, so their text is captured at 2x.

@@ -75,7 +75,9 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var desktop = false              // a whole display, not one app's window
     var opened = false               // streaming something: keeps this Mac's screen dark (Dark)
     var viewer: (size: CGSize, scale: Double)?   // desktop: the viewer's screen, whose shape a dark display may take (Dark.fit)
-    var adapt: (size: CGSize, scale: Double)?    // desktop, Adaptive: the viewer's window, whose size a dark display takes
+    var adapt: (size: CGSize, room: CGSize, scale: Double)?   // desktop, Adaptive: the viewer's window and the most room it
+                                                 // has, which a dark display takes the nearest mode to (Dark.fit)
+    var adaptAsked = false                       // …and the viewer waits to hear the size it snaps to, even if unchanged
     var nativeDesktop = false                    // desktop, Native: the display keeps its own mode, whatever else wants it
     var viewerScale = 1.0                        // the viewer's screen: 2 = Retina (app windows get a HiDPI mode then)
     var ax: AXUIElement?
@@ -271,10 +273,13 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                 DispatchQueue.main.async { Dark.tick() }
             }
         case "adapt" where desktop:   // the Mac viewer's Desktop: its window's size (Adaptive), or none (Native)
-            if let w = m.w, let h = m.h, w > 0, h > 0 { adapt = (CGSize(width: w, height: h), m.scale ?? 1); nativeDesktop = false }
+            if let w = m.w, let h = m.h, w > 0, h > 0 {   // x, y: the most room the viewer has (older viewers: the window)
+                adapt = (CGSize(width: w, height: h), CGSize(width: m.x ?? w, height: m.y ?? h), m.scale ?? 1); nativeDesktop = false
+                adaptAsked = true
+            }
             else { adapt = nil; nativeDesktop = true }
             viewer = nil
-            log("desktop \(adapt.map { "adaptive to \(Int($0.size.width))×\(Int($0.size.height))" } ?? "native")")
+            log("desktop \(adapt.map { "adaptive to \(Int($0.size.width))×\(Int($0.size.height)) within \(Int($0.room.width))×\(Int($0.room.height))" } ?? "native")")
             DispatchQueue.main.async { Dark.tick() }
         case "close": menuQ.async { pressClose(CGWindowID(m.k ?? 0)) }   // launcher menu's X; AX can block on a modal
         default: applyInput(m, udp: false)
@@ -1118,18 +1123,19 @@ enum Dark {
     static var fittedTo: [CGDirectDisplayID: CGDisplayMode] = [:] // …and the mode they were switched to (macOS reports the
                                                                    // old one for a moment after a switch)
 
-    /// A dark monitor nobody looks at can change mode for whoever streams it: an Adaptive Desktop takes the mode closest
-    /// to its window (so it shows near 1:1, not a letterboxed strip of an ultrawide), an iPhone's the shape of its screen,
+    /// A dark monitor nobody looks at can change mode for whoever streams it: an Adaptive Desktop takes the mode nearest
+    /// its window that the viewer has room for, and the window snaps to it (shown 1:1, pixel for pixel), an iPhone's the
+    /// shape of its screen,
     /// and app windows for a Retina viewer the roomiest HiDPI mode (captured at 2x, their text stays sharp). A Native
     /// Desktop keeps the display's own mode. Back to its own mode once nothing wants it; the change is the host's alone,
     /// so macOS undoes it if the host dies.
     static func fit() {
-        enum Want { case shape(CGSize, Double), closest(CGSize, Double), retina }
+        enum Want { case shape(CGSize, Double), snap(CGSize, CGSize, Double), retina }
         var want: [CGDirectDisplayID: Want] = [:], native = Set<CGDirectDisplayID>()
         if enabled {
             let open = sessions.values.filter { $0.opened && !$0.ended }
             for s in open where s.desktop {
-                if let a = s.adapt { want[s.windowID] = .closest(a.size, a.scale) }
+                if let a = s.adapt { want[s.windowID] = .snap(a.size, a.room, a.scale) }
                 else if s.nativeDesktop { native.insert(s.windowID) }
                 else if let v = s.viewer { want[s.windowID] = .shape(v.size, v.scale) }
             }
@@ -1145,19 +1151,27 @@ enum Dark {
             set(d, own)
         }
         let physical = physicalDisplays()
+        var changed = Set<CGDirectDisplayID>()
         let same = { (a: CGDisplayMode, b: CGDisplayMode) in a.width == b.width && a.height == b.height && a.pixelWidth == b.pixelWidth }
         for (d, w) in want where physical.contains(d) {
             let best: CGDisplayMode?
             switch w {
             case .shape(let size, let scale): best = bestMode(d, for: size, scale: scale)
-            case .closest(let size, let scale): best = pick(d) { closestMode($0, to: size, scale: scale) }
+            case .snap(let size, let room, let scale): best = pick(d) { snapMode($0, to: size, within: room, scale: scale) }
             case .retina: best = pick(d) { largestRetina($0) }
             }
-            guard let current = CGDisplayCopyDisplayMode(d), let best, !same(best, current),
-                  fittedTo[d].map({ !same($0, best) }) ?? true else { continue }
+            guard let current = CGDisplayCopyDisplayMode(d), let best, !same(best, current) else { continue }
+            if let to = fittedTo[d], same(to, best) { changed.insert(d); continue }   // switched, not reported yet
             if fitted[d] == nil { fitted[d] = current }
             fittedTo[d] = best
             set(d, best)
+            changed.insert(d)
+        }
+        // an Adaptive viewer that let go of its window snaps to the display's size: a mode change sends it (the session
+        // sees its frame change), so tell the others now, mode unchanged or the screen not dark
+        for s in sessions.values where s.desktop && s.adaptAsked {
+            s.adaptAsked = false
+            if !changed.contains(s.windowID) { s.q.async { var m = Msg("size"); m.w = s.frame.width; m.h = s.frame.height; s.wire.send(m) } }
         }
     }
 

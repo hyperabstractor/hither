@@ -226,6 +226,9 @@ final class StreamView: NSView {
     /// Native Desktop: nil = fit the window; else remote points × zoom, scrolled by `pan` where it's bigger than the window.
     private(set) var zoom: CGFloat?
     var pan = CGPoint.zero
+    /// Adaptive Desktop: 1, so the picture is never scaled up (it stays pixel for pixel, centered, while the window is
+    /// bigger than the host's screen); otherwise fit fills the window.
+    var maxFit: CGFloat = .greatestFiniteMagnitude { didSet { if maxFit != oldValue { place() } } }
     private(set) var picture = CGRect.zero   // where the video is in this view
 
     override init(frame: NSRect) {
@@ -247,9 +250,11 @@ final class StreamView: NSView {
     override func setFrameSize(_ s: NSSize) { super.setFrameSize(s); place() }
 
     func place() {
-        let r = pictureRect(view: bounds.size, remote: remoteSize, zoom: zoom, pan: pan)
+        let r = pictureRect(view: bounds.size, remote: remoteSize, zoom: zoom, pan: pan, maxFit: maxFit)
         pan = r.pan
-        picture = remoteSize == .zero ? bounds : r.rect
+        // centered: on whole points, so a 1:1 picture lands on whole pixels too (half a point is a blurry pixel at 1x)
+        picture = remoteSize == .zero ? bounds
+            : zoom == nil ? CGRect(origin: CGPoint(x: r.rect.minX.rounded(.down), y: r.rect.minY.rounded(.down)), size: r.rect.size) : r.rect
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         video.frame = picture
@@ -434,7 +439,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     var note: String?   // a passing status ("Sent text to mini-pb") shown in place of the latency
     var remoteSize = CGSize.zero { didSet { view.remoteSize = remoteSize } }
     /// Desktop: Native keeps the host's screen at its own resolution (zoom and scroll here); Adaptive has a dark one
-    /// take the mode closest to this window. Remembered per Mac.
+    /// take the mode nearest this window that fits here, and the window snaps to it, pixel for pixel. Remembered per Mac.
     var native: Bool {
         get { UserDefaults.standard.bool(forKey: "desktop.native.\(short(host))") }
         set { UserDefaults.standard.set(newValue, forKey: "desktop.native.\(short(host))") }
@@ -592,11 +597,14 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
             }
         case "size":
             remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
-            if isDesktop {   // the display changed mode (Adaptive fit it to this window): take its exact shape, no bigger
+            if isDesktop {   // Adaptive: the host's screen took a mode for this window, or answered that it keeps its own
                 guard !native, let w = window, !w.styleMask.contains(.fullScreen), !w.inLiveResize, remoteSize.width > 0 else { return }
+                let room = self.room(w)
+                if remoteSize.width <= room.width && remoteSize.height <= room.height { return snap(w, to: remoteSize) }   // 1:1
+                // too big to show 1:1 (the screen there isn't dark, so it keeps its mode): its shape, no bigger
                 let cur = w.contentLayoutRect.size, k = min(cur.width / remoteSize.width, cur.height / remoteSize.height)
-                let snap = CGSize(width: (remoteSize.width * k).rounded(), height: (remoteSize.height * k).rounded())
-                if abs(snap.width - cur.width) > 1 || abs(snap.height - cur.height) > 1 { w.setContentSize(snap) }
+                let shape = CGSize(width: (remoteSize.width * k).rounded(), height: (remoteSize.height * k).rounded())
+                if abs(shape.width - cur.width) > 1 || abs(shape.height - cur.height) > 1 { w.setContentSize(shape) }
                 return
             }
             guard let w = window, !w.inLiveResize, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) else { return }
@@ -701,16 +709,38 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         window.subtitle = "\(appName) on \(short(host))" + (extra.isEmpty ? "" : " · \(extra)")
     }
 
-    /// A desktop: Adaptive tells the host this window's size, which a dark display there takes the closest mode to;
-    /// Native says to keep its own.
+    /// A desktop: Adaptive tells the host this window's size and the most room it could have (x, y), and a dark display
+    /// there takes the nearest mode that fits, at this screen's scale; the host answers with "size" and the window snaps
+    /// to it. Native says to keep its own.
     func sendShape() {
         guard isDesktop, let w = window else { return }
         var m = Msg("adapt")
         if !native {
-            let s = w.contentLayoutRect.size
-            m.w = s.width.rounded(); m.h = s.height.rounded(); m.scale = Double((w.screen ?? NSScreen.main)?.backingScaleFactor ?? 2)
+            let s = w.contentLayoutRect.size, r = room(w)
+            m.w = s.width.rounded(); m.h = s.height.rounded(); m.x = r.width.rounded(.down); m.y = r.height.rounded(.down)
+            m.scale = Double((w.screen ?? NSScreen.main)?.backingScaleFactor ?? 2)
         }
         wire?.send(m)
+    }
+
+    /// The most content this window can show on its screen: all of it in full screen, else the usable area less the
+    /// title bar.
+    func room(_ w: NSWindow) -> CGSize {
+        if w.styleMask.contains(.fullScreen) { return w.contentLayoutRect.size }
+        guard let v = (w.screen ?? NSScreen.main)?.visibleFrame else { return w.contentLayoutRect.size }
+        return w.contentRect(forFrameRect: v).size
+    }
+
+    /// Content exactly `s`, top edge where it was, kept on the screen.
+    func snap(_ w: NSWindow, to s: CGSize) {
+        guard w.contentLayoutRect.size != s else { return }
+        var f = w.frameRect(forContentRect: NSRect(origin: .zero, size: s))
+        f.origin = CGPoint(x: w.frame.minX, y: w.frame.maxY - f.height)
+        if let v = w.screen?.visibleFrame {
+            f.origin.x = max(v.minX, min(f.minX, v.maxX - f.width))
+            f.origin.y = max(v.minY, min(f.minY, v.maxY - f.height))
+        }
+        w.setFrame(f, display: true, animate: false)
     }
 
     /// `s` scaled down to fit the screen's usable area (title bar included), keeping its shape.
@@ -755,7 +785,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         let fit = NSButton(image: symbol("arrow.up.left.and.down.right.magnifyingglass", "Fit in Window"), target: self, action: #selector(zoomFit))
         fit.toolTip = "Fit in Window (⌃⌥⌘9)"
         let mode = NSSegmentedControl(labels: ["Adaptive", "Native"], trackingMode: .selectOne, target: self, action: #selector(modeChosen(_:)))
-        mode.setToolTip("\(name)'s screen takes the resolution closest to this window (while Keep Screen Dark is on)", forSegment: 0)
+        mode.setToolTip("\(name)'s screen takes the resolution nearest this window and the window snaps to it, pixel for pixel (while Keep Screen Dark is on)", forSegment: 0)
         mode.setToolTip("\(name)'s screen keeps its own resolution: zoom here; zoomed in, the picture follows the pointer", forSegment: 1)
         for c in [zoom, fit, mode] as [NSControl] { c.controlSize = .small; c.font = .systemFont(ofSize: NSFont.smallSystemFontSize) }
         fit.bezelStyle = .accessoryBarAction
@@ -769,12 +799,14 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         w.addTitlebarAccessoryViewController(acc)
         zoomControl = zoom; fitButton = fit; modeControl = mode
         view.zoomKeys = native
+        view.maxFit = native ? .greatestFiniteMagnitude : 1
         updateZoomControls()
     }
 
     @objc func modeChosen(_ c: NSSegmentedControl) {
         native = c.selectedSegment == 1
         view.zoomKeys = native
+        view.maxFit = native ? .greatestFiniteMagnitude : 1
         view.setZoom(nil)
         updateZoomControls()
         sendShape()

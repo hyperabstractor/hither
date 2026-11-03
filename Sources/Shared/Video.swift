@@ -99,10 +99,11 @@ public struct Depacketizer {
 /// differ (full screen, an app that refused to shrink, a phone) the picture is scaled and letterboxed, and input has
 /// to follow.
 /// Where the picture goes in a view: `zoom` nil = fit (letterboxed), else remote points × zoom, centered when smaller
-/// than the view and shifted by `pan` (how far it's scrolled, top-left origin) when bigger. Returns the clamped pan too.
-public func pictureRect(view: CGSize, remote r: CGSize, zoom: CGFloat?, pan: CGPoint) -> (rect: CGRect, pan: CGPoint) {
+/// than the view and shifted by `pan` (how far it's scrolled, top-left origin) when bigger. `maxFit` caps the fit (1 = never
+/// scaled up: an Adaptive Desktop stays 1:1 and is centered). Returns the clamped pan too.
+public func pictureRect(view: CGSize, remote r: CGSize, zoom: CGFloat?, pan: CGPoint, maxFit: CGFloat = .greatestFiniteMagnitude) -> (rect: CGRect, pan: CGPoint) {
     guard r.width > 0, r.height > 0, view.width > 0, view.height > 0 else { return (CGRect(origin: .zero, size: view), .zero) }
-    let z = zoom ?? min(view.width / r.width, view.height / r.height)
+    let z = zoom ?? min(view.width / r.width, view.height / r.height, maxFit)
     let w = r.width * z, h = r.height * z
     let pan = CGPoint(x: w > view.width ? min(max(pan.x, 0), w - view.width) : 0,
                       y: h > view.height ? min(max(pan.y, 0), h - view.height) : 0)
