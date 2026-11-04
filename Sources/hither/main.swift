@@ -601,10 +601,11 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
                 guard !native, let w = window, !w.styleMask.contains(.fullScreen), !w.inLiveResize, remoteSize.width > 0 else { return }
                 let room = self.room(w)
                 if remoteSize.width <= room.width && remoteSize.height <= room.height { return snap(w, to: remoteSize) }   // 1:1
-                // too big to show 1:1 (the screen there isn't dark, so it keeps its mode): its shape, no bigger
+                // bigger than this screen has room for (no mode fit well, or the screen there isn't dark and keeps its
+                // own): scaled down, its shape, no bigger than the window
                 let cur = w.contentLayoutRect.size, k = min(cur.width / remoteSize.width, cur.height / remoteSize.height)
-                let shape = CGSize(width: (remoteSize.width * k).rounded(), height: (remoteSize.height * k).rounded())
-                if abs(shape.width - cur.width) > 1 || abs(shape.height - cur.height) > 1 { w.setContentSize(shape) }
+                let shape = CGSize(width: (remoteSize.width * k).rounded(.down), height: (remoteSize.height * k).rounded(.down))
+                if abs(shape.width - cur.width) > 1 || abs(shape.height - cur.height) > 1 { snap(w, to: shape) }
                 return
             }
             guard let w = window, !w.inLiveResize, !w.styleMask.contains(.fullScreen), w.contentLayoutRect.size != fit(remoteSize) else { return }
