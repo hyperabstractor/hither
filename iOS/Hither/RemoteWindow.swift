@@ -4,17 +4,22 @@ import os
 import Shared
 import UIKit
 
-/// What's on screen: one Mac window, or the Mac's whole Desktop, over its own connection. Like a proxy window on the
-/// Mac, minus the window: it asks the Mac to size the real window to fit ("restore" puts it back when the connection
-/// ends), and it reconnects after a Wi-Fi blip or when the app comes back to the front. It can switch to another
-/// window of the same Mac (a new one the app opened, or one picked from the Windows menu); when the one shown closes,
-/// it goes back to the one before.
+/// A session: one Mac window, or the Mac's whole Desktop, over its own connection. Like a proxy window on the Mac,
+/// minus the window: it asks the Mac to size the real window to fit ("restore" puts it back when the connection
+/// ends), and it reconnects after a Wi-Fi blip or when it's shown again. What it shows stays the same for as long as
+/// it's open (another window is another session: Sessions).
+///
+/// Sessions says where it is (`place`): on screen, it takes input and plays sound if it's the one used last; hidden,
+/// it lets go of input and the Mac stops sending it video and sound, and after a while (or in the background) it
+/// hangs up, keeping its zoom and what it shows, to reconnect when it's shown again.
 ///
 /// Video comes over UDP once the host's datagrams get through (the shared VideoLink), else over TCP; input goes over
 /// both, numbered, and the host applies each once, in order.
-final class RemoteWindow: ObservableObject {
+final class RemoteWindow: ObservableObject, Identifiable {
+    let id: UUID
     let mac: Peer
     weak var macs: Macs?
+    weak var sessions: Sessions?
     private(set) var item: Item       // a window (its ID pins it), an app (ID 0: its main window) or the Desktop
     var isDesktop: Bool { item.bundle == desktopApp }
     /// The window's ID, or the Mac display's for a Desktop (which can change: displays come and go over there).
@@ -23,9 +28,15 @@ final class RemoteWindow: ObservableObject {
     @Published var title = ""
     @Published var status = "Connecting…"   // empty while the picture is live
     @Published var latency = ""
-    @Published var closed = false           // gone on the Mac, or never found: leave the stream screen
-    /// Showing something else now: the controls follow.
-    var onSwitch: () -> Void = {}
+    @Published private(set) var closed = false   // closed here, gone on the Mac, or never found
+    @Published private(set) var place = SessionPlace.parked(since: CACurrentMediaTime())
+    @Published private(set) var paused = false   // hung up on purpose (hidden a while, or in the background)
+    /// It plays the Mac app's sound (Sessions picks the one on screen used last).
+    var audioOwner = false { didSet { if audioOwner != oldValue { tellHost() } } }
+    /// The controller showing it, if any: one at a time (a view is in one place only).
+    weak var attached: AnyObject?
+    /// The scale of the screen it's shown on (2 or 3 = Retina), while it isn't in a window to ask.
+    var sceneScale: Double
 
     private var wire: Wire?
     private let activeWire = OSAllocatedUnfairLock<ObjectIdentifier?>(initialState: nil)   // video and audio arrive off main
@@ -40,14 +51,17 @@ final class RemoteWindow: ObservableObject {
     private var shapeLater: DispatchWorkItem?
     private var retries = 0
     private var host = ""                    // the name this connection dialed (see Reach)
-    private var done = false, paused = false
+    private var done = false
     private(set) var lastInputAt = -Double.infinity
-    private var history: [Item] = []         // shown before, newest last: where to go back to
+    private var sentVisible: Bool?, sentAudio: Bool?   // what the host was told on this connection
+    private var reconnectWhenShown = false   // hidden when the codec changed: the new one, once it's looked at
+    private var refitUntil = 0.0             // a duplicate closed: a size change before this is the Mac putting it back
     private var menuSeq: UInt32 = 0
     private var menuReplies: [UInt32: ([MenuEntry]?) -> Void] = [:]
 
-    init(mac: Peer, item: Item, macs: Macs?) {
-        self.mac = mac; self.item = item; self.macs = macs
+    init(id: UUID, mac: Peer, item: Item, macs: Macs?, sessions: Sessions?, scale: Double) {
+        self.id = id; self.mac = mac; self.item = item; self.macs = macs; self.sessions = sessions
+        sceneScale = scale
         windowID = item.id
         title = Self.title(of: item, on: mac)
         view.send = { [weak self] in self?.send($0) }
@@ -61,11 +75,11 @@ final class RemoteWindow: ObservableObject {
         item.bundle == desktopApp ? "\(mac.name) Desktop" : item.title.isEmpty ? item.app : item.title
     }
 
-    /// The display this device is on: 2 or 3 = Retina, so the host may capture at 2x (and pick HiDPI modes).
-    static var screenScale: Double {
-        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
-        return Double(scene?.traitCollection.displayScale ?? 2)
-    }
+    /// The display it's shown on: 2 or 3 = Retina, so the host may capture at 2x (and pick HiDPI modes).
+    var screenScale: Double { view.window.map { Double($0.screen.scale) } ?? sceneScale }
+
+    /// The same thing to Sessions: what it shows, on which Mac.
+    var target: SessionTarget { SessionTarget(mac: mac.id, bundle: item.bundle, window: isDesktop ? windowID : item.id) }
 
     // MARK: Desktop: Adaptive or Native
 
@@ -134,9 +148,10 @@ final class RemoteWindow: ObservableObject {
         // No "hevc422": this device may not decode HEVC 4:2:2. LTR only while the Mac's codec is H.264: the host
         // keeps H.264 for a viewer that takes LTR, and the codec chosen here should mean what it says.
         askedLTR = (macs?.codec[mac.id] ?? "h264") == "h264"
+        reconnectWhenShown = false   // this connection asks for the codec as it is now
         var m = Msg("open"); m.app = item.bundle; m.k = windowID
         m.caps = ["hevc", "audio", "restore", "udp", "twice"] + (askedLTR ? ["ltr"] : [])
-        m.scale = Self.screenScale
+        m.scale = screenScale
         w.send(m)
         Reach.giveUpLater(on: w)
     }
@@ -149,7 +164,11 @@ final class RemoteWindow: ObservableObject {
             inputN &+= 1
             m.n = inputN
             link?.sendInput(m)
-            if m.t != "mouse" || m.k != 0 { lastInputAt = CACurrentMediaTime() }   // hovering isn't doing anything
+            // hovering isn't doing anything, nor is letting go of what's held (hidden, closing, its window inactive)
+            if (m.t != "mouse" || m.k != 0) && !view.lettingGo {
+                lastInputAt = CACurrentMediaTime()
+                if place.shown { sessions?.touched(self) }
+            }
         }
         w.send(m)
     }
@@ -223,14 +242,19 @@ final class RemoteWindow: ObservableObject {
             status = ""
             if !isDesktop { if let t = m.title, !t.isEmpty { title = t } else if let a = m.app { title = a } }
             view.remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
-            AudioOut.shared.claim(ObjectIdentifier(self))
-            if isDesktop {
-                sendShape()
-            } else {
-                send(Msg("focus"))   // bring it to the front on the Mac, so the first tap and key land there
-                resize(view.wantSize)
+            tellHost()
+            sessions?.resolved(self)   // the same window or display already open in another session: that one stays
+            guard !done else { return }
+            fitHost()
+        case "size":
+            let s = CGSize(width: m.w ?? 0, height: m.h ?? 0)
+            view.remoteSize = s
+            // put back by a duplicate's ending (fitAgain): ask again, once
+            if !isDesktop, CACurrentMediaTime() < refitUntil, let r = requested, r != s {
+                refitUntil = 0
+                requested = nil
+                fitHost()
             }
-        case "size": view.remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
         case "title": if !isDesktop, let t = m.title, !t.isEmpty { title = t }
         case "closed": log(m.title ?? "closed"); gone()
         case "udpoff": fellBackToTCP()
@@ -240,9 +264,31 @@ final class RemoteWindow: ObservableObject {
         }
     }
 
+    /// On screen with a connection that has its window: bring it forward on the Mac (so the first tap and key land
+    /// there) and ask for it at this view's size; a Desktop says its shape. The size comes from where the view is
+    /// shown: one not laid out there yet (just shown again) says it once it is, not the size it had elsewhere.
+    private func fitHost() {
+        guard opened, place.shown else { return }
+        if !isDesktop { send(Msg("focus")) }
+        guard view.window != nil, view.bounds.width > 0 else { return view.setNeedsLayout() }
+        if isDesktop { sendShape() } else { resize(view.wantSize) }
+    }
+
+    /// A duplicate session on this window closed, and the Mac puts the window back as that one found it, at some
+    /// point: ask for this one's size again now, and if the window then changes from it (in the next few seconds),
+    /// once more. Only once: an app that won't take the size isn't fought over.
+    func fitAgain() {
+        requested = nil
+        shaped = nil
+        refitUntil = CACurrentMediaTime() + 5
+        fitHost()
+    }
+
     /// Ask for the window at this size. If the app won't go that small, the picture is scaled to fit instead.
-    /// A Desktop is never resized: its shape goes to the host as "adapt" instead.
+    /// A Desktop is never resized: its shape goes to the host as "adapt" instead. Not while hidden: it's laid out
+    /// for wherever it's shown next.
     func resize(_ s: CGSize) {
+        guard place.shown else { return }
         if isDesktop { return shapeSoon() }
         guard opened, s.width > 0, s.height > 0, s != requested else { return }
         requested = s
@@ -262,72 +308,41 @@ final class RemoteWindow: ObservableObject {
     /// A Desktop: Adaptive tells the host this view's size (all the room there is, at this screen's scale), and a
     /// dark display there takes the mode nearest it; Native says to keep its own. The host answers with "size".
     func sendShape() {
-        guard isDesktop, opened, let w = wire else { return }
+        guard isDesktop, opened, place.shown, let w = wire else { return }
         let s = CGSize(width: view.bounds.width.rounded(.down), height: view.bounds.height.rounded(.down))
         guard native || (s.width > 0 && s.height > 0) else { return }
         if let last = shaped, last.native == native, native || last.size == s { return }
         shaped = (s, native)
         var m = Msg("adapt")
-        if !native { m.w = s.width; m.h = s.height; m.x = s.width; m.y = s.height; m.scale = Self.screenScale }
+        if !native { m.w = s.width; m.h = s.height; m.x = s.width; m.y = s.height; m.scale = screenScale }
         w.send(m)
     }
 
-    // MARK: switching
-
-    /// Show `new` (another window or app of this Mac, or its Desktop) instead. The one shown now is let go (the Mac
-    /// puts it back to its own size) and remembered, to go back to when `new` closes.
-    func show(_ new: Item, remember: Bool = true) {
-        guard !done else { return }
-        let same = new.bundle == item.bundle && (new.bundle == desktopApp || (new.id != 0 && new.id == windowID))
-        guard !same else { return }
-        if remember, opened {
-            history.removeAll { $0.bundle == item.bundle && $0.id == item.id }
-            history.append(item)
-            if history.count > 10 { history.removeFirst() }
-        }
-        view.releaseInput()
-        drop()
-        item = new
-        windowID = new.id
-        title = Self.title(of: new, on: mac)
-        status = "Connecting…"
-        latency = ""
-        retries = 0
-        view.reset()
-        configureView()
-        if !isDesktop { macs?.remember(new, on: mac) }
-        onSwitch()
-        connect()
-    }
+    // MARK: new windows, closing
 
     /// New windows on the Mac (Cmd-N, File › New Window, a link that opened a browser): show the newest, as a Mac
-    /// would open it in front, but only if they came from what was done here just now and a window is shown. On a
-    /// Desktop they're already in the picture.
+    /// would open it in front, if it came from what was done here just now. It's a session of its own (this one
+    /// stays open, a tap away in Sessions); one already open comes forward. On a Desktop they're in the picture.
     func appeared(_ items: [Item]) {
-        guard !isDesktop, opened, CACurrentMediaTime() - lastInputAt < 15,
+        guard !isDesktop, opened, place.shown, CACurrentMediaTime() - lastInputAt < 15,
               let new = items.last(where: { $0.id != windowID }) else { return }
-        macs?.flash("\(new.app) opened a window: showing it. Windows goes back.")
-        show(new)
+        macs?.flash("\(new.app) opened a window: showing it. Sessions goes back.")
+        sessions?.follow(new, from: self)
     }
 
-    /// What's shown closed on the Mac, or was never found: back to what was shown before, if it's still open there.
+    /// What's shown closed on the Mac, or was never found: this session closes (Sessions shows what was shown before).
     private func gone() {
-        let open = macs?.windows[mac.id] ?? []
-        while let previous = history.popLast() {
-            guard previous.bundle == desktopApp || previous.id == 0 || open.contains(where: { $0.id == previous.id }) else { continue }
-            macs?.flash("\(title) closed")
-            return show(previous, remember: false)
-        }
+        macs?.flash("\(title) closed")
         finish()
     }
 
-    /// The Mac's codec changed. One that asked for LTR stays H.264 there, so ask again without it.
+    /// The Mac's codec changed. One that asked for LTR stays H.264 there, so ask again without it: now if it's on
+    /// screen, else when it's next shown (a hidden one isn't woken for it).
     func codecChanged(_ codec: String) {
         guard askedLTR, codec != "h264", wire != nil, !done, !paused else { return }
-        view.releaseInput()
-        drop()
+        guard place.shown else { reconnectWhenShown = true; return }
         status = "Switching codec…"
-        connect()
+        reconnect()
     }
 
     // MARK: the app's menus
@@ -349,17 +364,84 @@ final class RemoteWindow: ObservableObject {
         lastInputAt = CACurrentMediaTime()   // File › New Window and the like are the user's doing
     }
 
-    // MARK: lifecycle
+    // MARK: where it is
 
-    /// In the background iOS suspends the app and its connections. Hang up cleanly instead (the Mac puts the window
-    /// back) and open it again on return.
-    func pause() {
-        view.releaseInput()
-        paused = true
-        drop()
+    /// Sessions moved it (shown, hidden, background) or time passed: input, connection and what the host sends
+    /// follow. Hiding lets go of whatever's held and puts the keyboard away, and nothing resizes while hidden.
+    func move(to p: SessionPlace, now: Double) {
+        guard !done else { return }
+        let wasShown = place.shown, wasPaused = paused
+        if p != place { place = p }
+        if wasShown && !p.shown {
+            view.releaseInput()
+            if view.isFirstResponder { _ = view.resignFirstResponder() }
+            shapeLater?.cancel()
+            shapeLater = nil
+        }
+        switch SessionBook.connection(p, now: now) {
+        case .connect: if paused { resume() }
+        case .drop: if !paused { pause() }
+        case .keep: break
+        }
+        if p.shown && !wasShown && !wasPaused { revealed() }   // after a pause it has a new connection already
+        tellHost()
     }
 
-    func resume() {
+    /// Shown again. The picture carries on from the one there if the decoder still has it (the Mac sends what changed
+    /// meanwhile); one that failed while hidden, or a codec change waiting, takes a new connection, which starts with
+    /// a whole frame. A Mac it gave up on reaching is tried again.
+    private func revealed() {
+        guard !paused else { return }
+        if wire == nil {
+            guard retries >= 30 else { return }   // a reconnect is on its way
+            retries = 0
+            status = "Connecting…"
+            return connect()
+        }
+        if reconnectWhenShown || view.pictureFailed {
+            reconnectWhenShown = false
+            status = "Reconnecting…"
+            return reconnect()
+        }
+        fitHost()
+    }
+
+    /// The host sends this connection video and sound only while it's on screen, and sound only to the one Sessions
+    /// picked: a hidden session costs the Mac no encoding and the network nothing but keepalives.
+    private func tellHost() {
+        guard opened, let w = wire else { return }
+        let visible = place.shown, audio = visible && audioOwner
+        if sentVisible != visible {
+            var m = Msg("visible"); m.down = visible
+            w.send(m)
+            sentVisible = visible
+        }
+        if sentAudio != audio {
+            var m = Msg("audio"); m.down = audio
+            w.send(m)
+            sentAudio = audio
+        }
+    }
+
+    private func reconnect() {
+        view.releaseInput()
+        drop()
+        connect()
+    }
+
+    /// Hang up, keeping what it shows and its zoom, to connect again when it's shown (`move`). Low on memory, the
+    /// picture goes too: the next connection starts with a whole frame.
+    func pause(droppingPicture: Bool = false) {
+        guard !done else { return }
+        if !paused {
+            view.releaseInput()
+            paused = true
+            drop()
+        }
+        if droppingPicture { view.dropPicture() }
+    }
+
+    private func resume() {
         guard paused else { return }
         paused = false
         retries = 0
@@ -367,13 +449,24 @@ final class RemoteWindow: ObservableObject {
         connect()
     }
 
+    /// Closed (here, or on the Mac): hang up for good and leave Sessions.
     func finish() {
         guard !done else { return }
         view.releaseInput()
         done = true
         closed = true
         drop()
-        AudioOut.shared.release(ObjectIdentifier(self), next: nil)
+        // the sound goes to the next session on screen, or nobody, through Sessions' one handover (which drops what
+        // this one had queued)
+        if let sessions { sessions.ended(self) } else { AudioOut.shared.hand(to: nil) }
+    }
+
+    /// What it's doing, in a few words, for lists.
+    var summary: String {
+        if closed { return "Closed" }
+        if paused { return place == .background ? "Disconnected in the background" : "Suspended: reconnects when opened" }
+        if !status.isEmpty { return status }
+        return place.shown ? latency.isEmpty ? "Connected" : "Connected · \(latency)" : "Hidden, still connected"
     }
 
     /// Hang up this connection: everything that belonged to it goes too (video link, pending shape and menu replies,
@@ -384,6 +477,8 @@ final class RemoteWindow: ObservableObject {
         shapeLater?.cancel()
         shapeLater = nil
         opened = false
+        sentVisible = nil
+        sentAudio = nil
         view.live = false
         let w = wire
         wire = nil

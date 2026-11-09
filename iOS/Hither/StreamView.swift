@@ -111,9 +111,10 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         keys.onHide = { [weak self] in _ = self?.resignFirstResponder() }
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardChanged(_:)),
                                                name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
-        // switching apps, Control Center, a call: nothing may stay pressed on the Mac
-        NotificationCenter.default.addObserver(self, selector: #selector(resignedActive),
-                                               name: UIApplication.willResignActiveNotification, object: nil)
+        // its window's scene going inactive (switching apps, Control Center, a call): nothing may stay pressed on the
+        // Mac. Only its own: another window of this app can be in front meanwhile.
+        NotificationCenter.default.addObserver(self, selector: #selector(resignedActive(_:)),
+                                               name: UIScene.willDeactivateNotification, object: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -121,7 +122,14 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        if window == nil { stopGlide(); endScroll() }   // closing, or gone from the screen: nothing may keep scrolling
+        if window == nil {   // closing, or gone from the screen: nothing may keep scrolling
+            lettingGo = true
+            stopGlide()
+            endScroll()
+            lettingGo = false
+        } else {
+            setNeedsLayout()   // shown (again): its size, from where it is now, goes to the Mac (layoutSubviews)
+        }
     }
 
     /// Pinch and two-finger drags go together; and a one-finger scroll that started a moment before the second finger
@@ -187,20 +195,14 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         meter(seq)
     }
 
-    /// Showing something else now (another window, the Desktop): no trace of the last one.
-    func reset() {
-        releaseInput()
-        stopGlide(sending: false)
+    /// The decoder gave up (iOS can take it away from a picture that's off screen): only a new stream fixes it.
+    var pictureFailed: Bool { video.sampleBufferRenderer.status == .failed }
+
+    /// Low on memory while hidden: let the decoder and the picture go. Zoom stays; the next stream starts afresh.
+    func dropPicture() {
         video.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         depacketizer = Depacketizer()
-        remoteSize = .zero
-        zoom = nil
-        offset = .zero
-        focus = nil
-        lastTap = nil
         sentAt = [:]
-        samples = []
-        setNeedsLayout()
     }
 
     /// key→frame: time from sending a key to the first frame the host captured after typing it.
@@ -574,6 +576,15 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         return !pressed.isEmpty
     }
 
+    /// A shortcut exactly as given (Keymap.shortcut), sent on its own: what's latched on the bar above the keyboard
+    /// stays for the next key, and modifiers held on a hardware keyboard don't join in. False without a session.
+    func shortcut(_ key: Int, modifiers: [Int]) -> Bool {
+        guard live else { return false }
+        stopGlide()
+        Keymap.shortcut(key, modifiers: modifiers, held: heldModifiers.sorted(), capsLock: capsLock).forEach(send)
+        return true
+    }
+
     private func keyDown(_ code: Int, repeating: Bool, held: UInt64) {
         guard live else { return }
         var d = Msg("key"); d.k = code; d.down = true; d.f = hardwareFlags | held | keys.take() | Keymap.implicitFlags(code)
@@ -609,8 +620,13 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         }
     }
 
+    /// Sending what letting go takes (key and button ups, a scroll's end): not input of the user's own.
+    private(set) var lettingGo = false
+
     /// Let go of everything this view holds down on the Mac: keys, modifiers, a mouse button, a touch-and-hold drag.
     func releaseInput() {
+        lettingGo = true
+        defer { lettingGo = false }
         stopGlide()
         endScroll()
         repeatTimer?.invalidate(); repeatTimer = nil
@@ -639,7 +655,10 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         holding = nil
     }
 
-    @objc private func resignedActive() { releaseInput() }
+    @objc private func resignedActive(_ n: Notification) {
+        guard let scene = window?.windowScene, n.object as? UIScene === scene else { return }
+        releaseInput()
+    }
 }
 
 /// Drives a glide once a frame without the display link (which keeps its target) keeping the view.

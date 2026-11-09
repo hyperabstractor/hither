@@ -87,8 +87,9 @@ and a submenu named after it with Clipboard, Keep Screen Dark, Lock, Video Codec
 
 ## iPhone and iPad
 
-`iOS/Hither.xcodeproj` is a viewer for iPhone and iPad. It shares nothing; it shows one of your Mac's windows, or its
-whole Desktop, at a time, full screen. The Mac sizes a window to fit the viewer and puts it back when you leave.
+`iOS/Hither.xcodeproj` is a viewer for iPhone and iPad. It shares nothing; it shows your Macs' windows, or their
+whole Desktops, full screen, as sessions you switch between. The Mac sizes a window to fit the viewer and puts it back
+when you leave.
 
 - Open `iOS/Hither.xcodeproj` in Xcode. Select your team under Signing & Capabilities, select the connected iPhone
   or iPad as the run destination, and run the Hither scheme. Enable Developer Mode on the device if prompted.
@@ -99,7 +100,7 @@ whole Desktop, at a time, full screen. The Mac sizes a window to fit the viewer 
 - **Each Mac** has its Desktop, its open windows and All Apps (apps you opened lately first), and a ⋯ menu beside
   its name: Send and Get Clipboard, Send Files, Keep Screen Dark, Lock, Video Codec (H.264 or HEVC, for every
   window that Mac sends) and Unpair. Keep Screen Dark works as on a Mac: the Mac's own monitors show black while you
-  use it from here, and it locks 2 minutes after you close the last window.
+  use it from here, and it locks 2 minutes after its last session closes or hangs up.
 - **Touch:** tap to click (tap again quickly for a double click), two-finger tap to right-click, drag to scroll
   (flick and it glides on; touch to stop it), touch and hold then drag to select or move things.
 - **Mouse and trackpad** on an iPad: point, click, secondary-click, drag and scroll as on a Mac.
@@ -112,15 +113,30 @@ whole Desktop, at a time, full screen. The Mac sizes a window to fit the viewer 
   only while Keep Screen Dark is on, and its windows rearrange to fit.
 - **Window size:** Actual Size maps one Mac point to one viewer point when the window fits. More Space fits more
   in with smaller text.
-- **Menus and windows:** the menu bar button shows the app's menus, read from the Mac when you open them. The
-  windows button switches to the Mac's Desktop, another open window or a recent app. When the app opens a new window
-  because of what you did (⌘N, a link), it's shown instead, and when that closes you're back where you were.
+- **Sessions:** each Desktop or window you open is a session with its own connection, and several can be open at
+  once, on the same Mac or different ones. The Sessions button (with how many are open) lists them: tap one to
+  switch to it, with its zoom where you left it. It also opens more of this Mac (its Desktop, open windows, recent
+  apps) as sessions of their own, and Home opens anything else; what's open stays open. Opening something already
+  open goes to its session. Close (✕) closes only this session and shows the one you had before it, or Home. Home
+  lists what's open, with Close (swipe) and Close All. When the app opens a new window because of what you did (⌘N,
+  a link), it's shown as a session of its own; closing it goes back. Unpairing a Mac closes its sessions.
+- **Hidden sessions** stay connected but send nothing: the Mac stops encoding them. Sound plays from one session:
+  the one on screen you used last, in the window you're using (with two side by side, the one you tapped into).
+  After 5 minutes hidden, a session hangs up (Home says Suspended) and reconnects when you open it, where you left
+  it. Sending the app to the background hangs up every session at once; coming back reconnects what's on screen. A Mac with Keep Screen Dark on locks 2 minutes after its last session hangs up or closes, so a forgotten
+  hidden session delays that by up to 5 minutes, not forever.
+- **iPad windows:** Hither can have several windows (Split View, Stage Manager), each showing a session of its own;
+  touch and hold a session or anything to open in Home for **Open in New Window**. A session is in one window at a
+  time: opening it from another brings its window forward. Closing a window closes the session it showed.
+- **Menus:** the menu bar button shows the app's menus, read from the Mac when you open them.
+- **Switch app:** on a Desktop, the ⌘⇥ button is a quick Command-Tab: it goes to the app used before, and tapping it
+  again goes back.
 - **Clipboard and files:** Send Clipboard puts text, rich text or an image from here on the Mac (iOS asks once
   whether Hither may paste). Get Clipboard brings the Mac's back; files copied in Finder come too, into Files ›
   On My iPad (or iPhone) › Hither, with a button to share or save them elsewhere. Send Files puts files you pick in
   the Mac's Downloads and on its clipboard. Copies show progress and can be cancelled.
 - **Controls:** the stream fills the screen, and the controls float over it as one round button in a corner. Tap it
-  for keyboard, menus, windows, size, ⋯ and Close; tap again to tuck them away. Drag it to move them to another
+  for keyboard, menus, sessions, size, ⋯ and Close; tap again to tuck them away. Drag it to move them to another
   corner. Opening and closing them never changes the stream's size.
 
 ## How it works
@@ -167,6 +183,10 @@ applies each once and in order, whether its UDP or TCP copy arrives first.
   macOS locks a Mac when a Screen Sharing session ends; to stop that, run
   `sudo defaults write /Library/Preferences/com.apple.RemoteManagement RestoreMachineState -bool NO`.
 - Keep Screen Dark blacks out the picture, not the Mac: its own keyboard and mouse still work while you use it.
+- iPhone and iPad sessions: a hidden one still holds its Mac window at this device's size, and the Mac still
+  captures it (it only stops encoding), until it hangs up. Sessions aren't kept when iOS quits the app; a window it
+  brings back opens at Home. Opening an app (rather than one of its windows) shows a session already open on any of
+  its windows.
   It only covers the session on the monitors; another user can't log in there at the same time.
 - Audio is captured before the host's volume control. Mute the host if you only want sound on this Mac.
 - The clipboard only moves on Send or Get Clipboard, never by itself. Copied files skip symlinks and special files,

@@ -2,20 +2,18 @@ import Shared
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Each paired Mac: its Desktop, its open windows (tap one to show it), its apps and its settings; and Macs nearby
-/// to pair with.
+/// The sessions open (tap one to go back to it), each paired Mac (its Desktop, its open windows and its apps, to open
+/// as sessions, and its settings), and Macs nearby to pair with.
 struct HomeView: View {
     @ObservedObject var macs: Macs
-    @State private var showing: Showing?
+    @ObservedObject var sessions: Sessions
+    @ObservedObject var scene: SceneModel
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.supportsMultipleWindows) private var multipleWindows
     @State private var askingAddress = false
     @State private var address = ""
     @State private var locking: MacRef?
     @State private var sendingFiles: MacRef?
-
-    struct Showing: Identifiable {
-        let id = UUID()
-        let mac: Peer, item: Item
-    }
 
     /// A paired Mac, for sheets and dialogs about it.
     struct MacRef: Identifiable {
@@ -28,6 +26,7 @@ struct HomeView: View {
     var body: some View {
         NavigationStack {
             List {
+                if !sessions.all.isEmpty { openSessions }
                 ForEach(macs.paired, id: \.id) { mac in section(mac) }
                 let unpaired = macs.nearby.filter { n in !macs.paired.contains { $0.id == n.id } }
                 if macs.paired.isEmpty || !unpaired.isEmpty || macs.noLocalNetwork {
@@ -101,21 +100,29 @@ struct HomeView: View {
         .sheet(item: $sendingFiles) { ref in
             DocumentPicker { urls in macs.sendFiles(urls, to: ref.mac, cleanup: urls) }.ignoresSafeArea()
         }
-        .fullScreenCover(item: $showing, onDismiss: { macs.refresh() }) { StreamScreen(macs: macs, mac: $0.mac, item: $0.item) }
+        // the session this window shows, over Home; switching to another keeps it up
+        .fullScreenCover(isPresented: Binding(get: { scene.shown != nil }, set: { if !$0 { sessions.home(scene) } }),
+                         onDismiss: { macs.refresh() }) {
+            if let w = scene.shown { StreamScreen(macs: macs, sessions: sessions, scene: scene, window: w).id(w.id) }
+        }
         #if DEBUG
         .onAppear(perform: testOpen)
         #endif
     }
 
     #if DEBUG
-    /// Test hook: HITHER_TEST_OPEN=mini/@desktop (or mini/com.apple.TextEdit) opens that stream at launch, so it can be
-    /// checked without tapping. A name that isn't paired opens one that can't connect: the controls, laid out.
+    /// Test hook: HITHER_TEST_OPEN=mini/@desktop (or mini/com.apple.TextEdit) opens that session at launch, so it can
+    /// be checked without tapping; several, comma-separated, open one after another (the last shown), and "home" goes
+    /// Home. A name that isn't paired opens one that can't connect: the controls, laid out.
     func testOpen() {
-        guard let spec = ProcessInfo.processInfo.environment["HITHER_TEST_OPEN"], showing == nil else { return }
-        let parts = spec.split(separator: "/", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return }
-        let mac = macs.paired.first { $0.name == parts[0] } ?? Peer(id: "test-\(parts[0])", name: parts[0], token: Data(count: 32))
-        show(parts[1] == desktopApp ? Self.desktop : Item(id: 0, app: parts[1], bundle: parts[1], title: ""), on: mac)
+        guard let spec = ProcessInfo.processInfo.environment["HITHER_TEST_OPEN"], sessions.all.isEmpty else { return }
+        for one in spec.split(separator: ",").map(String.init) {
+            if one == "home" { sessions.home(scene); continue }
+            let parts = one.split(separator: "/", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let mac = macs.paired.first { $0.name == parts[0] } ?? Peer(id: "test-\(parts[0])", name: parts[0], token: Data(count: 32))
+            show(parts[1] == desktopApp ? Self.desktop : Item(id: 0, app: parts[1], bundle: parts[1], title: ""), on: mac)
+        }
     }
     #endif
 
@@ -126,6 +133,7 @@ struct HomeView: View {
             Button { show(Self.desktop, on: mac) } label: {
                 AppRow(item: Self.desktop, icon: nil, symbol: "display", detail: "Its whole screen: menu bar, Dock and every window")
             }
+            .contextMenu { newWindowButton(Self.desktop, on: mac) }
             if macs.stopsSharing(mac) {
                 Text("\(mac.name) isn't sharing its windows. Turn on Share This Mac in Hither's menu there.")
                     .foregroundStyle(.secondary)
@@ -136,8 +144,9 @@ struct HomeView: View {
             ForEach(windows, id: \.id) { w in
                 Button { show(w, on: mac) } label: { AppRow(item: w, icon: macs.icons[w.bundle], detail: w.title) }
                     .swipeActions { Button("Close", role: .destructive) { macs.close(w, on: mac) } }
+                    .contextMenu { newWindowButton(w, on: mac) }
             }
-            NavigationLink("All Apps") { AppsView(macs: macs, mac: mac) { show($0, on: mac) } }
+            NavigationLink("All Apps") { AppsView(macs: macs, mac: mac, open: { show($0, on: mac) }, openInNewWindow: multipleWindows ? { openInNewWindow($0, on: mac) } : nil) }
         } header: {
             HStack {
                 Text(mac.name)
@@ -148,7 +157,7 @@ struct HomeView: View {
             .textCase(nil)
         } footer: {
             if dark {
-                Text("Keep Screen Dark is on: \(mac.name)'s own monitors show black while you use it from here, and it locks 2 minutes after you close the last window.")
+                Text("Keep Screen Dark is on: \(mac.name)'s own monitors show black while you use it from here, and it locks 2 minutes after its last session closes or hangs up.")
             }
         }
     }
@@ -189,9 +198,62 @@ struct HomeView: View {
         .accessibilityLabel("\(mac.name) settings")
     }
 
-    func show(_ item: Item, on mac: Peer) {
-        macs.remember(item, on: mac)
-        showing = Showing(mac: mac, item: item)
+    /// Open: its session if one is open, else a new one. This window shows it (what it showed stays open).
+    func show(_ item: Item, on mac: Peer) { sessions.open(item, on: mac, in: scene) }
+
+    // MARK: sessions
+
+    /// What's open, in this window and others: tap one to show it here; close one, or all.
+    var openSessions: some View {
+        Section {
+            ForEach(sessions.all) { w in
+                let elsewhere = sessions.elsewhere(w, from: scene)
+                Button { sessions.show(w, in: scene) } label: {
+                    SessionRow(window: w, icon: w.isDesktop ? nil : macs.icons[w.item.bundle], elsewhere: elsewhere,
+                               macName: macs.paired.count > 1 ? w.mac.name : nil)
+                }
+                .swipeActions { Button("Close", role: .destructive) { sessions.close(w) } }
+                .contextMenu {
+                    if multipleWindows && !elsewhere {
+                        Button("Open in New Window", systemImage: "macwindow.badge.plus") { openWindow(value: w.id) }
+                    }
+                    Button("Close", systemImage: "xmark", role: .destructive) { sessions.close(w) }
+                }
+            }
+            if sessions.all.count > 1 {
+                Button("Close All", role: .destructive) { sessions.closeAll() }
+            }
+        } header: {
+            Text("Open")
+        } footer: {
+            Text("A session you're not looking at stays connected for 5 minutes, then hangs up until you open it again. With Keep Screen Dark on, a Mac locks 2 minutes after its last session hangs up or closes.")
+        }
+    }
+
+    @ViewBuilder func newWindowButton(_ item: Item, on mac: Peer) -> some View {
+        if multipleWindows {
+            Button("Open in New Window", systemImage: "macwindow.badge.plus") { openInNewWindow(item, on: mac) }
+        }
+    }
+
+    /// In a window of its own (iPad); already shown in one, that window comes forward.
+    func openInNewWindow(_ item: Item, on mac: Peer) {
+        let w = sessions.session(for: item, on: mac, scale: scene.scale)
+        if sessions.elsewhere(w, from: scene) { sessions.show(w, in: scene) } else { openWindow(value: w.id) }
+    }
+}
+
+/// An open session in Home: what it shows, and how it is.
+struct SessionRow: View {
+    @ObservedObject var window: RemoteWindow
+    let icon: UIImage?
+    let elsewhere: Bool
+    let macName: String?
+
+    var body: some View {
+        let detail = [macName, elsewhere ? "In another window" : window.summary].compactMap { $0 }.joined(separator: " · ")
+        AppRow(item: Item(id: 0, app: window.title, bundle: window.item.bundle, title: ""), icon: icon,
+               symbol: window.isDesktop ? "display" : nil, detail: detail)
     }
 }
 
@@ -224,6 +286,7 @@ struct AppsView: View {
     @ObservedObject var macs: Macs
     let mac: Peer
     let open: (Item) -> Void
+    var openInNewWindow: ((Item) -> Void)?
     @State private var search = ""
 
     var body: some View {
@@ -235,12 +298,14 @@ struct AppsView: View {
                 Section("Recent") {
                     ForEach(recent, id: \.bundle) { a in
                         Button { open(a) } label: { AppRow(item: a, icon: macs.icons[a.bundle], detail: "") }
+                            .contextMenu { newWindow(a) }
                     }
                 }
             }
             Section(recent.isEmpty ? "" : "All Apps") {
                 ForEach(shown, id: \.bundle) { a in
                     Button { open(a) } label: { AppRow(item: a, icon: macs.icons[a.bundle], detail: "") }
+                        .contextMenu { newWindow(a) }
                 }
             }
         }
@@ -248,6 +313,10 @@ struct AppsView: View {
         .searchable(text: $search)
         .navigationTitle("Apps on \(mac.name)")
         .onAppear { if apps.isEmpty { macs.loadApps(mac) } }
+    }
+
+    @ViewBuilder func newWindow(_ a: Item) -> some View {
+        if let openInNewWindow { Button("Open in New Window", systemImage: "macwindow.badge.plus") { openInNewWindow(a) } }
     }
 }
 

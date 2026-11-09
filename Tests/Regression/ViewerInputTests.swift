@@ -137,3 +137,38 @@ private extension Optional {
         return self
     }
 }
+
+/// A shortcut sent on its own (Switch app's ⌘⇥) is one complete press of exactly that shortcut, whatever a hardware
+/// keyboard holds, and leaves the Mac's modifiers as that keyboard has them.
+func testShortcut() throws {
+    let cmd = Keymap.command
+    let sends = { (m: [Msg]) in m.map { "\($0.t) \($0.k!) \($0.down.map { $0 ? "down" : "up" } ?? "") \($0.f!)" } }
+    let cmdTab = { (held: [Int], caps: Bool) in Keymap.shortcut(Keymap.tab, modifiers: [Keymap.leftCommand], held: held, capsLock: caps) }
+
+    // nothing held: ⌘ down, Tab down and up with ⌘ only, ⌘ up (so no app switcher stays up)
+    try expectEqual(sends(cmdTab([], false)), ["flags 55  \(cmd)", "key 48 down \(cmd)", "key 48 up \(cmd)", "flags 55  0"])
+
+    // ⇧ and ⌥ held, caps lock on: they're let go of around it, and pressed again after; caps lock stays as it is
+    let caps = Keymap.capsLock
+    try expectEqual(sends(cmdTab([0x38, 0x3A], true)), [
+        "flags 58  \(caps | Keymap.shift)", "flags 56  \(caps)",   // ⌥ up, then ⇧ up
+        "flags 55  \(caps | cmd)",
+        "key 48 down \(caps | cmd)", "key 48 up \(caps | cmd)",
+        "flags 55  \(caps)",
+        "flags 56  \(caps | Keymap.shift)", "flags 58  \(caps | Keymap.shift | Keymap.option)",   // held again
+    ])
+    // whatever's held (⌘ itself included): Tab carries exactly ⌘, every modifier pressed is let go, and only what's
+    // held ends held
+    for held in [[], [0x3B], [0x37], [0x37, 0x3E], [0x38, 0x3A, 0x37]] {
+        let m = cmdTab(held, false)
+        try expectEqual(m.filter { $0.t == "key" }.map(\.f!), [cmd, cmd])
+        try expectEqual(m.filter { $0.t == "key" }.map(\.down!), [true, false])
+        let heldFlags = held.reduce(UInt64(0)) { $0 | Keymap.modifierFlag($1)! }
+        try expectEqual(m.last?.f, heldFlags)
+        var down: [Int: Int] = [:]
+        for f in m where f.t == "flags" {
+            down[f.k!, default: 0] += f.f! & Keymap.modifierFlag(f.k!)! != 0 ? 1 : -1
+        }
+        try expectEqual(down.filter { $0.value != 0 }.keys.sorted(), [])   // each modifier as often up as down
+    }
+}

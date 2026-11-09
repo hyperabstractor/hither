@@ -1,23 +1,20 @@
+import Combine
 import Shared
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-/// One Mac window or a Mac's Desktop, full screen.
+/// One session, full screen: a Mac window or a Mac's Desktop. The session belongs to Sessions: leaving this screen
+/// (Home, another session) leaves it open.
 struct StreamScreen: View {
     @ObservedObject var macs: Macs
-    @StateObject private var window: RemoteWindow
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.scenePhase) private var phase
+    let sessions: Sessions
+    let scene: SceneModel
+    @ObservedObject var window: RemoteWindow
     @State private var transferTop: CGFloat?    // the transfer bar's top, in the window, while it shows
 
-    init(macs: Macs, mac: Peer, item: Item) {
-        self.macs = macs
-        _window = StateObject(wrappedValue: RemoteWindow(mac: mac, item: item, macs: macs))
-    }
-
     var body: some View {
-        StreamControls(window: window, macs: macs, transferTop: transferTop) { dismiss() }
+        StreamControls(window: window, macs: macs, sessions: sessions, scene: scene, transferTop: transferTop)
             .ignoresSafeArea()
             .overlay {
                 if !window.status.isEmpty {
@@ -33,15 +30,6 @@ struct StreamScreen: View {
             .onPreferenceChange(TransferTop.self) { transferTop = $0 }
             .statusBarHidden()
             .persistentSystemOverlays(.hidden)
-            .onAppear { macs.stream = window }
-            .onChange(of: window.closed) { _, closed in if closed { dismiss() } }
-            .onChange(of: phase) { _, p in
-                if p == .background { window.pause() } else if p == .active { window.resume() }
-            }
-            .onDisappear {
-                window.finish()
-                if macs.stream === window { macs.stream = nil }
-            }
     }
 }
 
@@ -51,11 +39,15 @@ struct StreamScreen: View {
 struct StreamControls: UIViewControllerRepresentable {
     let window: RemoteWindow
     let macs: Macs
+    let sessions: Sessions
+    let scene: SceneModel
     let transferTop: CGFloat?
-    let close: () -> Void
 
-    func makeUIViewController(context: Context) -> StreamController { StreamController(window: window, macs: macs, close: close) }
+    func makeUIViewController(context: Context) -> StreamController {
+        StreamController(window: window, macs: macs, sessions: sessions, scene: scene)
+    }
     func updateUIViewController(_ c: StreamController, context: Context) { c.transferTop = transferTop }
+    static func dismantleUIViewController(_ c: StreamController, coordinator: ()) { c.detach() }
 }
 
 /// Where the transfer bar starts, in the window, while it shows.
@@ -75,11 +67,13 @@ private final class PassThroughView: UIView {
 final class StreamController: UIViewController, UIDocumentPickerDelegate {
     let window: RemoteWindow
     let macs: Macs
-    let close: () -> Void
+    let sessions: Sessions
+    let scene: SceneModel
     private var mac: Peer { window.mac }
     private let controls = PassThroughView()
     private var tools: [UIButton] = []           // everything but the handle: shown while open
-    private var menusButton: UIButton!, sizeButton: UIButton!, handle: UIButton!
+    private var menusButton: UIButton!, switchButton: UIButton!, sizeButton: UIButton!, sessionsButton: UIButton!, handle: UIButton!
+    private var counting: AnyCancellable?
     private var expanded = false
     /// The corner the controls keep to: bit 0 = right, bit 1 = bottom. Remembered.
     private var corner = UserDefaults.standard.object(forKey: "controls.corner") as? Int ?? 3
@@ -96,10 +90,11 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
     /// Window sizes on offer, as Mac points per viewer point.
     private let sizes: [(String, Double)] = [("Larger Text", 0.75), ("Actual Size", 1), ("More Space", 1.5), ("Most Space", 2)]
 
-    init(window: RemoteWindow, macs: Macs, close: @escaping () -> Void) {
+    init(window: RemoteWindow, macs: Macs, sessions: Sessions, scene: SceneModel) {
         self.window = window
         self.macs = macs
-        self.close = close
+        self.sessions = sessions
+        self.scene = scene
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -109,21 +104,39 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
         view.backgroundColor = .black
         let v = window.view
         v.scale = UserDefaults.standard.object(forKey: "scale") as? Double ?? 1
+        // the session's one view: here now (a controller that showed it before lets go of it, see detach)
+        window.attached = self
         view.addSubview(v)
         v.onResign = { [weak self] in self?.takeKeys() }
 
         menusButton = menuButton("menubar.rectangle", label: "App menus") { [weak self] in self?.appMenus() ?? [] }
+        sessionsButton = menuButton("rectangle.stack", label: "Sessions") { [weak self] in self?.sessionsMenu() ?? [] }
         sizeButton = menuButton("textformat.size", label: "Window size") { [weak self] in self?.sizeMenu() ?? [] }
+        switchButton = button("", label: "Switch app (Command-Tab)") { [weak self] in self?.switchApp() }
+        var c = switchButton.configuration
+        c?.image = nil
+        c?.title = "⌘⇥"
+        c?.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+            var a = $0
+            a.font = .systemFont(ofSize: 15, weight: .semibold)
+            return a
+        }
+        switchButton.configuration = c
+        switchButton.accessibilityHint = "Switches to the previously used app"
         tools = [
             button("keyboard", label: "Keyboard") { [weak self] in
                 guard let v = self?.window.view else { return }
                 _ = v.isFirstResponder ? v.resignFirstResponder() : v.becomeFirstResponder()
             },
             menusButton,
-            menuButton("rectangle.on.rectangle", label: "Windows") { [weak self] in self?.windowsMenu() ?? [] },
+            sessionsButton,
+            switchButton,
             sizeButton,
             menuButton("ellipsis", label: "More") { [weak self] in self?.moreMenu() ?? [] },
-            button("xmark", label: "Close stream") { [weak self] in self?.close() },
+            button("xmark", label: "Close session") { [weak self] in
+                guard let self else { return }
+                sessions.close(window)   // this one only: the window shows the one shown before it, or Home
+            },
         ]
         handle = button("slider.horizontal.3", label: "Show controls") { [weak self] in self?.toggle() }
         handle.accessibilityHint = "Drag to move the controls to another corner"
@@ -132,8 +145,33 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
         view.addSubview(controls)
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardChanged(_:)),
                                                name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
-        window.onSwitch = { [weak self] in self?.targetChanged() }
         targetChanged()
+        counting = sessions.$all.sink { [weak self] all in self?.countSessions(all.count) }
+    }
+
+    /// Let go of the session's view, unless another controller has it by now; and of its callbacks.
+    func detach() {
+        counting = nil
+        guard window.attached === self else { return }
+        window.attached = nil
+        window.view.onResign = {}
+        if window.view.isFirstResponder { _ = window.view.resignFirstResponder() }
+        if window.view.superview === view { window.view.removeFromSuperview() }
+    }
+
+    /// The Sessions button says how many are open, when there's more than this one.
+    private func countSessions(_ n: Int) {
+        var c = sessionsButton.configuration
+        c?.title = n > 1 ? "\(n)" : nil
+        c?.imagePadding = 4
+        c?.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+            var a = $0
+            a.font = .systemFont(ofSize: 13, weight: .semibold)
+            return a
+        }
+        sessionsButton.configuration = c
+        sessionsButton.accessibilityLabel = n > 1 ? "Sessions, \(n) open" : "Sessions"
+        view.setNeedsLayout()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -154,10 +192,18 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
     private func showTools() {
         for b in tools { b.isHidden = !expanded }
         menusButton.isHidden = !expanded || window.isDesktop
+        switchButton.isHidden = !expanded || !window.isDesktop   // a window's picture doesn't show the app switched to
         var c = handle.configuration
         c?.image = symbol(expanded ? "arrow.down.right.and.arrow.up.left" : "slider.horizontal.3")
         handle.configuration = c
         handle.accessibilityLabel = expanded ? "Hide controls" : "Show controls"
+    }
+
+    /// The app used before this one, as a quick ⌘⇥ at the Mac does: Command goes up with Tab, so there's no
+    /// switcher left up, and tapping again goes back. The controls stay open for that.
+    private func switchApp() {
+        guard window.isDesktop else { return }
+        _ = window.view.shortcut(Keymap.tab, modifiers: [Keymap.leftCommand])
     }
 
     /// Open or close the controls. Only they change: the picture keeps its size, so nothing goes to the Mac.
@@ -328,33 +374,49 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
         return mods + e.key.uppercased()
     }
 
-    /// The Mac's Desktop, its open windows and recent apps: show one instead of what's shown now.
-    private func windowsMenu() -> [UIMenuElement] {
+    /// The sessions open (tap one to show it here), what else this Mac has open or had lately (tap to open it as a
+    /// session too: this one stays open), and Home.
+    private func sessionsMenu() -> [UIMenuElement] {
         [UIDeferredMenuElement.uncached { [weak self] done in
             guard let self else { return done([]) }
-            macs.list(mac) { [weak self] items in
-                guard let self else { return done([]) }
-                let current = window.item
-                let desktop = UIAction(title: "Desktop", image: symbol("display"), state: window.isDesktop ? .on : .off) { [weak self] _ in
-                    self?.window.show(Item(id: 0, app: "Desktop", bundle: desktopApp, title: ""))
-                }
-                let shownID = window.isDesktop ? nil : Optional(window.windowID)
-                let icons = macs.icons, small = { (b: String) in icons[b].map(self.icon) }
-                let show = { [weak self] (i: Item) in self?.window.show(i) }
-                let open = items.map { w in
-                    UIAction(title: w.app, subtitle: w.title.isEmpty || w.title == w.app ? nil : w.title, image: small(w.bundle),
-                             state: w.id == shownID ? .on : .off) { _ in show(w) }
-                }
-                let recent = macs.recent(on: mac).filter { r in !items.contains { $0.bundle == r.bundle } && r.bundle != current.bundle }.prefix(5).map { r in
-                    UIAction(title: r.app, image: small(r.bundle)) { _ in show(r) }
-                }
-                var all: [UIMenuElement] = [UIMenu(options: .displayInline, children: [desktop])]
-                all.append(UIMenu(title: "Open on \(mac.name)", options: .displayInline,
-                                  children: open.isEmpty ? [UIAction(title: "No windows open", attributes: .disabled) { _ in }] : open))
-                if !recent.isEmpty { all.append(UIMenu(title: "Recent", options: .displayInline, children: Array(recent))) }
-                done(all)
-            }
+            macs.list(mac) { [weak self] items in done(self?.sessionsMenu(items) ?? []) }
         }]
+    }
+
+    private func sessionsMenu(_ items: [Item]) -> [UIMenuElement] {
+        let icons = macs.icons, small = { (b: String) in icons[b].map(self.icon) }
+        let names = macs.paired.count > 1
+        let open = sessions.all.map { w in
+            let subtitle = w === window ? nil : sessions.elsewhere(w, from: scene) ? "In another window" : w.summary
+            return UIAction(title: names ? "\(w.title) — \(w.mac.name)" : w.title, subtitle: subtitle,
+                            image: w.isDesktop ? symbol("display") : small(w.item.bundle), state: w === window ? .on : .off) { [weak self, weak w] _ in
+                guard let self, let w else { return }
+                sessions.show(w, in: scene)
+            }
+        }
+        let start = { [weak self] (i: Item) in
+            guard let self else { return }
+            sessions.open(i, on: mac, in: scene)
+        }
+        let desktop = Item(id: 0, app: "Desktop", bundle: desktopApp, title: "")
+        var here: [UIMenuElement] = []
+        if !sessions.isOpen(desktop, on: mac) { here.append(UIAction(title: "Desktop", image: symbol("display")) { _ in start(desktop) }) }
+        here += items.filter { !sessions.isOpen($0, on: mac) }.map { w in
+            UIAction(title: w.app, subtitle: w.title.isEmpty || w.title == w.app ? nil : w.title, image: small(w.bundle)) { _ in start(w) }
+        }
+        let recent = macs.recent(on: mac).filter { r in !items.contains { $0.bundle == r.bundle } && !sessions.isOpen(r, on: mac) }
+            .prefix(5).map { r in UIAction(title: r.app, image: small(r.bundle)) { _ in start(r) } }
+        let home = UIAction(title: "Home", subtitle: "Open another Mac, window or app. What's open stays open.",
+                            image: symbol("house")) { [weak self] _ in
+            guard let self else { return }
+            sessions.home(scene)
+        }
+        var all: [UIMenuElement] = [UIMenu(title: "Open", options: .displayInline, children: open)]
+        all.append(UIMenu(title: "Also on \(mac.name)", options: .displayInline,
+                          children: here.isEmpty ? [UIAction(title: "Everything there is open", attributes: .disabled) { _ in }] : here))
+        if !recent.isEmpty { all.append(UIMenu(title: "Recent", options: .displayInline, children: Array(recent))) }
+        all.append(UIMenu(options: .displayInline, children: [home]))
+        return all
     }
 
     private func icon(_ image: UIImage) -> UIImage {

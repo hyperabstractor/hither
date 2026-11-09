@@ -23,7 +23,8 @@ struct Received: Identifiable {
 
 /// Bonjour, pairing, and one control connection per paired Mac that lists its windows and apps, carries its settings
 /// (Keep Screen Dark, Lock, Video Codec) and the clipboard, and says when new windows open there. Each window you
-/// open has its own connection (RemoteWindow), and each file copy (FileCopy). Everything here runs on the main queue.
+/// open has its own connection (a session: RemoteWindow, kept by Sessions), and each file copy (FileCopy). Everything
+/// here runs on the main queue.
 final class Macs: ObservableObject {
     @Published var nearby: [NearbyMac] = []
     @Published var paired: [Peer] = Pairings.load().peers
@@ -39,8 +40,9 @@ final class Macs: ObservableObject {
     @Published var copies: [FileCopy] = []
     @Published var received: Received?
     var icons: [String: UIImage] = [:]   // by bundle; a list carries each app's icon once per connection
-    /// The stream on screen, if any: new windows on its Mac may switch it, and a codec change may reconnect it.
-    weak var stream: RemoteWindow?
+    /// The sessions open: new windows on a Mac may be shown by one, a codec change reconnects them, and unpairing a
+    /// Mac closes its own.
+    weak var sessions: Sessions?
 
     private var browser: NWBrowser?
     private var pairing: PairSession?
@@ -121,9 +123,12 @@ final class Macs: ObservableObject {
                 return
             }
             // a re-pair replaces the Mac's old entry: the same ID with a new key, or a Mac of the same name set up again
-            // (a new ID). Hang up on each before connecting with the new one; their reconnect timers then find them gone.
+            // (a new ID). Its sessions close first, while the old pairing still stands for them to let go of what they
+            // hold (each keeps the Mac as it was paired: its key, name and addresses); then hang up on the old entries
+            // before connecting with the new one, whose reconnect timers then find them gone.
             var all = Pairings.load()
             let replaced = all.peers.filter { $0.id == p.id || $0.name == p.name }
+            replaced.forEach { self.sessions?.closeAll(of: $0) }
             all.peers.removeAll { $0.id == p.id || $0.name == p.name }
             all.peers.append(p)
             all.save()
@@ -136,6 +141,7 @@ final class Macs: ObservableObject {
     }
 
     func unpair(_ mac: Peer) {
+        sessions?.closeAll(of: mac)   // first, while they can still let go of what they hold there
         var all = Pairings.load()
         all.peers.removeAll { $0.id == mac.id }
         all.save()
@@ -167,14 +173,14 @@ final class Macs: ObservableObject {
                 let c = m.codec ?? "h264"
                 if codec[mac.id] != c {
                     codec[mac.id] = c
-                    if let s = stream, s.mac.id == mac.id { s.codecChanged(c) }
+                    sessions?.codecChanged(c, on: mac)
                 }
                 listWaiters.removeValue(forKey: mac.id)?.forEach { $0(items) }
             case "apps": apps[mac.id] = keepIcons(m.items ?? []).sorted { $0.app.localizedStandardCompare($1.app) == .orderedAscending }
             case "appeared":
                 let items = keepIcons(m.items ?? [])
                 wires[mac.id]?.send(Msg("list"))
-                if let s = stream, s.mac.id == mac.id { s.appeared(items) }
+                sessions?.appeared(items, on: mac)
             case "clipset": flash("Sent \(m.text ?? "the clipboard") to \(mac.name)")
             case "cliperr": flash(m.text ?? "Couldn't get \(mac.name)'s clipboard")
             default: break
@@ -199,7 +205,7 @@ final class Macs: ObservableObject {
         wires[mac.id] = w
         w.start()
         w.send(Msg("list"))
-        w.send(Msg("watch"))   // new windows there: the stream on screen may follow them
+        w.send(Msg("watch"))   // new windows there: a session on screen may follow them
         Reach.giveUpLater(on: w)
     }
 

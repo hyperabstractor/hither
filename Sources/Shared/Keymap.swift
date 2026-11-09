@@ -7,6 +7,33 @@ public enum Keymap {
     public static let capsLock: UInt64 = 1 << 16, shift: UInt64 = 1 << 17, control: UInt64 = 1 << 18
     public static let option: UInt64 = 1 << 19, command: UInt64 = 1 << 20, numericPad: UInt64 = 1 << 21, function: UInt64 = 1 << 23
 
+    /// Mac key codes for the shortcuts sent on their own.
+    public static let leftCommand = 0x37, tab = 0x30
+
+    /// A shortcut exactly as given (⌘⇥: `tab`, [`leftCommand`]), as the key and flags messages a Mac keyboard would
+    /// send for it: modifiers down, the key down and up with only those flags (and what a Mac keyboard adds to that
+    /// key; caps lock, a toggle, as it is), modifiers up. Modifiers `held` on a hardware keyboard are let go of
+    /// first and pressed again after, so they don't join in and the Mac is left as that keyboard is.
+    public static func shortcut(_ key: Int, modifiers: [Int], held: [Int] = [], capsLock: Bool = false) -> [Msg] {
+        var out: [Msg] = []
+        var f = held.reduce(capsLock ? Self.capsLock : 0) { $0 | (modifierFlag($1) ?? 0) }
+        func flags(_ k: Int, _ change: (inout UInt64, UInt64) -> Void) {
+            change(&f, modifierFlag(k) ?? 0)
+            var m = Msg("flags"); m.k = k; m.f = f
+            out.append(m)
+        }
+        let down = { (f: inout UInt64, flag: UInt64) in f |= flag }, up = { (f: inout UInt64, flag: UInt64) in f &= ~flag }
+        held.reversed().forEach { flags($0, up) }
+        modifiers.forEach { flags($0, down) }
+        for pressed in [true, false] {
+            var m = Msg("key"); m.k = key; m.down = pressed; m.f = f | implicitFlags(key)
+            out.append(m)
+        }
+        modifiers.reversed().forEach { flags($0, up) }
+        held.forEach { flags($0, down) }
+        return out
+    }
+
     /// HID usage → Mac key code.
     static let table: [Int: Int] = [
         // letters a…z
