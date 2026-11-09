@@ -40,6 +40,8 @@ do {
     try testKeymap()
     try testDesktopZoom()
     print("PASS iPad keyboards send Mac keys; Desktop zoom keeps the spot under the fingers, clicks follow")
+    try testGlide()
+    print("PASS a flick glides on by elapsed time, the same at any frame rate, and its momentum always ends once")
     try testFiles()
     print("PASS Finder files cross on their own connection: folders, big files, safe names, nothing left half-done")
     try testSeal()

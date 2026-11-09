@@ -100,8 +100,8 @@ whole Desktop, at a time, full screen. The Mac sizes a window to fit the viewer 
   its name: Send and Get Clipboard, Send Files, Keep Screen Dark, Lock, Video Codec (H.264 or HEVC, for every
   window that Mac sends) and Unpair. Keep Screen Dark works as on a Mac: the Mac's own monitors show black while you
   use it from here, and it locks 2 minutes after you close the last window.
-- **Touch:** tap to click (tap again quickly for a double click), two-finger tap to right-click, drag to scroll,
-  touch and hold then drag to select or move things.
+- **Touch:** tap to click (tap again quickly for a double click), two-finger tap to right-click, drag to scroll
+  (flick and it glides on; touch to stop it), touch and hold then drag to select or move things.
 - **Mouse and trackpad** on an iPad: point, click, secondary-click, drag and scroll as on a Mac.
 - **Typing:** the keyboard button types into the window. The bar above the keyboard has esc, tab, arrows and
   ⌃ ⌥ ⌘ ⇧, which apply to the next key or tap (⌘ then S saves). A hardware keyboard sends Mac keys, shortcuts

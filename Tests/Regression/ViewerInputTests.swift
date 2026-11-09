@@ -61,3 +61,79 @@ func testClipChoosing() throws {
     try expectTrue(c.size <= Clip.limit)
     try expectTrue(Clip(choosing: []).parts.isEmpty)
 }
+
+/// A flick glides on by elapsed time, not frames: as far and as fast at any frame rate, no leap after a stall, and its
+/// momentum phases always run began, changed…, ended, once, whether it slows to a stop or is stopped.
+func testGlide() throws {
+    let close = { (a: CGFloat, b: CGFloat, within: CGFloat) in abs(a - b) <= within }
+    let tau = Glide.timeConstant
+    try expectTrue(abs(tau - 0.4995) < 0.001)   // UIScrollView's normal deceleration
+
+    // too slow to glide: it just stops
+    try expectNil(Glide(velocity: CGPoint(x: 0, y: 100), at: 0, minimum: 250, stop: 20, maximum: 8000))
+
+    /// Glide at `hz` for `seconds` (or until it ends): the distance, and the phases sent.
+    func run(_ v: CGPoint, hz: Double, seconds: Double) throws -> (CGPoint, [Glide.Phase]) {
+        var g = try Glide(velocity: v, at: 10, minimum: 250, stop: 20, maximum: 8000).unwrap()
+        var sum = CGPoint.zero, phases = [g.start.phase]
+        var t = 10.0
+        while t < 10 + seconds - 1e-9, let s = g.step(to: t + 1 / hz) {
+            t += 1 / hz
+            sum.x += s.delta.x; sum.y += s.delta.y
+            phases.append(s.phase)
+        }
+        return (sum, phases)
+    }
+
+    // 0.3 s in: the same distance at 30, 60 and 120 Hz, and what v·τ·(1 − e^(−t/τ)) says
+    let v = CGPoint(x: 600, y: -2000)
+    let want = CGFloat(tau * (1 - exp(-0.3 / tau)))
+    for hz in [30.0, 60, 120] {
+        let (d, _) = try run(v, hz: hz, seconds: 0.3)
+        try expectTrue(close(d.x, v.x * want, 0.01) && close(d.y, v.y * want, 0.01))
+    }
+    // to the end: it goes v·τ in all (less the slow tail it stops in), and ends once, last
+    let (all, phases) = try run(v, hz: 60, seconds: 10)
+    let speed = hypot(v.x, v.y)
+    try expectTrue(close(all.y, v.y * CGFloat(tau), abs(v.y) * 20 / speed * CGFloat(tau) + 0.5))
+    try expectEqual(phases.first, .began)
+    try expectEqual(phases.last, .ended)
+    try expectEqual(phases.filter { $0 == .ended }.count, 1)
+    try expectEqual(phases.dropFirst().dropLast().allSatisfy { $0 == .changed }, true)
+    // it stops once slower than `stop`: ln(speed / stop)·τ seconds in, a frame either way
+    let lasts = Double(phases.count - 1) / 60
+    try expectTrue(abs(lasts - log(Double(speed) / 20) * tau) <= 1.0 / 60 + 1e-9)
+
+    // a stall: one late frame moves at most what longestStep covers, then it carries on
+    var g = try Glide(velocity: CGPoint(x: 0, y: 3000), at: 0, minimum: 250, stop: 20, maximum: 8000).unwrap()
+    let late = try g.step(to: 2).unwrap()
+    try expectTrue(late.delta.y <= 3000 * CGFloat(Glide.longestStep) && late.delta.y > 0)
+    try expectEqual(late.phase, .changed)
+    // time going backwards (a frame stamp before the flick) moves nothing
+    var h = try Glide(velocity: CGPoint(x: 0, y: 3000), at: 5, minimum: 250, stop: 20, maximum: 8000).unwrap()
+    try expectEqual(h.step(to: 4.99)?.delta, .zero)
+
+    // stopped short: one end, with nothing moved, then nothing more
+    try expectEqual(g.stop(), Glide.Step(delta: .zero, phase: .ended))
+    try expectNil(g.stop())
+    try expectNil(g.step(to: 2.1))
+    // ended by itself: stopping it sends nothing more
+    var e = try Glide(velocity: CGPoint(x: 300, y: 0), at: 0, minimum: 250, stop: 20, maximum: 8000).unwrap()
+    var t = 0.0
+    while let s = e.step(to: t + 1.0 / 60) { t += 1.0 / 60; if s.phase == .ended { break } }
+    try expectTrue(e.ended)
+    try expectNil(e.stop())
+
+    // a spiky velocity estimate is held to `maximum`, direction kept
+    var fast = try Glide(velocity: CGPoint(x: 30000, y: 40000), at: 0, minimum: 250, stop: 20, maximum: 5000).unwrap()
+    let first = try fast.step(to: 0.01).unwrap().delta
+    let unclamped = CGFloat(tau * (1 - exp(-0.01 / tau)))
+    try expectTrue(close(first.x, 3000 * unclamped, 0.001) && close(first.y, 4000 * unclamped, 0.001))
+}
+
+private extension Optional {
+    func unwrap(file: StaticString = #filePath, line: UInt = #line) throws -> Wrapped {
+        guard let self else { throw RegressionFailure(message: "\(file):\(line): unexpected nil") }
+        return self
+    }
+}

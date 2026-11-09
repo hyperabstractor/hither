@@ -460,15 +460,25 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
     private func button(_ name: String, label: String, _ action: @escaping () -> Void) -> UIButton {
         let button = UIButton(configuration: configuration(name), primaryAction: UIAction { _ in action() })
         button.accessibilityLabel = label
+        stopsMomentum(button)
         return button
+    }
+
+    /// Touching a control stops a glide under it at once (the picture never sees that touch).
+    private func stopsMomentum(_ b: UIButton) {
+        b.addAction(UIAction { [weak self] _ in self?.window.view.stopMomentum() }, for: .touchDown)
     }
 
     /// A button whose menu is built each time it opens.
     private func menuButton(_ name: String, label: String, _ items: @escaping () -> [UIMenuElement]) -> UIButton {
         let button = UIButton(configuration: configuration(name))
-        button.menu = UIMenu(children: [UIDeferredMenuElement.uncached { done in done(items()) }])
+        button.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] done in
+            self?.window.view.stopMomentum()   // also when opened without a touch (keyboard, pointer)
+            done(items())
+        }])
         button.showsMenuAsPrimaryAction = true
         button.accessibilityLabel = label
+        stopsMomentum(button)
         return button
     }
 }

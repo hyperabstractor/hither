@@ -4,7 +4,8 @@ import UIKit
 
 /// The remote window's picture, and touch, pointer and typing back to it:
 ///   tap = click (tap again quickly for a double or triple click), two-finger tap = right click,
-///   drag = scroll, touch and hold then drag = press and drag (select text, move a divider).
+///   drag = scroll (flick and it glides on, as on a Mac trackpad; touch to stop it),
+///   touch and hold then drag = press and drag (select text, move a divider).
 ///   A Desktop also zooms and moves here: pinch, or drag with two fingers. That changes nothing on the Mac.
 /// A mouse or trackpad on an iPad points, clicks (secondary click = right click), drags and scrolls like one on a Mac.
 /// Typing goes to the Mac as text; the bar above the keyboard sends esc, tab, arrows and modifiers as Mac keys.
@@ -49,6 +50,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     private var lift: CGFloat = 0              // how far the picture is moved up for the keyboard
     private var lastTap: (at: CFTimeInterval, point: CGPoint, count: Int)?
     private var scrollAt = CGPoint.zero        // a scroll goes where it started, like a trackpad's under the pointer
+    private var scrolling: UIPanGestureRecognizer?   // the scroll that began in this session: only its moves and end go
     private var keySeq: UInt32 = 0
     private var sentAt: [UInt32: CFTimeInterval] = [:]
     private var samples: [Double] = []
@@ -66,6 +68,11 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     private var repeatTimer: Timer?
     private var pointer: (button: Int, at: CGPoint)?      // a mouse or trackpad button held
     private var holding: CGPoint?                         // touch and hold, then drag
+
+    // a flick's glide: momentum scrolls, one per frame, to where the drag scrolled (`scrollAt`)
+    private var glide: Glide?
+    private var glideLink: CADisplayLink?
+    private var touchStoppedGlide = false                 // so the tap that stopped it doesn't click too
 
     init() {
         super.init(frame: .zero)
@@ -109,6 +116,13 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
                                                name: UIApplication.willResignActiveNotification, object: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit { glideLink?.invalidate() }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { stopGlide(); endScroll() }   // closing, or gone from the screen: nothing may keep scrolling
+    }
 
     /// Pinch and two-finger drags go together; and a one-finger scroll that started a moment before the second finger
     /// landed doesn't keep them from starting (it's cancelled once they do).
@@ -176,6 +190,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     /// Showing something else now (another window, the Desktop): no trace of the last one.
     func reset() {
         releaseInput()
+        stopGlide(sending: false)
         video.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         depacketizer = Depacketizer()
         remoteSize = .zero
@@ -244,6 +259,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         let source: UIGestureRecognizer = active(twoFingers) ? twoFingers : pinch
         let a = source.location(in: self)
         if g.state != .changed {
+            stopGlide()
             if active(drag) { drag.isEnabled = false; drag.isEnabled = true }   // it ends, cancelled: no stray scroll
             if active(pinch) || active(twoFingers) {
                 anchor = (remote(a), scaleNow)
@@ -289,6 +305,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     }
 
     @objc private func tapped(_ g: UITapGestureRecognizer) {
+        if touchStoppedGlide { touchStoppedGlide = false; return }   // that touch only stopped a glide
         let p = g.location(in: self), now = CACurrentMediaTime()
         var count = 1
         if let l = lastTap, now - l.at < 0.4, hypot(p.x - l.point.x, p.y - l.point.y) < 16 { count = l.count % 3 + 1 }
@@ -296,16 +313,27 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         click(p, button: 0, count: count)
     }
 
-    @objc private func rightTapped(_ g: UITapGestureRecognizer) { click(g.location(in: self), button: 1, count: 1) }
+    @objc private func rightTapped(_ g: UITapGestureRecognizer) {
+        if touchStoppedGlide { touchStoppedGlide = false; return }
+        click(g.location(in: self), button: 1, count: 1)
+    }
 
-    /// A finger (or, from `wheel`, a trackpad or mouse wheel) scrolls what's under it. No momentum after a flick:
-    /// that would have to be made up here.
+    /// A finger (or, from `wheel`, a trackpad or mouse wheel) scrolls what's under it. A finger's flick glides on
+    /// afterwards (`glide`); a trackpad or mouse makes its own momentum, so nothing is added to theirs.
     @objc private func dragged(_ g: UIPanGestureRecognizer) {
         guard remoteSize.width > 0, shown.width > 0 else { return }
         if g === drag, g.state == .began || g.state == .changed, anchor != nil { return }   // zooming
-        if g.state == .began { scrollAt = remote(g.location(in: self)) }
+        if g.state == .began {
+            stopGlide()
+            endScroll()   // another one still going (a trackpad's and a finger's at once): it ends first
+            guard live else { return }   // nothing new without a session; its moves and end are ignored too
+            scrolling = g
+            scrollAt = remote(g.location(in: self))
+        }
         let t = g.translation(in: self), s = shown.width / remoteSize.width
         g.setTranslation(.zero, in: self)
+        // from before a disconnect, a switch or letting go of input: not for this session, and no glide from it
+        guard scrolling === g else { return }
         var m = Msg("scroll")
         m.x = scrollAt.x; m.y = scrollAt.y; m.dx = t.x / s; m.dy = t.y / s; m.f = g === wheel ? modifierFlags(g.modifierFlags) : 0; m.b = 0
         switch g.state {   // CGScrollPhase
@@ -316,6 +344,65 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         }
         m.mp = 0
         send(m)
+        guard g.state != .began, g.state != .changed else { return }
+        scrolling = nil
+        if g === drag, g.state == .ended, anchor == nil, live { flick(g.velocity(in: self), scale: s) }
+    }
+
+    /// The scroll under way ends here, cancelled (`sending`, while there's a session to tell); whatever that
+    /// gesture does later is ignored.
+    private func endScroll(sending: Bool = true) {
+        guard scrolling != nil else { return }
+        scrolling = nil
+        guard sending, live else { return }
+        var m = Msg("scroll")
+        m.x = scrollAt.x; m.y = scrollAt.y; m.dx = 0; m.dy = 0; m.f = 0; m.b = 0
+        m.p = 8   // CGScrollPhase cancelled
+        m.mp = 0
+        send(m)
+    }
+
+    /// Something else is being touched (the floating controls): a glide stops at once.
+    func stopMomentum() { stopGlide() }
+
+    // MARK: glide after a flick
+
+    /// The finger left moving fast enough: glide on from that speed, slowing down, in the Mac's points as the drag was.
+    /// Speeds are in points here per second, the finger's own.
+    private func flick(_ v: CGPoint, scale s: CGFloat) {
+        stopGlide()
+        guard let g = Glide(velocity: CGPoint(x: v.x / s, y: v.y / s), at: CACurrentMediaTime(),
+                            minimum: 250 / s, stop: 20 / s, maximum: 8000 / s) else { return }
+        glide = g
+        sendGlide(g.start)
+        let link = CADisplayLink(target: GlideTicker(self), selector: #selector(GlideTicker.tick(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 60)
+        link.add(to: .main, forMode: .common)
+        glideLink = link
+    }
+
+    fileprivate func glideTick(_ link: CADisplayLink) {
+        guard live, var g = glide else { return stopGlide(sending: false) }
+        let step = g.step(to: link.targetTimestamp)
+        glide = g
+        if let step { sendGlide(step) }
+        if g.ended { stopGlide(sending: false) }
+    }
+
+    /// Stop gliding: tell the Mac the momentum ended (`sending`), unless the session's gone or it already has.
+    private func stopGlide(sending: Bool = true) {
+        glideLink?.invalidate()
+        glideLink = nil
+        if var g = glide, let end = g.stop(), sending, live { sendGlide(end) }
+        glide = nil
+    }
+
+    private func sendGlide(_ step: Glide.Step) {
+        var m = Msg("scroll")
+        m.x = scrollAt.x; m.y = scrollAt.y; m.dx = step.delta.x; m.dy = step.delta.y; m.f = 0; m.b = 0
+        m.p = 0   // the gesture is over: momentum only
+        m.mp = step.phase.rawValue
+        send(m)
     }
 
     @objc private func held(_ g: UILongPressGestureRecognizer) {
@@ -323,6 +410,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         switch g.state {
         case .began:
             guard live else { return }
+            stopGlide()
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             focus = remote(p)
             holding = p
@@ -357,6 +445,8 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     private func pointerTouch(_ touches: Set<UITouch>) -> UITouch? { touches.first { $0.type == .indirectPointer } }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if event?.allTouches?.count == touches.count { touchStoppedGlide = glide != nil }   // the first finger(s) down
+        stopGlide()
         guard let t = pointerTouch(touches), pointer == nil else { return super.touchesBegan(touches, with: event) }
         guard live else { return }
         let p = t.location(in: self), b = event?.buttonMask.contains(.secondary) == true ? 1 : 0
@@ -521,6 +611,8 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
 
     /// Let go of everything this view holds down on the Mac: keys, modifiers, a mouse button, a touch-and-hold drag.
     func releaseInput() {
+        stopGlide()
+        endScroll()
         repeatTimer?.invalidate(); repeatTimer = nil
         for code in heldKeys {
             var u = Msg("key"); u.k = code; u.down = false; u.f = 0
@@ -538,6 +630,8 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
 
     /// The session ended without a chance to let go (the connection dropped): forget what was held, sending nothing.
     private func forgetInput() {
+        stopGlide(sending: false)
+        endScroll(sending: false)
         repeatTimer?.invalidate(); repeatTimer = nil
         heldKeys = []
         heldModifiers = []
@@ -546,4 +640,14 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     }
 
     @objc private func resignedActive() { releaseInput() }
+}
+
+/// Drives a glide once a frame without the display link (which keeps its target) keeping the view.
+private final class GlideTicker: NSObject {
+    private weak var view: StreamView?
+    init(_ view: StreamView) { self.view = view }
+    @objc func tick(_ link: CADisplayLink) {
+        guard let view else { return link.invalidate() }
+        view.glideTick(link)
+    }
 }
