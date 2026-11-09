@@ -2,23 +2,49 @@ import AVFoundation
 import Shared
 import UIKit
 
-/// The remote window's picture, and touch and typing back to it:
+/// The remote window's picture, and touch, pointer and typing back to it:
 ///   tap = click (tap again quickly for a double or triple click), two-finger tap = right click,
 ///   drag = scroll, touch and hold then drag = press and drag (select text, move a divider).
+///   A Desktop also zooms and moves here: pinch, or drag with two fingers. That changes nothing on the Mac.
+/// A mouse or trackpad on an iPad points, clicks (secondary click = right click), drags and scrolls like one on a Mac.
 /// Typing goes to the Mac as text; the bar above the keyboard sends esc, tab, arrows and modifiers as Mac keys.
-/// While the keyboard is up, the picture moves up just enough to keep the spot you last touched in view.
-final class StreamView: UIView, UIKeyInput {
+/// A hardware keyboard sends Mac keys, modifiers and shortcuts included (those the iPad keeps for itself excepted).
+/// While the on-screen keyboard is up, the picture moves up just enough to keep the spot you last touched in view.
+final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     let video = AVSampleBufferDisplayLayer()
     var depacketizer = Depacketizer()
     var remoteSize = CGSize.zero { didSet { if remoteSize != oldValue { setNeedsLayout() } } }
-    /// Mac points per phone point for the window size we ask for: 1 = actual size, more = more fits, smaller text.
+    /// App windows: Mac points per viewer point for the window size we ask for: 1 = actual size, more = more fits.
     var scale = 1.0 { didSet { if scale != oldValue { onWantSize(wantSize) } } }
     var send: (Msg) -> Void = { _ in }
     var onWantSize: (CGSize) -> Void = { _ in }
     var onLatency: (Int) -> Void = { _ in }
+    var onZoom: () -> Void = {}
+    /// The on-screen keyboard went away: whoever takes hardware keys when it isn't up should have them again.
+    var onResign: () -> Void = {}
+    /// A session is open with the Mac. Without one nothing new is pressed (it would never reach the Mac, and its key
+    /// up or repeats would go to the next session), and going without one forgets what was held: that session is gone.
+    var live = false { didSet { if !live { forgetInput() } } }
+
+    /// A Desktop: pinch and two fingers zoom and move the picture here (one finger still scrolls).
+    var zoomable = false {
+        didSet {
+            pinch.isEnabled = zoomable
+            twoFingers.isEnabled = zoomable
+            drag.maximumNumberOfTouches = zoomable ? 1 : 2
+            if !zoomable { zoom = nil }
+            setNeedsLayout()
+        }
+    }
+    /// nil = fit; else Mac points × zoom, moved by `offset` where it's bigger than this view.
+    private(set) var zoom: CGFloat?
+    private var offset = CGPoint.zero
+    /// An Adaptive Desktop is never scaled up (1): pixel for pixel, centered. Otherwise fit fills the view.
+    var maxFit: CGFloat = .greatestFiniteMagnitude { didSet { if maxFit != oldValue { setNeedsLayout() } } }
+    private(set) var picture = CGRect.zero     // where the video is, before any lift for the keyboard
 
     let keys = KeyBar()
-    private var keyboard: CGFloat = 0          // how much of this view the keyboard covers
+    private var keyboardFrame: CGRect?         // in the screen's coordinate space
     private var focus: CGPoint?                // last touch, in window points
     private var lift: CGFloat = 0              // how far the picture is moved up for the keyboard
     private var lastTap: (at: CFTimeInterval, point: CGPoint, count: Int)?
@@ -26,6 +52,20 @@ final class StreamView: UIView, UIKeyInput {
     private var keySeq: UInt32 = 0
     private var sentAt: [UInt32: CFTimeInterval] = [:]
     private var samples: [Double] = []
+
+    private let tap = UITapGestureRecognizer(), rightTap = UITapGestureRecognizer()
+    private let drag = UIPanGestureRecognizer(), hold = UILongPressGestureRecognizer()
+    private let pinch = UIPinchGestureRecognizer(), twoFingers = UIPanGestureRecognizer()
+    private let wheel = UIPanGestureRecognizer(), hover = UIHoverGestureRecognizer()
+    private var anchor: (spot: CGPoint, zoom: CGFloat)?   // a pinch or two-finger move: what stays under the fingers
+
+    // what's held down on the Mac because of us, so it's always let go again (app switch, disconnect, another window)
+    private var heldKeys: Set<Int> = []
+    private var heldModifiers: Set<Int> = []
+    private var capsLock = false
+    private var repeatTimer: Timer?
+    private var pointer: (button: Int, at: CGPoint)?      // a mouse or trackpad button held
+    private var holding: CGPoint?                         // touch and hold, then drag
 
     init() {
         super.init(frame: .zero)
@@ -36,21 +76,46 @@ final class StreamView: UIView, UIKeyInput {
         video.backgroundColor = UIColor.black.cgColor
         layer.addSublayer(video)
 
-        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
-        let rightTap = UITapGestureRecognizer(target: self, action: #selector(rightTapped(_:)))
+        // fingers and Pencil; a mouse or trackpad comes as touches of its own (touchesBegan…) and as scrolls
+        let touch = [UITouch.TouchType.direct, .pencil].map { NSNumber(value: $0.rawValue) }
+        tap.addTarget(self, action: #selector(tapped(_:)))
+        rightTap.addTarget(self, action: #selector(rightTapped(_:)))
         rightTap.numberOfTouchesRequired = 2
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
-        pan.maximumNumberOfTouches = 2
-        let hold = UILongPressGestureRecognizer(target: self, action: #selector(held(_:)))
+        drag.addTarget(self, action: #selector(dragged(_:)))
+        drag.maximumNumberOfTouches = 2
+        hold.addTarget(self, action: #selector(held(_:)))
         hold.minimumPressDuration = 0.35
-        [tap, rightTap, pan, hold].forEach(addGestureRecognizer)
+        pinch.addTarget(self, action: #selector(transformed(_:)))
+        twoFingers.addTarget(self, action: #selector(transformed(_:)))
+        twoFingers.minimumNumberOfTouches = 2
+        twoFingers.maximumNumberOfTouches = 2
+        for g in [tap, rightTap, drag, hold, twoFingers] { g.allowedTouchTypes = touch }
+        pinch.delegate = self
+        twoFingers.delegate = self
+        pinch.isEnabled = false
+        twoFingers.isEnabled = false
+        wheel.addTarget(self, action: #selector(dragged(_:)))
+        wheel.allowedScrollTypesMask = .all   // trackpad and mouse wheel scrolls, no touches
+        wheel.allowedTouchTypes = []
+        hover.addTarget(self, action: #selector(hovered(_:)))
+        [tap, rightTap, drag, hold, pinch, twoFingers, wheel, hover].forEach(addGestureRecognizer)
 
         keys.onKey = { [weak self] in self?.press($0) }
         keys.onHide = { [weak self] in _ = self?.resignFirstResponder() }
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardChanged(_:)),
                                                name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        // switching apps, Control Center, a call: nothing may stay pressed on the Mac
+        NotificationCenter.default.addObserver(self, selector: #selector(resignedActive),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Pinch and two-finger drags go together; and a one-finger scroll that started a moment before the second finger
+    /// landed doesn't keep them from starting (it's cancelled once they do).
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        let zooming = [pinch, twoFingers]
+        return zooming.contains(g) && (zooming.contains(other) || other === drag)
+    }
 
     // MARK: picture
 
@@ -63,23 +128,36 @@ final class StreamView: UIView, UIKeyInput {
         if bounds.width > 0 { onWantSize(wantSize) }
     }
 
-    /// Aspect-fit, then lifted if the keyboard would cover the spot last touched.
-    private func place(animated: Bool = false, duration: Double = 0.25) {
-        let r = remoteSize, b = bounds
-        var f = b
-        if r.width > 0, r.height > 0 {
-            let s = min(b.width / r.width, b.height / r.height)
-            f = CGRect(x: (b.width - r.width * s) / 2, y: (b.height - r.height * s) / 2, width: r.width * s, height: r.height * s)
-        }
+    /// Where the picture is now, lifted for the keyboard included: input maps through this.
+    private var shown: CGRect { picture.offsetBy(dx: 0, dy: -lift) }
+
+    /// Fit (or zoomed), then lifted if the keyboard would cover the spot last touched. `keepLift`: zooming around a
+    /// spot, which `anchored` keeps where it is for the lift there is now; working it out again would move it.
+    private func place(animated: Bool = false, duration: Double = 0.25, keepLift: Bool = false) {
+        let r = pictureRect(view: bounds.size, remote: remoteSize, zoom: zoom, pan: offset, maxFit: maxFit)
+        offset = r.pan
+        // fit on whole points, so a 1:1 picture lands on whole pixels too
+        picture = remoteSize == .zero ? bounds
+            : zoom == nil ? CGRect(origin: CGPoint(x: r.rect.minX.rounded(.down), y: r.rect.minY.rounded(.down)), size: r.rect.size) : r.rect
+        if keepLift { return draw(animated: animated, duration: duration) }
         lift = 0
-        if keyboard > 0, let p = focus, r.width > 0 {
-            let y = f.minY + p.y * f.width / r.width, visible = b.height - keyboard
-            lift = min(max(0, y + 44 - visible), max(0, f.maxY - visible))
+        if let keyboardFrame, let screen = window?.screen, let p = focus, remoteSize.width > 0 {
+            let keyboard = bounds.intersection(convert(keyboardFrame, from: screen.coordinateSpace))
+            let s = picture.width / remoteSize.width
+            let x = picture.minX + p.x * s, y = picture.minY + p.y * s
+            // A floating keyboard only hides the part of the picture it actually covers.
+            if !keyboard.isEmpty, x >= keyboard.minX, x <= keyboard.maxX, y <= keyboard.maxY {
+                lift = min(max(0, y + 44 - keyboard.minY), max(0, picture.maxY - keyboard.minY))
+            }
         }
+        draw(animated: animated, duration: duration)
+    }
+
+    private func draw(animated: Bool, duration: Double) {
         CATransaction.begin()
         CATransaction.setDisableActions(!animated)
         CATransaction.setAnimationDuration(duration)
-        video.frame = f.offsetBy(dx: 0, dy: -lift)
+        video.frame = shown
         CATransaction.commit()
     }
 
@@ -95,6 +173,21 @@ final class StreamView: UIView, UIKeyInput {
         meter(seq)
     }
 
+    /// Showing something else now (another window, the Desktop): no trace of the last one.
+    func reset() {
+        releaseInput()
+        video.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+        depacketizer = Depacketizer()
+        remoteSize = .zero
+        zoom = nil
+        offset = .zero
+        focus = nil
+        lastTap = nil
+        sentAt = [:]
+        samples = []
+        setNeedsLayout()
+    }
+
     /// key→frame: time from sending a key to the first frame the host captured after typing it.
     private func meter(_ seq: UInt32) {
         let now = CACurrentMediaTime()
@@ -108,12 +201,76 @@ final class StreamView: UIView, UIKeyInput {
         sentAt = sentAt.filter { now - $0.value < 1 }   // keys that changed nothing on screen
     }
 
+    // MARK: zoom (Desktop)
+
+    static let zoomSteps: [CGFloat] = [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4]
+    /// The picture's scale now, fit included: Mac points → points here.
+    var scaleNow: CGFloat { remoteSize.width > 0 ? picture.width / remoteSize.width : 1 }
+    private var fitScale: CGFloat {
+        guard remoteSize.width > 0, remoteSize.height > 0 else { return 1 }
+        return min(bounds.width / remoteSize.width, bounds.height / remoteSize.height, maxFit)
+    }
+
+    /// nil = fit. Keeps what's under `around` (default: the middle) where it is.
+    func setZoom(_ z: CGFloat?, around a: CGPoint? = nil) {
+        guard remoteSize.width > 0 else { return }
+        let a = a ?? CGPoint(x: bounds.midX, y: bounds.midY)
+        if let z = z.map({ min(max($0, 0.1), 4) }) { anchored(z, spot: remote(a), at: a) } else { zoom = nil; place() }
+        onZoom()
+    }
+
+    func zoomStep(_ dir: Int) {
+        let now = scaleNow
+        if let next = dir > 0 ? Self.zoomSteps.first(where: { $0 > now + 0.005 }) : Self.zoomSteps.last(where: { $0 < now - 0.005 }) {
+            setZoom(next <= fitScale + 0.005 && dir < 0 ? nil : next)
+        } else if dir < 0 {
+            setZoom(nil)
+        }
+    }
+
+    /// Zoom to `z` with the Mac's point `spot` at `a`, as input sees it: through the picture as drawn, lifted for the
+    /// keyboard. The lift stays as it is meanwhile; it's worked out again when the keyboard or the layout changes.
+    private func anchored(_ z: CGFloat, spot: CGPoint, at a: CGPoint) {
+        zoom = z
+        offset = Shared.pan(keeping: spot, at: a, zoom: z, lift: lift)
+        place(keepLift: true)
+    }
+
+    /// Pinch and two-finger drags, together: the spot first under the fingers stays under them. Whenever a finger
+    /// gesture starts or ends, that spot is taken again, so the other one carries on from where things are.
+    @objc private func transformed(_ g: UIGestureRecognizer) {
+        guard remoteSize.width > 0 else { return }
+        let active = { (r: UIGestureRecognizer) in r.state == .began || r.state == .changed }
+        let source: UIGestureRecognizer = active(twoFingers) ? twoFingers : pinch
+        let a = source.location(in: self)
+        if g.state != .changed {
+            if active(drag) { drag.isEnabled = false; drag.isEnabled = true }   // it ends, cancelled: no stray scroll
+            if active(pinch) || active(twoFingers) {
+                anchor = (remote(a), scaleNow)
+                pinch.scale = 1
+            } else {   // all fingers up: back to fit if it's about there
+                anchor = nil
+                if let z = zoom, z <= fitScale * 1.02 { zoom = nil; place() }
+                onZoom()
+            }
+            return
+        }
+        guard let start = anchor else { return }
+        anchored(min(max(start.zoom * (active(pinch) ? pinch.scale : 1), fitScale), 4), spot: start.spot, at: a)
+    }
+
+    /// Zoomed in past the view, a pointer leads: where it is across the view is where it is across the Mac's screen.
+    private func follow(_ p: CGPoint) {
+        guard zoomable, zoom != nil, picture.width > bounds.width || picture.height > bounds.height else { return }
+        let f = { (v: CGFloat, size: CGFloat) in min(max(v / size, 0), 1) }
+        offset = CGPoint(x: f(p.x, bounds.width) * (picture.width - bounds.width), y: f(p.y, bounds.height) * (picture.height - bounds.height))
+        place()
+    }
+
     // MARK: touch → mouse
 
-    /// A point in this view → the same spot in the Mac window.
-    private func remote(_ p: CGPoint) -> CGPoint {
-        remotePoint(CGPoint(x: p.x, y: p.y + lift), view: bounds.size, remote: remoteSize)
-    }
+    /// A point in this view → the same spot on the Mac.
+    private func remote(_ p: CGPoint) -> CGPoint { remoteSize == .zero ? p : remotePoint(p, in: shown, remote: remoteSize) }
 
     private func mouse(_ kind: Int, _ p: CGPoint, button: Int = 0, count: Int = 1, flags: UInt64 = 0) {
         let r = remote(p)
@@ -141,14 +298,16 @@ final class StreamView: UIView, UIKeyInput {
 
     @objc private func rightTapped(_ g: UITapGestureRecognizer) { click(g.location(in: self), button: 1, count: 1) }
 
-    /// Scrolls follow the finger. No momentum after a flick: that would have to be made up here.
-    @objc private func panned(_ g: UIPanGestureRecognizer) {
-        guard remoteSize.width > 0, video.frame.width > 0 else { return }
+    /// A finger (or, from `wheel`, a trackpad or mouse wheel) scrolls what's under it. No momentum after a flick:
+    /// that would have to be made up here.
+    @objc private func dragged(_ g: UIPanGestureRecognizer) {
+        guard remoteSize.width > 0, shown.width > 0 else { return }
+        if g === drag, g.state == .began || g.state == .changed, anchor != nil { return }   // zooming
         if g.state == .began { scrollAt = remote(g.location(in: self)) }
-        let t = g.translation(in: self), s = video.frame.width / remoteSize.width
+        let t = g.translation(in: self), s = shown.width / remoteSize.width
         g.setTranslation(.zero, in: self)
         var m = Msg("scroll")
-        m.x = scrollAt.x; m.y = scrollAt.y; m.dx = t.x / s; m.dy = t.y / s; m.f = 0; m.b = 0
+        m.x = scrollAt.x; m.y = scrollAt.y; m.dx = t.x / s; m.dy = t.y / s; m.f = g === wheel ? modifierFlags(g.modifierFlags) : 0; m.b = 0
         switch g.state {   // CGScrollPhase
         case .began: m.p = 1
         case .ended: m.p = 4
@@ -163,21 +322,84 @@ final class StreamView: UIView, UIKeyInput {
         let p = g.location(in: self)
         switch g.state {
         case .began:
+            guard live else { return }
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             focus = remote(p)
+            holding = p
             mouse(0, p)
             mouse(1, p, flags: keys.take())
-        case .changed: mouse(3, p)
-        case .ended, .cancelled: mouse(2, p)
+        case .changed:
+            guard holding != nil else { return }   // let go of already (releaseInput)
+            holding = p
+            mouse(3, p)
+        case .ended, .cancelled:
+            guard holding != nil else { return }
+            holding = nil
+            mouse(2, p)
         default: break
         }
     }
 
-    // MARK: keyboard
+    // MARK: mouse and trackpad
+
+    /// UIKeyModifierFlags use the same bits as CGEventFlags; only the ones a click or scroll carries.
+    private func modifierFlags(_ f: UIKeyModifierFlags) -> UInt64 {
+        UInt64(f.intersection([.shift, .control, .alternate, .command, .alphaShift]).rawValue)
+    }
+
+    @objc private func hovered(_ g: UIHoverGestureRecognizer) {
+        guard g.state == .began || g.state == .changed, pointer == nil else { return }
+        let p = g.location(in: self)
+        follow(p)
+        mouse(0, p)
+    }
+
+    private func pointerTouch(_ touches: Set<UITouch>) -> UITouch? { touches.first { $0.type == .indirectPointer } }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = pointerTouch(touches), pointer == nil else { return super.touchesBegan(touches, with: event) }
+        guard live else { return }
+        let p = t.location(in: self), b = event?.buttonMask.contains(.secondary) == true ? 1 : 0
+        pointer = (b, p)
+        focus = remote(p)
+        mouse(0, p)
+        mouse(1, p, button: b, count: max(1, t.tapCount), flags: modifierFlags(event?.modifierFlags ?? []) | keys.take())
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = pointerTouch(touches), let held = pointer else { return super.touchesMoved(touches, with: event) }
+        let p = t.location(in: self)
+        pointer = (held.button, p)
+        follow(p)
+        mouse(3, p, button: held.button, flags: modifierFlags(event?.modifierFlags ?? []))
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = pointerTouch(touches), let held = pointer else { return super.touchesEnded(touches, with: event) }
+        pointer = nil
+        mouse(2, t.location(in: self), button: held.button, count: max(1, t.tapCount), flags: modifierFlags(event?.modifierFlags ?? []))
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard pointerTouch(touches) != nil, let held = pointer else { return super.touchesCancelled(touches, with: event) }
+        pointer = nil
+        mouse(2, held.at, button: held.button)
+    }
+
+    // MARK: on-screen keyboard
 
     override var canBecomeFirstResponder: Bool { true }
     override var inputAccessoryView: UIView? { keys }
     var hasText: Bool { true }   // so Delete always comes through
+
+    override func resignFirstResponder() -> Bool {
+        let done = super.resignFirstResponder()
+        if done { DispatchQueue.main.async { [weak self] in self?.onResign() } }
+        return done
+    }
+
+    // no edit menu shortcuts here (⌘C, ⌘V…): they go to the Mac as keys
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
 
     // no help from iOS: the Mac app does its own completion and correction
     var autocorrectionType = UITextAutocorrectionType.no
@@ -206,8 +428,7 @@ final class StreamView: UIView, UIKeyInput {
 
     /// A Mac key with the latched modifiers, down and up.
     func press(_ code: Int, _ flags: UInt64 = 0) {
-        let arrow = (Keys.left...Keys.up).contains(code)
-        let f = keys.take() | flags | (arrow ? Keys.arrowFlags : 0)
+        let f = keys.take() | flags | Keymap.implicitFlags(code)
         keySeq += 1
         sentAt[keySeq] = CACurrentMediaTime()
         var d = Msg("key"); d.k = code; d.down = true; d.f = f; d.seq = keySeq
@@ -217,9 +438,112 @@ final class StreamView: UIView, UIKeyInput {
     }
 
     @objc private func keyboardChanged(_ n: Notification) {
-        guard let end = n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect, let screen = window?.screen else { return }
-        let k = convert(end, from: screen.coordinateSpace)
-        keyboard = max(0, bounds.maxY - k.minY)
+        keyboardFrame = isFirstResponder ? n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect : nil
         place(animated: true, duration: n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25)
     }
+
+    // MARK: hardware keyboard
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !hardware(presses, down: true) { super.pressesBegan(presses, with: event) }
+    }
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !hardware(presses, down: false) { super.pressesEnded(presses, with: event) }
+    }
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !hardware(presses, down: false) { super.pressesCancelled(presses, with: event) }
+    }
+
+    /// The modifiers held on the hardware keyboard (and caps lock), as the host posts them.
+    private var hardwareFlags: UInt64 {
+        heldModifiers.reduce(capsLock ? Keymap.capsLock : 0) { $0 | (Keymap.modifierFlag($1) ?? 0) }
+    }
+
+    /// Keys from a hardware keyboard, as Mac keys. Returns whether they went to the Mac (keys a Mac keyboard doesn't
+    /// have stay with the iPad). Presses that come together (⌘ and S in one event) arrive as a set, in no order: the
+    /// modifiers go first going down and last coming up, and each key also carries the modifiers iOS says are held,
+    /// so ⌘S is ⌘S whatever the order, and even if ⌘ was held before this screen had the keyboard.
+    func hardware(_ presses: Set<UIPress>, down: Bool) -> Bool {
+        let pressed = presses.compactMap { p in p.key.flatMap { k in Keymap.macKey(hid: k.keyCode.rawValue).map { (k, $0) } } }
+        let rank = { (code: Int) in (Keymap.modifierFlag(code) != nil) == down ? 0 : 1 }
+        let modifiersFirst = pressed.sorted { rank($0.1) < rank($1.1) }
+        for (key, code) in modifiersFirst {
+            capsLock = key.modifierFlags.contains(.alphaShift)
+            if let flag = Keymap.modifierFlag(code) {
+                if flag != Keymap.capsLock {
+                    if !down { heldModifiers.remove(code) } else if live { heldModifiers.insert(code) } else { continue }
+                }
+                var m = Msg("flags"); m.k = code; m.f = hardwareFlags
+                send(m)
+            } else if down {
+                keyDown(code, repeating: heldKeys.contains(code), held: modifierFlags(key.modifierFlags))
+            } else {
+                keyUp(code)
+            }
+        }
+        return !pressed.isEmpty
+    }
+
+    private func keyDown(_ code: Int, repeating: Bool, held: UInt64) {
+        guard live else { return }
+        var d = Msg("key"); d.k = code; d.down = true; d.f = hardwareFlags | held | keys.take() | Keymap.implicitFlags(code)
+        if repeating {
+            d.rep = true   // iOS repeats it itself: no repeats of our own
+            repeatTimer?.invalidate(); repeatTimer = nil
+        } else {
+            keySeq += 1
+            sentAt[keySeq] = CACurrentMediaTime()
+            d.seq = keySeq
+            heldKeys.insert(code)
+            startRepeat(code, held: held)
+        }
+        send(d)
+    }
+
+    private func keyUp(_ code: Int) {
+        guard heldKeys.remove(code) != nil else { return }
+        if heldKeys.isEmpty { repeatTimer?.invalidate(); repeatTimer = nil }
+        var u = Msg("key"); u.k = code; u.down = false; u.f = hardwareFlags | Keymap.implicitFlags(code)
+        send(u)
+    }
+
+    /// A key held down repeats, as on a Mac (posted keys don't repeat by themselves there): the newest key held only.
+    private func startRepeat(_ code: Int, held: UInt64) {
+        repeatTimer?.invalidate()
+        repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+            self?.repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] t in
+                guard let self, heldKeys.contains(code) else { return t.invalidate() }
+                var d = Msg("key"); d.k = code; d.down = true; d.rep = true; d.f = hardwareFlags | held | Keymap.implicitFlags(code)
+                send(d)
+            }
+        }
+    }
+
+    /// Let go of everything this view holds down on the Mac: keys, modifiers, a mouse button, a touch-and-hold drag.
+    func releaseInput() {
+        repeatTimer?.invalidate(); repeatTimer = nil
+        for code in heldKeys {
+            var u = Msg("key"); u.k = code; u.down = false; u.f = 0
+            send(u)
+        }
+        heldKeys = []
+        for code in heldModifiers {
+            var m = Msg("flags"); m.k = code; m.f = 0
+            send(m)
+        }
+        heldModifiers = []
+        if let held = pointer { pointer = nil; mouse(2, held.at, button: held.button) }
+        if let p = holding { holding = nil; mouse(2, p) }
+    }
+
+    /// The session ended without a chance to let go (the connection dropped): forget what was held, sending nothing.
+    private func forgetInput() {
+        repeatTimer?.invalidate(); repeatTimer = nil
+        heldKeys = []
+        heldModifiers = []
+        pointer = nil
+        holding = nil
+    }
+
+    @objc private func resignedActive() { releaseInput() }
 }

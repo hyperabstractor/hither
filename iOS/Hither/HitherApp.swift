@@ -1,8 +1,9 @@
 import AVFoundation
 import SwiftUI
 
-// Hither for iPhone: a viewer only. It pairs with a Mac running Hither, lists that Mac's windows and apps, and shows
-// one window at a time, full screen, resized to fit the phone (and put back when you're done). It shares nothing.
+// Hither for iPhone and iPad: a viewer only. It pairs with a Mac running Hither, lists that Mac's windows and apps,
+// and shows one window (resized to fit, and put back when you're done) or the Mac's whole Desktop at a time, full
+// screen. It shares nothing of its own, apart from a clipboard or files you choose to send.
 
 @main
 struct HitherApp: App {

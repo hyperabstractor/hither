@@ -178,4 +178,11 @@ func testVideoLink() throws {
         throw RegressionFailure(message: "VideoLink delivered \(got.count) of \(frames.count) frames")
     }
     try expectEqual(got, frames)
+    // a reset reports back on the link's own queue, after every frame it handed on: a viewer falling back to TCP
+    // tells stale datagram frames from later ones by it
+    let reset = DispatchSemaphore(value: 0)
+    var seenAtReset = -1
+    link.reset { seenAtReset = got.count; reset.signal() }
+    guard reset.wait(timeout: .now() + 2) == .success else { throw RegressionFailure(message: "VideoLink reset never finished") }
+    try expectEqual(seenAtReset, frames.count)
 }

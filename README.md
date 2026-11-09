@@ -85,19 +85,43 @@ and a submenu named after it with Clipboard, Keep Screen Dark, Lock, Video Codec
   the bottom of the window's Edit menu, and in the Mac's submenu of the menu bar icon.
 - **Video Codec** in the Mac's submenu switches every window between H.264, HEVC and HEVC 4:2:2.
 
-## iPhone
+## iPhone and iPad
 
-`iOS/Hither.xcodeproj` is a viewer for iPhone and iPad. It shares nothing; it opens your Mac's windows one at a
-time, full screen. The Mac sizes the window to fit the phone and puts it back when you leave.
+`iOS/Hither.xcodeproj` is a viewer for iPhone and iPad. It shares nothing; it shows one of your Mac's windows, or its
+whole Desktop, at a time, full screen. The Mac sizes a window to fit the viewer and puts it back when you leave.
 
-- Build it with Xcode (sign in under Settings › Accounts and pick your team) and run it on your phone.
+- Open `iOS/Hither.xcodeproj` in Xcode. Select your team under Signing & Capabilities, select the connected iPhone
+  or iPad as the run destination, and run the Hither scheme. Enable Developer Mode on the device if prompted.
 - **Pair:** the Mac shows up under Nearby Macs. Tap it, check both screens show the same code, and click Pair on
-  the Mac too. Paired iPhones get their own **Unpair** item under **Settings** in the Mac's menu.
+  the Mac too. A Mac on another network (over Tailscale): **Pair with Mac at Address…** in the ⋯ menu, and type its
+  Tailscale name or IP; Hither keeps the address it answered on as a way back. Paired iPhones and iPads get their
+  own **Unpair** item under **Settings** in the Mac's menu.
+- **Each Mac** has its Desktop, its open windows and All Apps (apps you opened lately first), and a ⋯ menu beside
+  its name: Send and Get Clipboard, Send Files, Keep Screen Dark, Lock, Video Codec (H.264 or HEVC, for every
+  window that Mac sends) and Unpair. Keep Screen Dark works as on a Mac: the Mac's own monitors show black while you
+  use it from here, and it locks 2 minutes after you close the last window.
 - **Touch:** tap to click (tap again quickly for a double click), two-finger tap to right-click, drag to scroll,
   touch and hold then drag to select or move things.
+- **Mouse and trackpad** on an iPad: point, click, secondary-click, drag and scroll as on a Mac.
 - **Typing:** the keyboard button types into the window. The bar above the keyboard has esc, tab, arrows and
-  ⌃ ⌥ ⌘ ⇧, which apply to the next key or tap (⌘ then S saves).
-- **Window size:** Actual Size shows Mac points at iPhone size. More Space fits more in with smaller text.
+  ⌃ ⌥ ⌘ ⇧, which apply to the next key or tap (⌘ then S saves). A hardware keyboard sends Mac keys, shortcuts
+  included, except the ones iPadOS keeps for itself (⌘Tab, ⌘Space, ⌘H, Globe shortcuts).
+- **Desktop:** pinch or drag with two fingers to zoom and move around (or Fit, Actual Size, Zoom In and Out in the
+  🔍 menu); with a pointer, the zoomed picture follows it. That never changes the Mac. The same menu sets the Mac's
+  screen: **Native** (the default) keeps its resolution; **Adaptive** has it take the resolution nearest this screen,
+  only while Keep Screen Dark is on, and its windows rearrange to fit.
+- **Window size:** Actual Size maps one Mac point to one viewer point when the window fits. More Space fits more
+  in with smaller text.
+- **Menus and windows:** the menu bar button shows the app's menus, read from the Mac when you open them. The
+  windows button switches to the Mac's Desktop, another open window or a recent app. When the app opens a new window
+  because of what you did (⌘N, a link), it's shown instead, and when that closes you're back where you were.
+- **Clipboard and files:** Send Clipboard puts text, rich text or an image from here on the Mac (iOS asks once
+  whether Hither may paste). Get Clipboard brings the Mac's back; files copied in Finder come too, into Files ›
+  On My iPad (or iPhone) › Hither, with a button to share or save them elsewhere. Send Files puts files you pick in
+  the Mac's Downloads and on its clipboard. Copies show progress and can be cancelled.
+- **Controls:** the stream fills the screen, and the controls float over it as one round button in a corner. Tap it
+  for keyboard, menus, windows, size, ⋯ and Close; tap again to tuck them away. Drag it to move them to another
+  corner. Opening and closing them never changes the stream's size.
 
 ## How it works
 
@@ -114,12 +138,13 @@ it, so a lost packet costs one frame's repair instead of holding up every frame 
 datagrams that fit Tailscale's MTU. The viewer asks again for any missing pieces, and when a frame can't be saved
 in time it waits for a keyframe instead of showing a broken picture. The datagrams are sealed with ChaChaPoly
 using a key that each TLS connection exports, so the pairing is still the only thing that lets a Mac in. If no
-datagrams get through, or they stop for 3 s, video carries on over TCP. The iPhone app uses TCP.
+datagrams get through, or they stop for 3 s, video carries on over TCP. The iPhone and iPad app does the same.
 
 Over UDP a Mac viewer uses H.264 with long-term references (LTR): the viewer confirms each frame it shows, and every
 frame is built only on confirmed ones. So a lost frame spoils only itself; the next one decodes, with no repair to
 wait for and no keyframe. (VideoToolbox's HEVC encoder doesn't support this, so over UDP the codec setting doesn't
-apply; it does for TCP and the iPhone.) Keys, clicks and scrolls also go over UDP, three copies each, and the host
+apply; it does for TCP. The iPhone and iPad app asks for LTR only while the codec is H.264, so HEVC applies there
+too; it never asks for HEVC 4:2:2.) Keys, clicks and scrolls also go over UDP, three copies each, and the host
 applies each once and in order, whether its UDP or TCP copy arrives first.
 
 ## Security

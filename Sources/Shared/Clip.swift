@@ -1,6 +1,9 @@
 import Foundation
 #if os(macOS)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
+import UniformTypeIdentifiers
 #endif
 
 /// Clipboard contents on the wire (a kind-4 frame), moved only when the user asks: Send Clipboard puts this Mac's
@@ -16,6 +19,15 @@ public struct Clip {
     public static let limit = 8 << 20
 
     public var size: Int { parts.reduce(0) { $0 + $1.data.count } }
+
+    /// The representations on offer, best first: each type once, and any that would take the clipboard past `limit`
+    /// left out (a smaller one later on can still go).
+    public init(choosing offered: [(type: String, data: Data)]) {
+        self.init()
+        for o in offered where !o.data.isEmpty && !parts.contains(where: { $0.type == o.type }) && size + o.data.count <= Clip.limit {
+            parts.append(o)
+        }
+    }
 
     public func encoded() -> Data {
         var d = Data()
@@ -83,6 +95,55 @@ public extension Clip {
         for p in parts { item.setData(p.data, forType: NSPasteboard.PasteboardType(p.type)) }
         pb.clearContents()
         pb.writeObjects([item])
+    }
+}
+#endif
+
+#if canImport(UIKit) && !os(macOS)
+public extension Clip {
+    static let plainText = "public.utf8-plain-text", png = "public.png", jpeg = "public.jpeg"
+    /// Carried as they are, after the text and before any image: the types a Mac's clipboard takes back.
+    static let richTypes = ["public.rtf", "public.html", "com.apple.flat-rtfd", "com.adobe.pdf"]
+
+    /// The first item on `pb`: its text, rich text, and an image as PNG (as JPEG when PNG would be too big). One
+    /// read of the pasteboard, so iOS asks at most once whether Hither may paste.
+    static func read(_ pb: UIPasteboard = .general) -> Clip {
+        guard let item = pb.items.first, !item.isEmpty else { return Clip() }
+        func data(_ v: Any) -> Data? {
+            switch v {
+            case let d as Data: d
+            case let s as String: Data(s.utf8)
+            case let u as URL: Data(u.absoluteString.utf8)
+            case let a as NSAttributedString: Data(a.string.utf8)
+            default: nil
+            }
+        }
+        var offered: [(type: String, data: Data)] = []
+        let textTypes = [plainText, "public.plain-text", "public.text", "public.url"]
+        if let t = textTypes.first(where: { item[$0] != nil }), let d = data(item[t]!) { offered.append((plainText, d)) }
+        for t in richTypes { if let v = item[t], let d = data(v) { offered.append((t, d)) } }
+        // an image: PNG as is; any other kind (JPEG, HEIC, a UIImage) made PNG, or JPEG if that's too big
+        if let v = item[png] as? Data {
+            offered.append((png, v))
+        } else if let (_, v) = item.first(where: { UTType($0.key)?.conforms(to: .image) == true }) {
+            let image = (v as? UIImage) ?? (v as? Data).flatMap(UIImage.init(data:))
+            if let p = image?.pngData(), p.count <= limit { offered.append((png, p)) }
+            else if let j = image?.jpegData(compressionQuality: 0.9) { offered.append((jpeg, j)) }
+        }
+        return Clip(choosing: offered)
+    }
+
+    /// Replace `pb`'s contents with this clipboard (nothing to put: leave it be). Text goes as a string, so every
+    /// app can paste it; a TIFF as PNG, which iOS apps read.
+    func write(_ pb: UIPasteboard = .general) {
+        guard !parts.isEmpty else { return }
+        var item: [String: Any] = [:]
+        for p in parts {
+            if p.type == Clip.plainText { item[p.type] = String(decoding: p.data, as: UTF8.self) }
+            else if p.type == "public.tiff", item[Clip.png] == nil, let png = UIImage(data: p.data)?.pngData() { item[Clip.png] = png }
+            else { item[p.type] = p.data }
+        }
+        pb.setItems([item])
     }
 }
 #endif

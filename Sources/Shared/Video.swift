@@ -111,6 +111,14 @@ public func pictureRect(view: CGSize, remote r: CGSize, zoom: CGFloat?, pan: CGP
     return (CGRect(x: x, y: y, width: w, height: h), pan)
 }
 
+/// The `pan` for `pictureRect` that keeps the host's point `spot` under the view's point `anchor` at `zoom`: zooming
+/// around the pointer or between two fingers. `lift`: the picture is drawn that much higher than `pictureRect` puts it
+/// (moved up for an on-screen keyboard), so the spot goes that much lower in it. `pictureRect` clamps the pan where the
+/// picture would leave the view.
+public func pan(keeping spot: CGPoint, at anchor: CGPoint, zoom: CGFloat, lift: CGFloat = 0) -> CGPoint {
+    CGPoint(x: spot.x * zoom - anchor.x, y: spot.y * zoom - (anchor.y + lift))
+}
+
 /// A point in the view → the same spot on the host, given where the picture is (`pictureRect`).
 public func remotePoint(_ p: CGPoint, in rect: CGRect, remote r: CGSize) -> CGPoint {
     guard rect.width > 0, rect.height > 0 else { return p }

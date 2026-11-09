@@ -324,8 +324,9 @@ public final class VideoLink {
 
     public func stop() { timer?.cancel(); timer = nil; conn.cancel() }
 
-    /// The host went back to TCP video: frames up to `seq` will never come.
-    public func reset() { queue.async { self.assembler = Reassembler() } }
+    /// The host went back to TCP video: frames up to `seq` will never come. `then` runs on the link's queue once it's
+    /// done, after every frame handed on before it: a viewer can tell those stale frames from later ones by it.
+    public func reset(then done: @escaping () -> Void = {}) { queue.async { self.assembler = Reassembler(); done() } }
 
     private func receive() {
         conn.receiveMessage { [weak self] d, _, _, err in
