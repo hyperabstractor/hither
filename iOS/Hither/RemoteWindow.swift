@@ -361,6 +361,7 @@ final class RemoteWindow: ObservableObject, Identifiable {
     func pressMenu(_ path: [Int]) {
         var m = Msg("press"); m.path = path
         wire?.send(m)
+        view.resetTyping()   // Edit › Paste and the like change the text where typing goes
         lastInputAt = CACurrentMediaTime()   // File › New Window and the like are the user's doing
     }
 
@@ -374,7 +375,7 @@ final class RemoteWindow: ObservableObject, Identifiable {
         if p != place { place = p }
         if wasShown && !p.shown {
             view.releaseInput()
-            if view.isFirstResponder { _ = view.resignFirstResponder() }
+            if view.isTyping { view.stopTyping() }
             shapeLater?.cancel()
             shapeLater = nil
         }

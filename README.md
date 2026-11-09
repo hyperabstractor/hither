@@ -106,7 +106,9 @@ when you leave.
 - **Mouse and trackpad** on an iPad: point, click, secondary-click, drag and scroll as on a Mac.
 - **Typing:** the keyboard button types into the window. The bar above the keyboard has esc, tab, arrows and
   ⌃ ⌥ ⌘ ⇧, which apply to the next key or tap (⌘ then S saves). A hardware keyboard sends Mac keys, shortcuts
-  included, except the ones iPadOS keeps for itself (⌘Tab, ⌘Space, ⌘H, Globe shortcuts).
+  included, except the ones iPadOS keeps for itself (⌘Tab, ⌘Space, ⌘H, Globe shortcuts). The keyboard's mic key
+  dictates into the window; as dictation revises its words, so does the Mac's text, back to the last tap or key
+  that moved the cursor.
 - **Desktop:** pinch or drag with two fingers to zoom and move around (or Fit, Actual Size, Zoom In and Out in the
   🔍 menu); with a pointer, the zoomed picture follows it. That never changes the Mac. The same menu sets the Mac's
   screen: **Native** (the default) keeps its resolution; **Adaptive** has it take the resolution nearest this screen,

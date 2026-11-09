@@ -8,10 +8,11 @@ import UIKit
 ///   touch and hold then drag = press and drag (select text, move a divider).
 ///   A Desktop also zooms and moves here: pinch, or drag with two fingers. That changes nothing on the Mac.
 /// A mouse or trackpad on an iPad points, clicks (secondary click = right click), drags and scrolls like one on a Mac.
-/// Typing goes to the Mac as text; the bar above the keyboard sends esc, tab, arrows and modifiers as Mac keys.
+/// Typing goes to the Mac as text, through an invisible text view iOS can write into and revise (dictation from the
+/// keyboard's mic key; see TypingBuffer); the bar above the keyboard sends esc, tab, arrows and modifiers as Mac keys.
 /// A hardware keyboard sends Mac keys, modifiers and shortcuts included (those the iPad keeps for itself excepted).
 /// While the on-screen keyboard is up, the picture moves up just enough to keep the spot you last touched in view.
-final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
+final class StreamView: UIView, UIGestureRecognizerDelegate {
     let video = AVSampleBufferDisplayLayer()
     var depacketizer = Depacketizer()
     var remoteSize = CGSize.zero { didSet { if remoteSize != oldValue { setNeedsLayout() } } }
@@ -45,6 +46,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     private(set) var picture = CGRect.zero     // where the video is, before any lift for the keyboard
 
     let keys = KeyBar()
+    private let typing = TypingBuffer()        // first responder while the on-screen keyboard is up
     private var keyboardFrame: CGRect?         // in the screen's coordinate space
     private var focus: CGPoint?                // last touch, in window points
     private var lift: CGFloat = 0              // how far the picture is moved up for the keyboard
@@ -107,8 +109,18 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         hover.addTarget(self, action: #selector(hovered(_:)))
         [tap, rightTap, drag, hold, pinch, twoFingers, wheel, hover].forEach(addGestureRecognizer)
 
-        keys.onKey = { [weak self] in self?.press($0) }
-        keys.onHide = { [weak self] in _ = self?.resignFirstResponder() }
+        typing.inputAccessoryView = keys
+        typing.onEdit = { [weak self] in self?.type($0) }
+        typing.onInsert = { [weak self] in self?.typedKey($0) ?? false }
+        typing.onDelete = { [weak self] in self?.typedDelete(empty: $0) ?? false }
+        typing.onPresses = { [weak self] in self?.hardware($0, down: $1) ?? false }
+        typing.onResign = { [weak self] in DispatchQueue.main.async { self?.onResign() } }
+        addSubview(typing)
+        keys.onKey = { [weak self] in
+            self?.press($0)
+            self?.resetTyping()   // esc, tab and arrows: the cursor may be anywhere now
+        }
+        keys.onHide = { [weak self] in self?.stopTyping() }
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardChanged(_:)),
                                                name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
         // its window's scene going inactive (switching apps, Control Center, a call): nothing may stay pressed on the
@@ -181,6 +193,13 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         CATransaction.setAnimationDuration(duration)
         video.frame = shown
         CATransaction.commit()
+        // the invisible text the keyboard types into sits where the typing likely goes (the spot last touched), so
+        // anything iOS shows beside it (dictation's) is there too
+        if let p = focus, remoteSize.width > 0 {
+            let s = shown.width / remoteSize.width
+            typing.frame.origin = CGPoint(x: min(max(shown.minX + p.x * s, 0), max(0, bounds.width - 1)),
+                                          y: min(max(shown.minY + p.y * s, 0), max(0, bounds.height - 1)))
+        }
     }
 
     func show(_ packet: Data) {
@@ -300,6 +319,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
 
     private func click(_ p: CGPoint, button: Int, count: Int) {
         focus = remote(p)
+        resetTyping()
         let f = keys.take()
         mouse(0, p)   // the pointer moves there first, as it would with a mouse (hover states, tooltips)
         mouse(1, p, button: button, count: count, flags: f)
@@ -415,6 +435,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
             stopGlide()
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             focus = remote(p)
+            resetTyping()
             holding = p
             mouse(0, p)
             mouse(1, p, flags: keys.take())
@@ -454,6 +475,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
         let p = t.location(in: self), b = event?.buttonMask.contains(.secondary) == true ? 1 : 0
         pointer = (b, p)
         focus = remote(p)
+        resetTyping()
         mouse(0, p)
         mouse(1, p, button: b, count: max(1, t.tapCount), flags: modifierFlags(event?.modifierFlags ?? []) | keys.take())
     }
@@ -480,47 +502,77 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
 
     // MARK: on-screen keyboard
 
-    override var canBecomeFirstResponder: Bool { true }
-    override var inputAccessoryView: UIView? { keys }
-    var hasText: Bool { true }   // so Delete always comes through
+    /// The on-screen keyboard is up for this view (typing into `typing`).
+    var isTyping: Bool { typing.isFirstResponder }
 
-    override func resignFirstResponder() -> Bool {
-        let done = super.resignFirstResponder()
-        if done { DispatchQueue.main.async { [weak self] in self?.onResign() } }
-        return done
+    /// Bring up the on-screen keyboard, starting with nothing typed.
+    @discardableResult func startTyping() -> Bool {
+        typing.reset()
+        return typing.becomeFirstResponder()
     }
+
+    /// Put the on-screen keyboard away; `onResign` follows.
+    @discardableResult func stopTyping() -> Bool { typing.resignFirstResponder() }
+
+    /// Where the Mac's text cursor is no longer follows what was typed here (a click, a key that moves it, a menu
+    /// item): what's been typed can't be revised or deleted from here any more, only what's typed next.
+    func resetTyping() { typing.reset() }
 
     // no edit menu shortcuts here (⌘C, ⌘V…): they go to the Mac as keys
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
 
-    // no help from iOS: the Mac app does its own completion and correction
-    var autocorrectionType = UITextAutocorrectionType.no
-    var autocapitalizationType = UITextAutocapitalizationType.none
-    var spellCheckingType = UITextSpellCheckingType.no
-    var smartQuotesType = UITextSmartQuotesType.no
-    var smartDashesType = UITextSmartDashesType.no
-    var smartInsertDeleteType = UITextSmartInsertDeleteType.no
-    var inlinePredictionType = UITextInlinePredictionType.no
-
-    func insertText(_ text: String) {
-        if text == "\n" { return press(Keys.returnKey) }
-        if text == "\t" { return press(Keys.tab) }
-        // with ⌘, ⌃ or ⌥ latched it's a shortcut: send the key itself
-        if keys.latched & (Keys.command | Keys.control | Keys.option) != 0, text.count == 1, let k = Keys.code(for: text.first!) {
-            return press(k.code, k.shift ? Keys.shift : 0)
-        }
+    /// What the typed text changed by (a character typed, or dictation revising what it wrote), on the Mac: Deletes,
+    /// then the text, with Return and Tab in it as those keys. Latched modifiers don't carry into text.
+    private func type(_ edit: TypingEdit) {
         _ = keys.take()
+        for _ in 0..<edit.deletes { key(Keys.delete) }
+        var run = ""
+        for c in edit.insert {
+            guard c.isNewline || c == "\t" else { run.append(c); continue }
+            if !run.isEmpty { text(run); run = "" }
+            key(c == "\t" ? Keys.tab : Keys.returnKey)
+        }
+        if !run.isEmpty { text(run) }
+    }
+
+    /// Typed, but a Mac key instead of text: Return, Tab, or with ⌘, ⌃ or ⌥ latched the shortcut for that key. True
+    /// when it was; the cursor may be anywhere after, so what was typed before is forgotten.
+    private func typedKey(_ text: String) -> Bool {
+        if text == "\n" {
+            press(Keys.returnKey)
+        } else if text == "\t" {
+            press(Keys.tab)
+        } else if keys.latched & (Keys.command | Keys.control | Keys.option) != 0, text.count == 1, let k = Keys.code(for: text.first!) {
+            press(k.code, k.shift ? Keys.shift : 0)
+        } else {
+            return false
+        }
+        resetTyping()
+        return true
+    }
+
+    /// Delete as a Mac key: with nothing typed to take back (it goes on deleting what's there on the Mac), or with
+    /// modifiers latched (⌥ deletes a word). Otherwise the typed text loses a character and that goes as a Delete.
+    private func typedDelete(empty: Bool) -> Bool {
+        guard empty || keys.latched != 0 else { return false }
+        press(Keys.delete)
+        if !empty { resetTyping() }
+        return true
+    }
+
+    private func text(_ text: String) {
         keySeq += 1
         sentAt[keySeq] = CACurrentMediaTime()
         var m = Msg("text"); m.text = text; m.seq = keySeq
         send(m)
     }
 
-    func deleteBackward() { press(Keys.delete) }
-
     /// A Mac key with the latched modifiers, down and up.
-    func press(_ code: Int, _ flags: UInt64 = 0) {
-        let f = keys.take() | flags | Keymap.implicitFlags(code)
+    func press(_ code: Int, _ flags: UInt64 = 0) { key(code, flags: keys.take() | flags) }
+
+    /// A Mac key, down and up, with just these modifiers.
+    private func key(_ code: Int, flags: UInt64 = 0) {
+        let f = flags | Keymap.implicitFlags(code)
         keySeq += 1
         sentAt[keySeq] = CACurrentMediaTime()
         var d = Msg("key"); d.k = code; d.down = true; d.f = f; d.seq = keySeq
@@ -530,21 +582,11 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     }
 
     @objc private func keyboardChanged(_ n: Notification) {
-        keyboardFrame = isFirstResponder ? n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect : nil
+        keyboardFrame = isTyping ? n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect : nil
         place(animated: true, duration: n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25)
     }
 
     // MARK: hardware keyboard
-
-    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        if !hardware(presses, down: true) { super.pressesBegan(presses, with: event) }
-    }
-    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        if !hardware(presses, down: false) { super.pressesEnded(presses, with: event) }
-    }
-    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        if !hardware(presses, down: false) { super.pressesCancelled(presses, with: event) }
-    }
 
     /// The modifiers held on the hardware keyboard (and caps lock), as the host posts them.
     private var hardwareFlags: UInt64 {
@@ -554,7 +596,9 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     /// Keys from a hardware keyboard, as Mac keys. Returns whether they went to the Mac (keys a Mac keyboard doesn't
     /// have stay with the iPad). Presses that come together (⌘ and S in one event) arrive as a set, in no order: the
     /// modifiers go first going down and last coming up, and each key also carries the modifiers iOS says are held,
-    /// so ⌘S is ⌘S whatever the order, and even if ⌘ was held before this screen had the keyboard.
+    /// so ⌘S is ⌘S whatever the order, and even if ⌘ was held before this screen had the keyboard. They come from
+    /// `typing` while the on-screen keyboard is up, else from the screen showing this view. A key that isn't a
+    /// modifier means the cursor may have moved: what the on-screen keyboard typed before is forgotten.
     func hardware(_ presses: Set<UIPress>, down: Bool) -> Bool {
         let pressed = presses.compactMap { p in p.key.flatMap { k in Keymap.macKey(hid: k.keyCode.rawValue).map { (k, $0) } } }
         let rank = { (code: Int) in (Keymap.modifierFlag(code) != nil) == down ? 0 : 1 }
@@ -568,6 +612,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
                 var m = Msg("flags"); m.k = code; m.f = hardwareFlags
                 send(m)
             } else if down {
+                resetTyping()
                 keyDown(code, repeating: heldKeys.contains(code), held: modifierFlags(key.modifierFlags))
             } else {
                 keyUp(code)
@@ -581,6 +626,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     func shortcut(_ key: Int, modifiers: [Int]) -> Bool {
         guard live else { return false }
         stopGlide()
+        resetTyping()
         Keymap.shortcut(key, modifiers: modifiers, held: heldModifiers.sorted(), capsLock: capsLock).forEach(send)
         return true
     }
@@ -627,6 +673,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
     func releaseInput() {
         lettingGo = true
         defer { lettingGo = false }
+        resetTyping()
         stopGlide()
         endScroll()
         repeatTimer?.invalidate(); repeatTimer = nil
@@ -646,6 +693,7 @@ final class StreamView: UIView, UIKeyInput, UIGestureRecognizerDelegate {
 
     /// The session ended without a chance to let go (the connection dropped): forget what was held, sending nothing.
     private func forgetInput() {
+        resetTyping()
         stopGlide(sending: false)
         endScroll(sending: false)
         repeatTimer?.invalidate(); repeatTimer = nil

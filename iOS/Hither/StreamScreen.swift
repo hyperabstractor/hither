@@ -126,7 +126,7 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
         tools = [
             button("keyboard", label: "Keyboard") { [weak self] in
                 guard let v = self?.window.view else { return }
-                _ = v.isFirstResponder ? v.resignFirstResponder() : v.becomeFirstResponder()
+                _ = v.isTyping ? v.stopTyping() : v.startTyping()
             },
             menusButton,
             sessionsButton,
@@ -155,7 +155,7 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
         guard window.attached === self else { return }
         window.attached = nil
         window.view.onResign = {}
-        if window.view.isFirstResponder { _ = window.view.resignFirstResponder() }
+        if window.view.isTyping { window.view.stopTyping() }
         if window.view.superview === view { window.view.removeFromSuperview() }
     }
 
@@ -304,7 +304,7 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
 
     private func takeKeys() {
-        guard viewIfLoaded?.window != nil, !window.view.isFirstResponder else { return }
+        guard viewIfLoaded?.window != nil, !window.view.isTyping else { return }
         becomeFirstResponder()
     }
 

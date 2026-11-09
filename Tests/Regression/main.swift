@@ -40,6 +40,8 @@ do {
     try testKeymap()
     try testDesktopZoom()
     print("PASS iPad keyboards send Mac keys; Desktop zoom keeps the spot under the fingers, clicks follow")
+    try testTyping()
+    print("PASS on-screen typing and dictation revisions reach the Mac as just enough Deletes, one per character, then text")
     try testGlide()
     print("PASS a flick glides on by elapsed time, the same at any frame rate, and its momentum always ends once")
     try testShortcut()
