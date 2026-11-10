@@ -42,6 +42,14 @@ public func snapMode(_ modes: [ModeSize], to window: CGSize, within room: CGSize
     return pool.min { (cost($0), -area($0)) < (cost($1), -area($1)) }
 }
 
+/// Adaptive Desktop on a virtual display, which can be any size: exactly the viewer's window (no bigger than its room),
+/// in whole points, never below the smallest size macOS lays a desktop out in (a smaller window shows it scaled down).
+public func virtualSize(for window: CGSize, within room: CGSize) -> (width: Int, height: Int)? {
+    guard window.width > 0, window.height > 0 else { return nil }
+    let w = room.width > 0 ? min(window.width, room.width) : window.width, h = room.height > 0 ? min(window.height, room.height) : window.height
+    return (max(640, Int(w.rounded(.down))), max(480, Int(h.rounded(.down))))
+}
+
 /// App windows for a Retina viewer: the HiDPI mode with the most room, so their text is captured at 2x.
 public func largestRetina(_ modes: [ModeSize]) -> Int? {
     modes.indices.filter { modes[$0].width >= 1024 && modes[$0].pixelWidth >= 2 * modes[$0].width }

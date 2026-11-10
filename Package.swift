@@ -9,7 +9,8 @@ let package = Package(
     ],
     targets: [
         .target(name: "Shared"),
-        .executableTarget(name: "hither-host", dependencies: ["Shared"]),
+        .target(name: "VirtualDisplay"),   // private CoreGraphics classes, declared (Adaptive Desktop's exact size)
+        .executableTarget(name: "hither-host", dependencies: ["Shared", "VirtualDisplay"]),
         .executableTarget(name: "hither", dependencies: ["Shared"]),
         // An executable keeps regression checks runnable with Command Line Tools, without an Xcode test SDK.
         .executableTarget(name: "hither-tests", dependencies: ["Shared"], path: "Tests/Regression"),

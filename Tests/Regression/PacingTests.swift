@@ -57,6 +57,11 @@ func testDisplayFit() throws {
     try expectEqual(snapMode(acer, to: CGSize(width: 1300, height: 750), within: room, scale: 2).map { acer[$0] }, ModeSize(width: 1280, height: 720, pixelWidth: 2560))
     try expectEqual(snapMode(acer, to: CGSize(width: 1590, height: 890), within: room, scale: 2).map { acer[$0] }, ModeSize(width: 1600, height: 900, pixelWidth: 3200))
     try expectEqual(snapMode(acer, to: CGSize(width: 2000, height: 1100), within: CGSize(width: 2560, height: 1400), scale: 2).map { acer[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
+    // on a virtual display: the window's size exactly, within its room, not below what macOS lays out
+    try expectEqual(virtualSize(for: CGSize(width: 1133, height: 744), within: CGSize(width: 1133, height: 744)).map { [$0.width, $0.height] }, [1133, 744])   // iPad mini
+    try expectEqual(virtualSize(for: CGSize(width: 1700.6, height: 1200), within: room).map { [$0.width, $0.height] }, [1700, 1045])
+    try expectEqual(virtualSize(for: CGSize(width: 500, height: 300), within: room).map { [$0.width, $0.height] }, [640, 480])
+    try expectEqual(virtualSize(for: .zero, within: room).map { [$0.width, $0.height] }, nil)
     // …and shown pixel for pixel, centered, in a full-screen window bigger than it (never scaled up)
     let oneToOne = pictureRect(view: CGSize(width: 1710, height: 1075), remote: CGSize(width: 1680, height: 945), zoom: nil, pan: .zero, maxFit: 1).rect
     try expectEqual(oneToOne, CGRect(x: 15, y: 65, width: 1680, height: 945))

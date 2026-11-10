@@ -4,6 +4,7 @@ import VideoToolbox
 import IOKit.pwr_mgt
 import Network
 import Shared
+import VirtualDisplay
 
 // Host: runs on the Mac that owns the apps. Streams one window per connection, injects the viewer's input.
 
@@ -73,6 +74,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var pid: pid_t = 0
     var windowID: CGWindowID = 0     // the display's ID when streaming the whole desktop
     var desktop = false              // a whole display, not one app's window
+    var home: CGDirectDisplayID = 0  // desktop: the monitor asked for (windowID may be a virtual display standing in)
     var opened = false               // streaming something: keeps this Mac's screen dark (Dark)
     var viewer: (size: CGSize, scale: Double)?   // desktop: the viewer's screen, whose shape a dark display may take (Dark.fit)
     var adapt: (size: CGSize, room: CGSize, scale: Double)?   // desktop, Adaptive: the viewer's window and the most room it
@@ -406,6 +408,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             opened = true
             codec = viewerCodec()
             windowID = id != 0 && CGDisplayIsOnline(id) != 0 ? id : main
+            home = windowID
             frame = CGDisplayBounds(windowID)
             if case .hostPort(_, let port) = wire.conn.endpoint { appName = "Desktop:\(port)" } else { appName = "Desktop" }
         }
@@ -430,7 +433,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             let c = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
             let setup: (SCContentFilter, SCStreamConfiguration)? = q.sync {
-                guard let r = readFrame(), let d = c.displays.first(where: { $0.frame.contains(CGPoint(x: r.midX, y: r.midY)) }) ?? c.displays.first
+                guard let r = readFrame() else { return nil }
+                let mine = desktop ? c.displays.first { $0.displayID == windowID } : nil
+                if desktop, mine == nil, CGDisplayIsOnline(windowID) != 0 { return nil }   // a virtual display, not listed yet
+                guard let d = mine ?? c.displays.first(where: { $0.frame.contains(CGPoint(x: r.midX, y: r.midY)) }) ?? c.displays.first
                 else { return nil }
                 frame = r
                 display = d
@@ -457,6 +463,15 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             log("capture failed: \(error.localizedDescription), retrying")
             retry()
         }
+    }
+
+    /// Desktop: stream display `id` from now on: the virtual display standing in for its monitor, or the monitor again.
+    func show(_ id: CGDirectDisplayID) {
+        guard desktop, !ended, windowID != id else { return }
+        log("\(appName): streaming display \(id)\(id == home ? " (its own)" : " (virtual)")")
+        windowID = id
+        if let s = stream { stream = nil; s.stopCapture { _ in } }
+        Task { try? await Task.sleep(for: .milliseconds(300)); await capture() }
     }
 
     func retry() {
@@ -1075,6 +1090,69 @@ func isOurs(_ bundle: String) -> Bool { bundle.hasPrefix("dev.hither.") }
 
 // MARK: dark screen
 
+/// Adaptive Desktop at exactly the viewer's size: a virtual display made that size (Retina for a Retina viewer), which
+/// the dark monitor mirrors, so every window moves onto it, and it's what the Desktop streams. One per monitor, resized
+/// in place as the window is; gone once nothing wants it, and with the host if it dies (as is the mirroring). Uses
+/// private CoreGraphics API (CGVirtualDisplay, see VirtualDisplay.h): a `no-virtual` file in the config folder turns
+/// it off, and then, or if one can't be made, the monitor takes its nearest mode instead. Main queue.
+enum Virtual {
+    static var on: Bool { !FileManager.default.fileExists(atPath: configDir.appending(path: "no-virtual").path) }
+    static var displays: [CGDirectDisplayID: (display: CGVirtualDisplay, width: Int, height: Int, retina: Bool)] = [:]   // by monitor
+
+    /// The virtual display standing in for monitor `d`, at `size` points: made, or changed to that size (`changed`).
+    static func show(_ d: CGDirectDisplayID, _ size: (width: Int, height: Int), retina: Bool) -> (id: CGDirectDisplayID, changed: Bool)? {
+        if let v = displays[d] {
+            mirror(d, to: v.display.displayID)
+            if (v.width, v.height, v.retina) == (size.width, size.height, retina) { return (v.display.displayID, false) }
+            guard apply(v.display, size, retina) else { return nil }
+            displays[d] = (v.display, size.width, size.height, retina)
+            return (v.display.displayID, true)
+        }
+        let desc = CGVirtualDisplayDescriptor()
+        desc.name = "Hither Virtual"   // "virtual": Dark leaves it lit (it's what the viewer sees)
+        desc.maxPixelsWide = 7680; desc.maxPixelsHigh = 7680   // room to resize in place, Retina, up to 3840 points
+        desc.sizeInMillimeters = CGSize(width: Double(size.width) * 25.4 / 110, height: Double(size.height) * 25.4 / 110)
+        desc.vendorID = 0x4854; desc.productID = 1; desc.serialNum = d
+        desc.queue = .main
+        desc.terminationHandler = { _, _ in log("virtual display for \(d) ended"); displays[d] = nil }
+        guard let v = CGVirtualDisplay(descriptor: desc), apply(v, size, retina) else {
+            log("virtual display \(size.width)×\(size.height): couldn't make one, using the monitor's modes"); return nil
+        }
+        displays[d] = (v, size.width, size.height, retina)
+        mirror(d, to: v.displayID)
+        return (v.displayID, true)
+    }
+
+    static func apply(_ v: CGVirtualDisplay, _ size: (width: Int, height: Int), _ retina: Bool) -> Bool {
+        let s = CGVirtualDisplaySettings()
+        s.hiDPI = retina ? 1 : 0
+        s.modes = [CGVirtualDisplayMode(width: UInt(size.width), height: UInt(size.height), refreshRate: 60)]
+        let ok = v.apply(s)
+        log("virtual display \(v.displayID) → \(size.width)×\(size.height)\(retina ? " Retina" : ""): \(ok ? "ok" : "failed")")
+        if Dark.dark { Dark.blackOut() }
+        return ok
+    }
+
+    /// Monitor `d` shows `v` (nil: itself again). Only until the host quits, like a mode change.
+    static func mirror(_ d: CGDirectDisplayID, to v: CGDirectDisplayID?) {
+        let to = v ?? kCGNullDirectDisplay
+        guard CGDisplayMirrorsDisplay(d) != to else { return }
+        var c: CGDisplayConfigRef?
+        CGBeginDisplayConfiguration(&c)
+        CGConfigureDisplayMirrorOfDisplay(c, d, to)
+        let err = CGCompleteDisplayConfiguration(c, .forAppOnly)
+        log("display \(d) \(v.map { "mirrors virtual display \($0)" } ?? "shows itself again"): \(err == .success ? "ok" : "error \(err.rawValue)")")
+        if Dark.dark { Dark.blackOut() }
+    }
+
+    static func release(_ d: CGDirectDisplayID) {
+        guard displays[d] != nil else { return }
+        mirror(d, to: nil)
+        displays[d] = nil   // the last reference: the display goes
+        log("virtual display for \(d) released")
+    }
+}
+
 /// Keep Screen Dark: while anything here is streamed, this Mac's own monitors show black, so whoever is near it
 /// doesn't see what you do. Their gamma tables are zeroed: capture happens before gamma, so the stream is unaffected,
 /// and macOS restores the colors by itself if this process dies. Two minutes after the last stream closes, the Mac
@@ -1135,9 +1213,9 @@ enum Dark {
         if enabled {
             let open = sessions.values.filter { $0.opened && !$0.ended }
             for s in open where s.desktop {
-                if let a = s.adapt { want[s.windowID] = .snap(a.size, a.room, a.scale) }
-                else if s.nativeDesktop { native.insert(s.windowID) }
-                else if let v = s.viewer { want[s.windowID] = .shape(v.size, v.scale) }
+                if let a = s.adapt { want[s.home] = .snap(a.size, a.room, a.scale) }
+                else if s.nativeDesktop { native.insert(s.home) }
+                else if let v = s.viewer { want[s.home] = .shape(v.size, v.scale) }
             }
             // app windows for a Retina viewer: a HiDPI mode, so their text is as sharp there as here (unless a Desktop
             // on that display wants something else, or wants it left alone)
@@ -1145,15 +1223,29 @@ enum Dark {
                 if let d = s.display?.displayID, want[d] == nil, !native.contains(d) { want[d] = .retina }
             }
         }
-        for (d, own) in fitted where want[d] == nil {
+        let physical = physicalDisplays()
+        var changed = Set<CGDirectDisplayID>()
+        let virtual = { (d: CGDirectDisplayID) -> Bool in if Virtual.on, case .snap = want[d] { return true }; return false }
+        for (d, own) in fitted where want[d] == nil || virtual(d) {   // its own mode again (before it mirrors one)
             fitted[d] = nil
             fittedTo[d] = nil
             set(d, own)
         }
-        let physical = physicalDisplays()
-        var changed = Set<CGDirectDisplayID>()
+        // Adaptive at exactly the window's size: a virtual display the monitor mirrors, if one can be made
+        var stand: [CGDirectDisplayID: CGDirectDisplayID] = [:]   // monitor → the virtual display standing in for it
+        for (d, w) in want where physical.contains(d) && virtual(d) {
+            guard case .snap(let size, let room, let scale) = w, let wh = virtualSize(for: size, within: room),
+                  let v = Virtual.show(d, wh, retina: scale >= 2) else { continue }
+            stand[d] = v.id
+            if v.changed { changed.insert(d) }
+        }
+        for d in Virtual.displays.keys where stand[d] == nil { Virtual.release(d) }
+        for s in sessions.values where s.desktop && !s.ended {
+            let id = stand[s.home] ?? s.home
+            if s.windowID != id { s.q.async { s.show(id) }; changed.insert(s.home) }
+        }
         let same = { (a: CGDisplayMode, b: CGDisplayMode) in a.width == b.width && a.height == b.height && a.pixelWidth == b.pixelWidth }
-        for (d, w) in want where physical.contains(d) {
+        for (d, w) in want where physical.contains(d) && stand[d] == nil {
             let best: CGDisplayMode?
             switch w {
             case .shape(let size, let scale): best = bestMode(d, for: size, scale: scale)
@@ -1171,7 +1263,7 @@ enum Dark {
         // sees its frame change), so tell the others now, mode unchanged or the screen not dark
         for s in sessions.values where s.desktop && s.adaptAsked {
             s.adaptAsked = false
-            if !changed.contains(s.windowID) { s.q.async { var m = Msg("size"); m.w = s.frame.width; m.h = s.frame.height; s.wire.send(m) } }
+            if !changed.contains(s.home) { s.q.async { var m = Msg("size"); m.w = s.frame.width; m.h = s.frame.height; s.wire.send(m) } }
         }
     }
 
@@ -1222,6 +1314,7 @@ enum Dark {
         var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
         CGGetOnlineDisplayList(16, &ids, &n)
         return ids.prefix(Int(n)).filter { d in
+            if Virtual.displays.values.contains(where: { $0.display.displayID == d }) { return false }   // ours
             let name = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == d }?.localizedName ?? ""
             return !name.localizedCaseInsensitiveContains("virtual")
         }
