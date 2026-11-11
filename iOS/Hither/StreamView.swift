@@ -324,6 +324,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         mouse(0, p)   // the pointer moves there first, as it would with a mouse (hover states, tooltips)
         mouse(1, p, button: button, count: count, flags: f)
         mouse(2, p, button: button, count: count, flags: f)
+        closeSwitcher()   // a tap on an app in the switcher picks it; anywhere else, the one it's on
     }
 
     @objc private func tapped(_ g: UITapGestureRecognizer) {
@@ -621,6 +622,36 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         return !pressed.isEmpty
     }
 
+    // MARK: app switcher
+
+    private var switcher = Keymap.AppSwitcher()
+    private var switcherTimer: Timer?
+    var onSwitcher: (Bool) -> Void = { _ in }   // the Mac's app switcher went up or away
+
+    /// The Mac's app switcher, as ⌘ held and Tab at the Mac: the first call shows it, on the app used before, and
+    /// each one after moves to the next app. ⌘ is let go of, switching to the app it's on, 2 s after the last call
+    /// or at once with a tap (on an app in it: that one). False without a session.
+    func switchApps() -> Bool {
+        guard live else { return false }
+        stopGlide()
+        resetTyping()
+        let opening = !switcher.isOpen
+        switcher.next(held: heldModifiers.sorted(), capsLock: capsLock).forEach(send)
+        switcherTimer?.invalidate()
+        switcherTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in self?.closeSwitcher() }
+        if opening { onSwitcher(true) }
+        return true
+    }
+
+    /// Let go of ⌘: the Mac switches to the app picked. `sending` false: the session's gone, just forget it.
+    func closeSwitcher(sending: Bool = true) {
+        switcherTimer?.invalidate(); switcherTimer = nil
+        guard switcher.isOpen else { return }
+        let up = switcher.close()
+        if sending { up.forEach(send) }
+        onSwitcher(false)
+    }
+
     /// A shortcut exactly as given (Keymap.shortcut), sent on its own: what's latched on the bar above the keyboard
     /// stays for the next key, and modifiers held on a hardware keyboard don't join in. False without a session.
     func shortcut(_ key: Int, modifiers: [Int]) -> Bool {
@@ -676,6 +707,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         resetTyping()
         stopGlide()
         endScroll()
+        closeSwitcher()
         repeatTimer?.invalidate(); repeatTimer = nil
         for code in heldKeys {
             var u = Msg("key"); u.k = code; u.down = false; u.f = 0
@@ -693,6 +725,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
 
     /// The session ended without a chance to let go (the connection dropped): forget what was held, sending nothing.
     private func forgetInput() {
+        closeSwitcher(sending: false)
         resetTyping()
         stopGlide(sending: false)
         endScroll(sending: false)

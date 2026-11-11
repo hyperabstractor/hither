@@ -134,8 +134,8 @@ when you leave.
   touch and hold a session or anything to open in Home for **Open in New Window**. A session is in one window at a
   time: opening it from another brings its window forward. Closing a window closes the session it showed.
 - **Menus:** the menu bar button shows the app's menus, read from the Mac when you open them.
-- **Switch app:** on a Desktop, the ⌘⇥ button is a quick Command-Tab: it goes to the app used before, and tapping it
-  again goes back.
+- **Switch app:** on a Desktop, the ⌘⇥ button shows the Mac's app switcher, as holding ⌘ and pressing Tab does: tap
+  it again for the next app, or tap an app in it. It switches to the one picked two seconds after your last tap.
 - **Clipboard and files:** Send Clipboard puts text, rich text or an image from here on the Mac (iOS asks once
   whether Hither may paste). Get Clipboard brings the Mac's back; files copied in Finder come too, into Files ›
   On My iPad (or iPhone) › Hither, with a button to share or save them elsewhere. Send Files puts files you pick in

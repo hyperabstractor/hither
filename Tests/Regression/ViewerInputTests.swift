@@ -138,6 +138,23 @@ private extension Optional {
     }
 }
 
+/// Switch app keeps the Mac's app switcher up: ⌘ down and Tab, Tab again for each tap, ⌘ up to pick, and a hardware
+/// keyboard's modifiers stay out of it and are held again after.
+func testAppSwitcher() throws {
+    let cmd = Keymap.command
+    let sends = { (m: [Msg]) in m.map { "\($0.t) \($0.k!) \($0.down.map { $0 ? "down" : "up" } ?? "") \($0.f!)" } }
+    var s = Keymap.AppSwitcher()
+    try expectEqual(s.close().count, 0)   // nothing up: nothing to let go
+    try expectEqual(sends(s.next()), ["flags 55  \(cmd)", "key 48 down \(cmd)", "key 48 up \(cmd)"])
+    try expectEqual(s.isOpen, true)
+    try expectEqual(sends(s.next()), ["key 48 down \(cmd)", "key 48 up \(cmd)"])
+    try expectEqual(sends(s.close()), ["flags 55  0"])
+    try expectEqual(s.isOpen, false)
+    // ⇧ held on a hardware keyboard: up while it's open, down again after
+    try expectEqual(sends(s.next(held: [0x38])), ["flags 56  0", "flags 55  \(cmd)", "key 48 down \(cmd)", "key 48 up \(cmd)"])
+    try expectEqual(sends(s.close()), ["flags 55  0", "flags 56  \(Keymap.shift)"])
+}
+
 /// A shortcut sent on its own (Switch app's ⌘⇥) is one complete press of exactly that shortcut, whatever a hardware
 /// keyboard holds, and leaves the Mac's modifiers as that keyboard has them.
 func testShortcut() throws {

@@ -122,7 +122,11 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
             return a
         }
         switchButton.configuration = c
-        switchButton.accessibilityHint = "Switches to the previously used app"
+        switchButton.accessibilityHint = "Shows the Mac's app switcher; tap again for the next app, or tap an app"
+        v.onSwitcher = { [weak self] up in   // lit while the switcher is up (⌘ held)
+            guard let b = self?.switchButton else { return }
+            b.configuration?.baseBackgroundColor = up ? .tintColor : UIColor(white: 0.08, alpha: 0.62)
+        }
         tools = [
             button("keyboard", label: "Keyboard") { [weak self] in
                 guard let v = self?.window.view else { return }
@@ -199,11 +203,12 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
         handle.accessibilityLabel = expanded ? "Hide controls" : "Show controls"
     }
 
-    /// The app used before this one, as a quick ⌘⇥ at the Mac does: Command goes up with Tab, so there's no
-    /// switcher left up, and tapping again goes back. The controls stay open for that.
+    /// The Mac's app switcher, as ⌘⇥ held at the Mac: it shows on the app used before, each tap moves to the next,
+    /// and it switches 2 s after the last tap, or at once on a tap in the picture (on an app: that one). The
+    /// controls stay open for that.
     private func switchApp() {
         guard window.isDesktop else { return }
-        _ = window.view.shortcut(Keymap.tab, modifiers: [Keymap.leftCommand])
+        _ = window.view.switchApps()
     }
 
     /// Open or close the controls. Only they change: the picture keeps its size, so nothing goes to the Mac.

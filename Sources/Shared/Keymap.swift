@@ -34,6 +34,34 @@ public enum Keymap {
         return out
     }
 
+    /// The Mac's app switcher, kept up from a button, as ⌘ held and Tab tapped at the Mac: the first `next()` holds ⌘
+    /// and presses Tab (the switcher shows, on the app used before), each one after presses Tab again (the next app),
+    /// and `close()` lets go of ⌘, which switches to the app picked. Modifiers held on a hardware keyboard are let go
+    /// of while it's up, as for a shortcut, and pressed again after.
+    public struct AppSwitcher {
+        public private(set) var isOpen = false
+        private var held: [Int] = [], caps = false
+        public init() {}
+
+        public mutating func next(held: [Int] = [], capsLock: Bool = false) -> [Msg] {
+            var out: [Msg] = []
+            if !isOpen {
+                isOpen = true; self.held = held; caps = capsLock
+                let open = Keymap.shortcut(tab, modifiers: [leftCommand], held: held, capsLock: capsLock)
+                out = Array(open.prefix(held.count + 1))   // held ones up, ⌘ down
+            }
+            let f = (caps ? Keymap.capsLock : 0) | Keymap.command
+            for pressed in [true, false] { var m = Msg("key"); m.k = tab; m.down = pressed; m.f = f; out.append(m) }
+            return out
+        }
+
+        public mutating func close() -> [Msg] {
+            guard isOpen else { return [] }
+            isOpen = false
+            return Array(Keymap.shortcut(tab, modifiers: [leftCommand], held: held, capsLock: caps).suffix(held.count + 1))   // ⌘ up, held ones down
+        }
+    }
+
     /// HID usage → Mac key code.
     static let table: [Int: Int] = [
         // letters a…z
