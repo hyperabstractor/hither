@@ -6,42 +6,6 @@ public struct ModeSize: Equatable {
     public init(width: Int, height: Int, pixelWidth: Int) { self.width = width; self.height = height; self.pixelWidth = pixelWidth }
 }
 
-/// Which of a display's modes a viewer's screen (points, and Retina or not) shows best: for a Retina viewer a HiDPI mode
-/// about the size of its own screen if there is one, so text is as sharp as on the screen itself; then the shape that
-/// fills the viewer's window most; among near-equals, the most room.
-public func bestMode(_ modes: [ModeSize], for viewer: CGSize, scale: Double) -> Int? {
-    let usable = modes.indices.filter { modes[$0].width >= 1024 }
-    let hiDPI = usable.filter { let m = modes[$0]
-        return m.pixelWidth >= 2 * m.width && Double(m.width) >= 0.75 * viewer.width && Double(m.height) >= 0.75 * viewer.height }
-    let pool = scale >= 2 && !hiDPI.isEmpty ? hiDPI : usable
-    let a = viewer.width / viewer.height
-    let fills = { (i: Int) -> Double in let r = Double(modes[i].width) / Double(modes[i].height); return min(r / a, a / r) }
-    guard let most = pool.map(fills).max() else { return nil }
-    let sharp = { (i: Int) in scale >= 2 ? modes[i].pixelWidth : -modes[i].pixelWidth }   // HiDPI only if it can be seen
-    return pool.filter { most - fills($0) < 0.02 }.max { a, b in
-        (modes[a].width * modes[a].height, sharp(a)) < (modes[b].width * modes[b].height, sharp(b))
-    }
-}
-
-/// Adaptive Desktop: the mode whose picture best matches the window, Retina for a Retina viewer, plain for one that
-/// isn't. A mode that fits `room` (the most the viewer has, title bar left out) shows 1:1, pixel for pixel, and the
-/// window snaps to it; a bigger one is shown scaled down to fit, which costs some sharpness, so it wins only when it
-/// fills the window much better (an ultrawide whose Retina modes are all a bit too wide or far too small).
-public func snapMode(_ modes: [ModeSize], to window: CGSize, within room: CGSize, scale: Double) -> Int? {
-    guard window.width > 0, window.height > 0, room.width > 0, room.height > 0 else { return nil }
-    let usable = modes.indices.filter { modes[$0].width >= 800 }
-    let hiDPI = usable.filter { modes[$0].pixelWidth >= 2 * modes[$0].width }
-    let plain = usable.filter { modes[$0].pixelWidth < 2 * modes[$0].width }
-    let pool = scale >= 2 ? (hiDPI.isEmpty ? usable : hiDPI) : (plain.isEmpty ? usable : plain)
-    func cost(_ i: Int) -> Double {
-        let w = Double(modes[i].width), h = Double(modes[i].height)
-        let k = min(1, room.width / w, room.height / h)   // shown at this scale
-        return abs(log(w * k / window.width)) + abs(log(h * k / window.height)) + 2 * abs(log(k))
-    }
-    let area = { (i: Int) in modes[i].width * modes[i].height }
-    return pool.min { (cost($0), -area($0)) < (cost($1), -area($1)) }
-}
-
 /// Adaptive Desktop sizes on the iPad: Default is the view's own points (1:1, Retina), More Space and Most Space give
 /// the Mac that many times more, which the viewer shows scaled down to fit (still Retina-rendered, like a Mac's own
 /// scaled modes, so text stays sharp, just smaller).

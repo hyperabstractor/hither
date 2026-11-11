@@ -28,35 +28,15 @@ func testFrameWindow() throws {
     try expectEqual(moved.limit, 3)       // …until that minimum is 10 s old
 }
 
-/// The office LG ultrawide (its real mode list) viewed from a 15" MacBook Air (1710×1112 points, Retina): the
-/// 1920×1080 HiDPI mode, sharp and 16:9, not the 4:3 mode that fills its window a hair better. A non-Retina viewer
-/// gets the same room without HiDPI (it couldn't show the extra pixels, and they'd cost a 4K encode).
+/// Display sizes: Adaptive's on a virtual display (exactly the viewer's, or more of them), and the Retina mode app
+/// windows get (the office LG ultrawide's real mode list).
 func testDisplayFit() throws {
     let lg = [(3440, 1440, 3440), (2560, 1080, 2560), (2048, 1080, 4096), (1920, 1080, 3840), (1920, 1080, 1920),
               (1600, 1200, 1600), (2048, 858, 2048), (1920, 804, 1920), (1344, 1008, 1344), (1720, 720, 1720),
               (1720, 720, 3440), (1280, 960, 1280), (1600, 670, 1600), (1280, 720, 1280), (1024, 768, 1024),
               (1344, 562, 1344), (1280, 540, 2560), (1280, 536, 1280), (960, 540, 1920), (800, 600, 1600), (800, 600, 800)]
         .map { ModeSize(width: $0.0, height: $0.1, pixelWidth: $0.2) }
-    let air = CGSize(width: 1710, height: 1112)
-    try expectEqual(bestMode(lg, for: air, scale: 2).map { lg[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
-    try expectEqual(bestMode(lg, for: air, scale: 1).map { lg[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 1920))
-    try expectEqual(bestMode(lg, for: CGSize(width: 1920, height: 1080), scale: 2).map { lg[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
-    // Adaptive Desktop: a mode that fits the viewer's room shows 1:1 and the window snaps to it; a bigger one only
-    // when it fills the window much better. Retina for Retina.
     let room = CGSize(width: 1710, height: 1045)   // the Air: visible area less the title bar
-    // the LG's Retina modes that fit the Air are tiny (1280×540): 1920×1080 a little scaled down fills it
-    try expectEqual(snapMode(lg, to: room, within: room, scale: 2).map { lg[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
-    try expectEqual(snapMode(lg, to: CGSize(width: 1700, height: 760), within: CGSize(width: 1800, height: 1045), scale: 2).map { lg[$0] }, ModeSize(width: 1720, height: 720, pixelWidth: 3440))
-    try expectEqual(snapMode(lg, to: CGSize(width: 1700, height: 760), within: CGSize(width: 1800, height: 1045), scale: 1).map { lg[$0] }, ModeSize(width: 1720, height: 720, pixelWidth: 1720))
-    try expectEqual(snapMode(lg, to: CGSize(width: 3440, height: 1440), within: CGSize(width: 3440, height: 1440), scale: 1).map { lg[$0] }, ModeSize(width: 3440, height: 1440, pixelWidth: 3440))
-    try expectEqual(snapMode(lg, to: CGSize(width: 1250, height: 560), within: room, scale: 2).map { lg[$0] }, ModeSize(width: 1280, height: 540, pixelWidth: 2560))
-    // the Mini's Acer 4K (its Retina modes, all 16:9) from the Air: 1:1 modes that fit beat a scaled-down 1920×1080
-    let acer = [(800, 600), (840, 525), (960, 540), (1024, 576), (1152, 648), (1280, 720), (1504, 846), (1600, 900),
-                (1680, 945), (1920, 1080), (2048, 1152), (2304, 1296), (2560, 1440)].map { ModeSize(width: $0.0, height: $0.1, pixelWidth: 2 * $0.0) }
-    try expectEqual(snapMode(acer, to: room, within: room, scale: 2).map { acer[$0] }, ModeSize(width: 1680, height: 945, pixelWidth: 3360))
-    try expectEqual(snapMode(acer, to: CGSize(width: 1300, height: 750), within: room, scale: 2).map { acer[$0] }, ModeSize(width: 1280, height: 720, pixelWidth: 2560))
-    try expectEqual(snapMode(acer, to: CGSize(width: 1590, height: 890), within: room, scale: 2).map { acer[$0] }, ModeSize(width: 1600, height: 900, pixelWidth: 3200))
-    try expectEqual(snapMode(acer, to: CGSize(width: 2000, height: 1100), within: CGSize(width: 2560, height: 1400), scale: 2).map { acer[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
     // the iPad mini's view (1158×756) with more space: 1.25× and 1.5× the points, shown scaled down
     try expectEqual(DesktopSpace.more.size(for: CGSize(width: 1158, height: 756)), CGSize(width: 1447, height: 945))
     try expectEqual(DesktopSpace.most.size(for: CGSize(width: 1158, height: 756)), CGSize(width: 1737, height: 1134))

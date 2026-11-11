@@ -83,7 +83,7 @@ final class RemoteWindow: ObservableObject, Identifiable {
 
     // MARK: Desktop: Adaptive or Native
 
-    /// Native keeps the Mac's screen at its own resolution; Adaptive has a dark one take the mode nearest this view
+    /// Native keeps the Mac's screen at its own resolution; Adaptive gives a dark one this view's size (`space`)
     /// (only while Keep Screen Dark is on there: nobody sees its monitors change). Native unless chosen otherwise:
     /// a screen the size of a phone or tablet would crowd every window on the Mac. Remembered per Mac.
     var native: Bool {
@@ -233,6 +233,11 @@ final class RemoteWindow: ObservableObject, Identifiable {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.connect() }
     }
 
+    // a locked Mac: unlocked with its saved password (Unlocker)
+    private var unlocker: Unlocker { Unlocker.shared.macsFlash = { [weak macs] in macs?.flash($0) }; return .shared }
+    private var unlockSend: (Msg) -> Void { { [weak self] in self?.wire?.send($0) } }
+    private var unlockPresent: () -> UIViewController? { { [weak self] in self?.view.window?.rootViewController } }
+
     func handle(_ m: Msg) {
         switch m.t {
         case "opened":
@@ -254,8 +259,11 @@ final class RemoteWindow: ObservableObject, Identifiable {
             view.remoteSize = CGSize(width: m.w ?? 0, height: m.h ?? 0)
             tellHost()
             sessions?.resolved(self)   // the same window or display already open in another session: that one stays
+            if m.locked == true { unlocker.locked(mac, send: unlockSend, present: unlockPresent) }   // saved password
             guard !done else { return }
             fitHost()
+        case "locked", "unlocked":   // locked or unlocked meanwhile, or how an unlock went
+            unlocker.result(mac, locked: m.locked ?? false, tried: m.t == "unlocked", send: unlockSend, present: unlockPresent)
         case "size":
             let s = CGSize(width: m.w ?? 0, height: m.h ?? 0)
             view.remoteSize = s
@@ -316,7 +324,8 @@ final class RemoteWindow: ObservableObject, Identifiable {
     }
 
     /// A Desktop: Adaptive tells the host this view's size, times its space (all the room there is, at this screen's
-    /// scale), and a dark display there takes that size exactly (a virtual display) or the mode nearest it; Native says to keep its own. The host answers with "size".
+    /// scale), and a dark display there shows a virtual display that size; Native says to keep its own. The host
+    /// answers with "size".
     func sendShape() {
         guard isDesktop, opened, place.shown, let w = wire else { return }
         let s = space.size(for: view.bounds.size)

@@ -447,7 +447,7 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
     }
 
     /// Zoom here (Fit, 1:1, in and out; pinch does it too), and what the Mac's screen does: Adaptive has it take the
-    /// resolution nearest this screen while Keep Screen Dark is on; Native keeps its own.
+    /// size of this screen (Adaptive Size) while Keep Screen Dark is on; Native keeps its own.
     private func desktopMenu(_ info: String) -> [UIMenuElement] {
         let v = window.view, z = v.zoom, pct = Int((v.scaleNow * 100).rounded())
         let zoom = UIMenu(title: "Zoom · \(pct)%", options: .displayInline, children: [
@@ -495,7 +495,13 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
                 macs.setDark(!dark, on: mac)
             },
             UIAction(title: "Lock \(name)…", image: symbol("lock")) { [weak self] _ in self?.confirmLock() },
-        ])
+        ] + (SavedPassword.has(mac.id) ? [
+            UIAction(title: "Forget Saved Password", subtitle: "\(name) won't unlock by itself", image: symbol("key.slash")) { [weak self] _ in
+                guard let self else { return }
+                SavedPassword.forget(mac.id)
+                macs.flash("Forgot \(name)'s password")
+            },
+        ] : []))
         return [clip, screen]
     }
 

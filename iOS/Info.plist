@@ -12,6 +12,8 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Hither uses Face ID to unlock your Mac with its saved password.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Hither saves images you got from your Mac when you ask it to.</string>
 </dict>

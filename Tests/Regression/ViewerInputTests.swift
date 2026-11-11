@@ -138,6 +138,14 @@ private extension Optional {
     }
 }
 
+/// A saved password reaches the lock screen as the real keys a US keyboard would press.
+func testUSKeys() throws {
+    let keys = { (s: String) in s.map { Keymap.usKey(for: $0).map { "\($0.code)\($0.shift ? "⇧" : "")" } ?? "-" } }
+    try expectEqual(keys("aZ1!"), ["0", "6⇧", "18", "18⇧"])
+    try expectEqual(keys(" -_@?"), ["49", "27", "27⇧", "19⇧", "44⇧"])
+    try expectEqual(keys("`~\\|\"'é"), ["50", "50⇧", "42", "42⇧", "39⇧", "39", "-"])
+}
+
 /// Switch app keeps the Mac's app switcher up: ⌘ down and Tab, Tab again for each tap, ⌘ up to pick, and a hardware
 /// keyboard's modifiers stay out of it and are held again after.
 func testAppSwitcher() throws {

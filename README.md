@@ -23,10 +23,9 @@ local network.
 - **Both directions.** Every Mac runs the same app: it shares its own windows and shows the other Mac's.
 - **Whole desktop.** Desktop, at the top of each Mac's section, streams its whole screen the same smooth way:
   menu bar, Dock and every window. You can unlock a locked Mac from there too. Its toolbar picks how:
-  **Adaptive** has the other Mac's dark screen take the resolution closest to this window (Retina on a Retina
-  screen), so it shows about 1:1; resize the window and it re-fits when you let go. It's exact: that Mac makes a
-  virtual display just the window's size, which its dark monitor mirrors until you're done (private macOS API; a
-  `no-virtual` file in `~/.hither` goes back to the monitor's nearest mode). **Native** leaves its resolution
+  **Adaptive** gives the other Mac's dark screen exactly this window's size (Retina on a Retina screen), so it
+  shows 1:1; resize the window and it re-fits when you let go. That Mac makes a virtual display just the window's
+  size, which its dark monitor mirrors until you're done (private macOS API). **Native** leaves its resolution
   alone: zoom out, 1:1 and in (⌃⌥⌘−, ⌃⌥⌘0, ⌃⌥⌘=) or fit (⌃⌥⌘9), and when it's bigger than the window, the picture
   follows the pointer: where it is across the window is where it is across that screen.
 - **Sharp text.** While its screen is dark, the other Mac switches to its roomiest Retina mode as long as you're

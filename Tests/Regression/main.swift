@@ -46,6 +46,7 @@ do {
     print("PASS a flick glides on by elapsed time, the same at any frame rate, and its momentum always ends once")
     try testShortcut()
     try testAppSwitcher()
+    try testUSKeys()
     print("PASS Switch app holds ⌘ so the Mac's app switcher shows, Tab per tap, and leaves what a hardware keyboard holds held")
     try testSessionTargets()
     try testSessionSelection()

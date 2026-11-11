@@ -35,6 +35,54 @@ var lastWindowInputAt: CFTimeInterval = 0
 var wakeID: IOPMAssertionID = 0, lastWake: CFTimeInterval = 0
 /// Runs on inputQ. Remote use counts as someone at this Mac: wakes a sleeping display (capture needs it) and
 /// resets the idle timer, exactly like touching its own keyboard.
+/// The monitor that shows display `id`: the one mirroring it, if it's a virtual display standing in for one, else itself.
+func monitor(behind id: CGDirectDisplayID) -> CGDirectDisplayID {
+    var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
+    CGGetOnlineDisplayList(16, &ids, &n)
+    return ids.prefix(Int(n)).first { $0 != id && CGDisplayMirrorsDisplay($0) == id } ?? id
+}
+
+/// The screen is locked (the lock screen is up, asking for the password).
+func screenLocked() -> Bool {
+    (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
+}
+
+/// A viewer's saved password, typed into the lock screen, then Return; the answer says whether that unlocked it. Only
+/// while it's locked, checked again just before typing: otherwise it would land in whatever has the keyboard.
+func unlock(_ password: String, reply: @escaping (Msg) -> Void) {
+    let answer = { var m = Msg("unlocked"); m.locked = screenLocked(); reply(m) }
+    guard screenLocked() else { log("unlock: not locked"); return answer() }
+    inputQ.async { lastWake = 0; wake() }   // the display on, so the password field is up
+    inputQ.asyncAfter(deadline: .now() + 1.5) {
+        guard screenLocked() else { return answer() }
+        log("unlock: typing the saved password (\(password.count) characters)")
+        // as a keyboard would: the real key for each character (US layout), Shift around it if it takes Shift, the
+        // character itself on it too, at about typing speed; the password field drops a burst
+        let src = CGEventSource(stateID: .hidSystemState)
+        func post(_ e: CGEvent?) { e?.post(tap: .cghidEventTap); usleep(15_000) }
+        for ch in password {
+            let key = Keymap.usKey(for: ch), units = Array(String(ch).utf16)
+            let flags: CGEventFlags = key?.shift == true ? .maskShift : []
+            func shift(_ down: Bool) {   // a modifier is a flags change, not a key press
+                let e = CGEvent(keyboardEventSource: src, virtualKey: 0x38, keyDown: down)
+                e?.type = .flagsChanged; e?.flags = down ? .maskShift : []
+                post(e)
+            }
+            if key?.shift == true { shift(true) }
+            for down in [true, false] {
+                let e = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(key?.code ?? 0), keyDown: down)
+                e?.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+                e?.flags = flags
+                post(e)
+            }
+            if key?.shift == true { shift(false) }
+        }
+        usleep(100_000)
+        for down in [true, false] { let e = CGEvent(keyboardEventSource: src, virtualKey: 36, keyDown: down); e?.flags = []; post(e) }
+        inputQ.asyncAfter(deadline: .now() + 3) { answer() }   // a wrong one shakes and stays locked
+    }
+}
+
 func wake() {
     guard CACurrentMediaTime() - lastWake > 1 else { return }
     lastWake = CACurrentMediaTime()
@@ -76,10 +124,10 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var desktop = false              // a whole display, not one app's window
     var home: CGDirectDisplayID = 0  // desktop: the monitor asked for (windowID may be a virtual display standing in)
     var opened = false               // streaming something: keeps this Mac's screen dark (Dark)
-    var viewer: (size: CGSize, scale: Double)?   // desktop: the viewer's screen, whose shape a dark display may take (Dark.fit)
     var adapt: (size: CGSize, room: CGSize, scale: Double)?   // desktop, Adaptive: the viewer's window and the most room it
-                                                 // has, which a dark display takes the nearest mode to (Dark.fit)
+                                                 // has: a dark monitor shows a virtual display that size (Dark.fit)
     var adaptAsked = false                       // …and the viewer waits to hear the size it snaps to, even if unchanged
+    var adaptAt: CFTimeInterval = 0              // …when it last asked: of two Desktops wanting a size, the newer wins
     var nativeDesktop = false                    // desktop, Native: the display keeps its own mode, whatever else wants it
     var viewerScale = 1.0                        // the viewer's screen: 2 = Retina (app windows get a HiDPI mode then)
     var ax: AXUIElement?
@@ -92,6 +140,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var ticks = 0
     var ended = false
     var title: String?               // remote window title, pushed to the viewer when it changes
+    var locked = false               // the screen was locked, as last told to the viewer
     var sentIcons: Set<String> = []  // app icons already sent on this connection
 
     var encoder: VTCompressionSession?
@@ -180,6 +229,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             DispatchQueue.main.async { Dark.enabled = on }
             Task { await list() }   // reply with the new state
         case "lock": DispatchQueue.main.async { Dark.lock() }
+        case "unlock": if let pw = m.text, !pw.isEmpty { unlock(pw) { [weak self] in self?.wire.send($0) } }
         case "clipget":   // Get Clipboard on the viewer. Off the main queue: macOS may hold the read for a privacy prompt
             clipQ.async {
                 if #available(macOS 15.4, *), NSPasteboard.general.accessBehavior == .alwaysDeny {
@@ -269,18 +319,14 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             pump()   // newly visible: send whatever changed while hidden
         case "focus": if pid != 0 { inputQ.async { self.focus(force: false) } }   // proxy became the active window on the client
         case "resize":
-            if !desktop { resize(m.w ?? frame.width, m.h ?? frame.height) }
-            else if let w = m.w, let h = m.h, w > 0, h > 0 {   // a shape to fit, if dark
-                viewer = (CGSize(width: w, height: h), m.scale ?? 1)
-                DispatchQueue.main.async { Dark.tick() }
-            }
+            if !desktop { resize(m.w ?? frame.width, m.h ?? frame.height) }   // a Desktop's size comes as "adapt"
         case "adapt" where desktop:   // the Mac viewer's Desktop: its window's size (Adaptive), or none (Native)
             if let w = m.w, let h = m.h, w > 0, h > 0 {   // x, y: the most room the viewer has (older viewers: the window)
                 adapt = (CGSize(width: w, height: h), CGSize(width: m.x ?? w, height: m.y ?? h), m.scale ?? 1); nativeDesktop = false
                 adaptAsked = true
+                adaptAt = CACurrentMediaTime()
             }
             else { adapt = nil; nativeDesktop = true }
-            viewer = nil
             log("desktop \(adapt.map { "adaptive to \(Int($0.size.width))×\(Int($0.size.height)) within \(Int($0.room.width))×\(Int($0.room.height))" } ?? "native")")
             DispatchQueue.main.async { Dark.tick() }
         case "close": menuQ.async { pressClose(CGWindowID(m.k ?? 0)) }   // launcher menu's X; AX can block on a modal
@@ -392,6 +438,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             m.w = win.frame.width; m.h = win.frame.height
             m.k = Int(win.windowID)
             m.icon = NSRunningApplication(processIdentifier: pid)?.icon.flatMap(png)
+            locked = screenLocked(); m.locked = locked
             wire.send(m)
             log("opening \(owner.applicationName) '\(win.title ?? "")', accessibility=\(AXIsProcessTrusted())")
             await capture()
@@ -408,7 +455,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
             opened = true
             codec = viewerCodec()
             windowID = id != 0 && CGDisplayIsOnline(id) != 0 ? id : main
-            home = windowID
+            home = monitor(behind: windowID)   // a virtual display standing in (Virtual): the monitor it stands for
             frame = CGDisplayBounds(windowID)
             if case .hostPort(_, let port) = wire.conn.endpoint { appName = "Desktop:\(port)" } else { appName = "Desktop" }
         }
@@ -417,6 +464,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         m.title = localName()
         m.w = frame.width; m.h = frame.height
         m.k = Int(windowID)
+        let l = screenLocked(); q.sync { locked = l }; m.locked = l
         wire.send(m)
         log("opening desktop \(Int(frame.width))×\(Int(frame.height)), accessibility=\(AXIsProcessTrusted())")
         await capture()
@@ -586,6 +634,11 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
                        r.isEmpty ? 0 : r[r.count / 2], r.last ?? 0, window.limit, nDelayed, nLost, nResent, nInUDP, nInTCP, nRaises, nRaises > 0 ? raiseMs / Double(nRaises) : 0, nAudio / 5, audioPeak))
             nLost = 0; nResent = 0; nInUDP = 0; nInTCP = 0
             nAudio = 0; audioPeak = 0; nFrames = 0; nBytes = 0; nKeys = 0; nDelayed = 0; nRaises = 0; encMs = 0; raiseMs = 0; rtts = []
+        }
+        if ticks % 4 == 0, screenLocked() != locked {   // locked or unlocked here: the viewer may save a password
+            locked.toggle()
+            var m = Msg("locked"); m.locked = locked
+            wire.send(m)
         }
         if ticks % 4 == 0 {  // new/closed sibling windows → refresh exclusions ~1/s
             Task {
@@ -1093,10 +1146,9 @@ func isOurs(_ bundle: String) -> Bool { bundle.hasPrefix("dev.hither.") }
 /// Adaptive Desktop at exactly the viewer's size: a virtual display made that size (Retina for a Retina viewer), which
 /// the dark monitor mirrors, so every window moves onto it, and it's what the Desktop streams. One per monitor, resized
 /// in place as the window is; gone once nothing wants it, and with the host if it dies (as is the mirroring). Uses
-/// private CoreGraphics API (CGVirtualDisplay, see VirtualDisplay.h): a `no-virtual` file in the config folder turns
-/// it off, and then, or if one can't be made, the monitor takes its nearest mode instead. Main queue.
+/// private CoreGraphics API (CGVirtualDisplay, see VirtualDisplay.h); if one can't be made, the monitor stays as it is
+/// (as with Native). Main queue.
 enum Virtual {
-    static var on: Bool { !FileManager.default.fileExists(atPath: configDir.appending(path: "no-virtual").path) }
     static var displays: [CGDirectDisplayID: (display: CGVirtualDisplay, width: Int, height: Int, retina: Bool)] = [:]   // by monitor
 
     /// The virtual display standing in for monitor `d`, at `size` points: made, or changed to that size (`changed`).
@@ -1116,7 +1168,7 @@ enum Virtual {
         desc.queue = .main
         desc.terminationHandler = { _, _ in log("virtual display for \(d) ended"); displays[d] = nil }
         guard let v = CGVirtualDisplay(descriptor: desc), apply(v, size, retina) else {
-            log("virtual display \(size.width)×\(size.height): couldn't make one, using the monitor's modes"); return nil
+            log("virtual display \(size.width)×\(size.height): couldn't make one, the monitor stays as it is"); return nil
         }
         displays[d] = (v, size.width, size.height, retina)
         mirror(d, to: v.displayID)
@@ -1201,21 +1253,21 @@ enum Dark {
     static var fittedTo: [CGDirectDisplayID: CGDisplayMode] = [:] // …and the mode they were switched to (macOS reports the
                                                                    // old one for a moment after a switch)
 
-    /// A dark monitor nobody looks at can change mode for whoever streams it: an Adaptive Desktop takes the mode nearest
-    /// its window that the viewer has room for, and the window snaps to it (shown 1:1, pixel for pixel), an iPhone's the
-    /// shape of its screen,
-    /// and app windows for a Retina viewer the roomiest HiDPI mode (captured at 2x, their text stays sharp). A Native
-    /// Desktop keeps the display's own mode. Back to its own mode once nothing wants it; the change is the host's alone,
+    /// A dark monitor nobody looks at can change for whoever streams it: an Adaptive Desktop gets a virtual display its
+    /// window's size, which the monitor mirrors (Virtual; shown 1:1, pixel for pixel), and app windows for a Retina
+    /// viewer the monitor's roomiest HiDPI mode (captured at 2x, their text stays sharp). A Native Desktop keeps the
+    /// display's own mode. Back to its own mode once nothing wants it; the change is the host's alone,
     /// so macOS undoes it if the host dies.
     static func fit() {
-        enum Want { case shape(CGSize, Double), snap(CGSize, CGSize, Double), retina }
+        enum Want { case snap(CGSize, CGSize, Double), retina }
         var want: [CGDirectDisplayID: Want] = [:], native = Set<CGDirectDisplayID>()
         if enabled {
             let open = sessions.values.filter { $0.opened && !$0.ended }
-            for s in open where s.desktop {
+            // two Desktops of one monitor (an iPad's and a Mac's): the one on screen that asked last decides its size
+            let order = { (s: Session) in (s.visible ? 1 : 0, s.adaptAt) }
+            for s in open.sorted(by: { order($0) < order($1) }) where s.desktop {
                 if let a = s.adapt { want[s.home] = .snap(a.size, a.room, a.scale) }
                 else if s.nativeDesktop { native.insert(s.home) }
-                else if let v = s.viewer { want[s.home] = .shape(v.size, v.scale) }
             }
             // app windows for a Retina viewer: a HiDPI mode, so their text is as sharp there as here (unless a Desktop
             // on that display wants something else, or wants it left alone)
@@ -1225,13 +1277,13 @@ enum Dark {
         }
         let physical = physicalDisplays()
         var changed = Set<CGDirectDisplayID>()
-        let virtual = { (d: CGDirectDisplayID) -> Bool in if Virtual.on, case .snap = want[d] { return true }; return false }
+        let virtual = { (d: CGDirectDisplayID) -> Bool in if case .snap = want[d] { return true }; return false }
         for (d, own) in fitted where want[d] == nil || virtual(d) {   // its own mode again (before it mirrors one)
             fitted[d] = nil
             fittedTo[d] = nil
             set(d, own)
         }
-        // Adaptive at exactly the window's size: a virtual display the monitor mirrors, if one can be made
+        // Adaptive: exactly the window's size, a virtual display the monitor mirrors (none made: it stays as it is)
         var stand: [CGDirectDisplayID: CGDirectDisplayID] = [:]   // monitor → the virtual display standing in for it
         for (d, w) in want where physical.contains(d) && virtual(d) {
             guard case .snap(let size, let room, let scale) = w, let wh = virtualSize(for: size, within: room),
@@ -1245,13 +1297,9 @@ enum Dark {
             if s.windowID != id { s.q.async { s.show(id) }; changed.insert(s.home) }
         }
         let same = { (a: CGDisplayMode, b: CGDisplayMode) in a.width == b.width && a.height == b.height && a.pixelWidth == b.pixelWidth }
-        for (d, w) in want where physical.contains(d) && stand[d] == nil {
-            let best: CGDisplayMode?
-            switch w {
-            case .shape(let size, let scale): best = bestMode(d, for: size, scale: scale)
-            case .snap(let size, let room, let scale): best = pick(d) { snapMode($0, to: size, within: room, scale: scale) }
-            case .retina: best = pick(d) { largestRetina($0) }
-            }
+        for (d, w) in want where physical.contains(d) {   // app windows: the monitor's roomiest Retina mode
+            guard case .retina = w else { continue }
+            let best = pick(d) { largestRetina($0) }
             guard let current = CGDisplayCopyDisplayMode(d), let best, !same(best, current) else { continue }
             if let to = fittedTo[d], same(to, best) { changed.insert(d); continue }   // switched, not reported yet
             if fitted[d] == nil { fitted[d] = current }
@@ -1265,10 +1313,6 @@ enum Dark {
             s.adaptAsked = false
             if !changed.contains(s.home) { s.q.async { var m = Msg("size"); m.w = s.frame.width; m.h = s.frame.height; s.wire.send(m) } }
         }
-    }
-
-    static func bestMode(_ d: CGDirectDisplayID, for viewer: CGSize, scale: Double) -> CGDisplayMode? {
-        pick(d) { Shared.bestMode($0, for: viewer, scale: scale) }
     }
 
     /// One of display `d`'s modes, chosen by `choose` from their sizes.

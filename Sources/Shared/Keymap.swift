@@ -62,6 +62,18 @@ public enum Keymap {
         }
     }
 
+    /// The key that types `c` on a US keyboard, and whether it takes Shift (nil: not on one). For typing where only
+    /// real keys will do, like the lock screen's password field.
+    public static func usKey(for c: Character) -> (code: Int, shift: Bool)? {
+        let us = Array("asdfhgzxcv§bqweryt123465=97-80]ou[ip\rlj'k;\\,/nm.\t `")
+        let shifted = Array("~!@#$%^&*()_+{}|:\"<>?"), unshifted = Array("`1234567890-=[]\\;',./")
+        if c == " " { return (0x31, false) }
+        if c.isUppercase, c.isASCII, let i = us.firstIndex(of: Character(c.lowercased())) { return (i, true) }
+        if let j = shifted.firstIndex(of: c), let i = us.firstIndex(of: unshifted[j]) { return (i, true) }
+        guard c != "§", c.isASCII, !c.isWhitespace, let i = us.firstIndex(of: c) else { return nil }
+        return (i, false)
+    }
+
     /// HID usage → Mac key code.
     static let table: [Int: Int] = [
         // letters a…z
