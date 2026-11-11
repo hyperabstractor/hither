@@ -108,6 +108,10 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
         window.attached = self
         view.addSubview(v)
         v.onResign = { [weak self] in self?.takeKeys() }
+        v.onKeysMoved = { [weak self] in   // the keys came, went or moved with a floating keyboard
+            guard let self, dragFrom == nil else { return }
+            UIView.animate(withDuration: 0.2) { self.placeControls() }
+        }
 
         menusButton = menuButton("menubar.rectangle", label: "App menus") { [weak self] in self?.appMenus() ?? [] }
         sessionsButton = menuButton("rectangle.stack", label: "Sessions") { [weak self] in self?.sessionsMenu() ?? [] }
@@ -226,10 +230,11 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
         if dragFrom == nil { placeControls() }
     }
 
-    /// The on-screen keyboard, where it covers this view.
+    /// The on-screen keyboard and the keys on it, where they cover this view.
     private var keyboardHere: CGRect? {
-        guard let k = keyboard, let screen = view.window?.screen else { return nil }
-        let f = view.convert(k, from: screen.coordinateSpace).intersection(view.bounds)
+        var f = CGRect.null
+        if let k = keyboard, let screen = view.window?.screen { f = view.convert(k, from: screen.coordinateSpace).intersection(view.bounds) }
+        if let c = window.view.keyboardCover { f = f.union(view.convert(c, from: window.view)) }
         return f.isNull || f.isEmpty ? nil : f
     }
 

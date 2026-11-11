@@ -20,53 +20,92 @@ enum Keys {
     }
 }
 
-/// The row above the keyboard: keys the iPhone keyboard lacks. Modifiers latch for the next key or click.
-final class KeyBar: UIInputView, UIInputViewAudioFeedback {
+/// The keys the iPhone and iPad keyboards lack, on glass above the on-screen keyboard: one row along the top of a
+/// docked one (or at the bottom with a hardware keyboard), two rows above a floating one, the same width, moving
+/// with it (`compact`). Modifiers latch for the next key or click. StreamView places it by the keyboard layout guide:
+/// iPadOS shows an input accessory view at the bottom of the screen, with nothing behind it, when the keyboard floats.
+final class KeyBar: UIView {
     var onKey: (Int) -> Void = { _ in }
     var onHide: () -> Void = {}
     private(set) var latched: UInt64 = 0
+    /// Two rows, rounded: above a floating keyboard.
+    var compact = false {
+        didSet {
+            guard compact != oldValue else { return }
+            backdrop.layer.cornerRadius = compact ? 16 : 0
+            for b in first + second + [hide!] {   // narrow keys in the grid: less padding, so "esc" stays on one line
+                b.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: compact ? 2 : 12, bottom: 6, trailing: compact ? 2 : 12)
+            }
+            invalidateIntrinsicContentSize()
+            setNeedsLayout()
+        }
+    }
+
     private var modifierButtons: [(flag: UInt64, button: UIButton)] = []
-    var enableInputClicksWhenVisible: Bool { true }
+    private var first: [UIButton] = [], second: [UIButton] = []   // esc tab ⌃ ⌥ ⌘ ⇧ | ← ↑ ↓ →
+    private var hide: UIButton!
+    private let backdrop: UIVisualEffectView = {
+        if #available(iOS 26, *) { return UIVisualEffectView(effect: UIGlassEffect()) }
+        return UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
+    }()
+    private let scroll = UIScrollView()
+    private static let pad: CGFloat = 6, keyHeight: CGFloat = 36
 
     init() {
-        super.init(frame: CGRect(x: 0, y: 0, width: 0, height: 48), inputViewStyle: .keyboard)
-        let row = UIStackView()
-        row.axis = .horizontal
-        row.spacing = 6
+        super.init(frame: .zero)
+        backdrop.clipsToBounds = true
+        addSubview(backdrop)
+        scroll.showsHorizontalScrollIndicator = false
+        backdrop.contentView.addSubview(scroll)
         for (title, code) in [("esc", Keys.escape), ("tab", Keys.tab)] {
-            row.addArrangedSubview(key(title: title) { [weak self] in self?.onKey(code) })
+            first.append(key(title: title) { [weak self] in self?.onKey(code) })
         }
         for (title, flag) in [("⌃", Keys.control), ("⌥", Keys.option), ("⌘", Keys.command), ("⇧", Keys.shift)] {
             let b = key(title: title) { [weak self] in self?.toggle(flag) }
             modifierButtons.append((flag, b))
-            row.addArrangedSubview(b)
+            first.append(b)
         }
         for (symbol, code) in [("arrow.left", Keys.left), ("arrow.up", Keys.up), ("arrow.down", Keys.down), ("arrow.right", Keys.right)] {
-            row.addArrangedSubview(key(symbol: symbol) { [weak self] in self?.onKey(code) })
+            second.append(key(symbol: symbol) { [weak self] in self?.onKey(code) })
         }
-        let hide = key(symbol: "keyboard.chevron.compact.down") { [weak self] in self?.onHide() }
-
-        let scroll = UIScrollView()
-        scroll.showsHorizontalScrollIndicator = false
-        scroll.addSubview(row)
-        for v in [scroll, row, hide] as [UIView] { v.translatesAutoresizingMaskIntoConstraints = false }
-        addSubview(scroll)
-        addSubview(hide)
-        NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 6),
-            scroll.trailingAnchor.constraint(equalTo: hide.leadingAnchor, constant: -6),
-            scroll.topAnchor.constraint(equalTo: topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
-            row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
-            row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
-            row.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
-            row.heightAnchor.constraint(equalToConstant: 36),
-            hide.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -6),
-            hide.centerYAnchor.constraint(equalTo: centerYAnchor),
-            hide.heightAnchor.constraint(equalToConstant: 36),
-        ])
+        hide = key(symbol: "keyboard.chevron.compact.down") { [weak self] in self?.onHide() }
+        (first + second).forEach(scroll.addSubview)
+        backdrop.contentView.addSubview(hide)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: Self.pad + (compact ? 2 * (Self.keyHeight + Self.pad) : Self.keyHeight + Self.pad) + 6)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        backdrop.frame = bounds
+        let pad = Self.pad, h = Self.keyHeight, w = { (b: UIButton) in max(44, b.intrinsicContentSize.width) }
+        if compact {   // a grid as wide as the keyboard: six keys, then the arrows and hide
+            scroll.frame = backdrop.bounds
+            scroll.contentSize = scroll.bounds.size
+            let inner = bounds.insetBy(dx: pad, dy: pad + 3)
+            for (row, keys) in ([first, second + [hide]] as [[UIButton]]).enumerated() {
+                let kw = (inner.width - pad * CGFloat(keys.count - 1)) / CGFloat(keys.count)
+                for (i, b) in keys.enumerated() {
+                    if b === hide, hide.superview !== scroll { scroll.addSubview(hide) }
+                    b.frame = CGRect(x: inner.minX + CGFloat(i) * (kw + pad), y: inner.minY + CGFloat(row) * (h + pad), width: kw, height: h)
+                }
+            }
+        } else {   // one row, scrolling if it's too long; hide stays at the end
+            if hide.superview !== backdrop.contentView { backdrop.contentView.addSubview(hide) }
+            let y = (bounds.height - h) / 2
+            hide.frame = CGRect(x: bounds.maxX - safeAreaInsets.right - pad - w(hide), y: y, width: w(hide), height: h)
+            scroll.frame = CGRect(x: safeAreaInsets.left + pad, y: 0, width: max(0, hide.frame.minX - pad - safeAreaInsets.left - pad), height: bounds.height)
+            var x: CGFloat = 0
+            for b in first + second {
+                b.frame = CGRect(x: x, y: y, width: w(b), height: h)
+                x += w(b) + pad
+            }
+            scroll.contentSize = CGSize(width: max(0, x - pad), height: bounds.height)
+        }
+    }
 
     /// The latched modifiers, released: they apply to one key or click.
     func take() -> UInt64 {
@@ -90,6 +129,7 @@ final class KeyBar: UIInputView, UIInputViewAudioFeedback {
         c.baseForegroundColor = .label
         c.cornerStyle = .medium
         c.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
+        c.titleLineBreakMode = .byClipping
         let b = UIButton(configuration: c, primaryAction: UIAction { _ in
             UIDevice.current.playInputClick()
             action()

@@ -9,7 +9,7 @@ import UIKit
 ///   A Desktop also zooms and moves here: pinch, or drag with two fingers. That changes nothing on the Mac.
 /// A mouse or trackpad on an iPad points, clicks (secondary click = right click), drags and scrolls like one on a Mac.
 /// Typing goes to the Mac as text, through an invisible text view iOS can write into and revise (dictation from the
-/// keyboard's mic key; see TypingBuffer); the bar above the keyboard sends esc, tab, arrows and modifiers as Mac keys.
+/// keyboard's mic key; see TypingBuffer); the keys on the keyboard (KeyBar) send esc, tab, arrows and modifiers as Mac keys.
 /// A hardware keyboard sends Mac keys, modifiers and shortcuts included (those the iPad keeps for itself excepted).
 /// While the on-screen keyboard is up, the picture moves up just enough to keep the spot you last touched in view.
 final class StreamView: UIView, UIGestureRecognizerDelegate {
@@ -46,6 +46,9 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     private(set) var picture = CGRect.zero     // where the video is, before any lift for the keyboard
 
     let keys = KeyBar()
+    private var keysGap: NSLayoutConstraint!
+    /// The key panel moved (with the keyboard, or shown or hidden): what avoids it should look again.
+    var onKeysMoved: () -> Void = {}
     private let typing = TypingBuffer()        // first responder while the on-screen keyboard is up
     private var keyboardFrame: CGRect?         // in the screen's coordinate space
     private var focus: CGPoint?                // last touch, in window points
@@ -109,12 +112,21 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         hover.addTarget(self, action: #selector(hovered(_:)))
         [tap, rightTap, drag, hold, pinch, twoFingers, wheel, hover].forEach(addGestureRecognizer)
 
-        typing.inputAccessoryView = keys
+        // the keys ride on the keyboard, floating or docked (KeyBar), by the guide that follows either
+        keyboardLayoutGuide.followsUndockedKeyboard = true
+        keys.isHidden = true
+        keys.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(keys)
+        keysGap = keys.bottomAnchor.constraint(equalTo: keyboardLayoutGuide.topAnchor)
+        let belowTop = keys.topAnchor.constraint(greaterThanOrEqualTo: safeAreaLayoutGuide.topAnchor)   // keyboard at the top:
+        keysGap.priority = .defaultHigh                                                               // over its edge
+        NSLayoutConstraint.activate([keysGap, belowTop, keys.centerXAnchor.constraint(equalTo: keyboardLayoutGuide.centerXAnchor),
+                                     keys.widthAnchor.constraint(equalTo: keyboardLayoutGuide.widthAnchor)])
         typing.onEdit = { [weak self] in self?.type($0) }
         typing.onInsert = { [weak self] in self?.typedKey($0) ?? false }
         typing.onDelete = { [weak self] in self?.typedDelete(empty: $0) ?? false }
         typing.onPresses = { [weak self] in self?.hardware($0, down: $1) ?? false }
-        typing.onResign = { [weak self] in DispatchQueue.main.async { self?.onResign() } }
+        typing.onResign = { [weak self] in DispatchQueue.main.async { self?.showKeys(); self?.onResign() } }
         addSubview(typing)
         keys.onKey = { [weak self] in
             self?.press($0)
@@ -157,7 +169,13 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     var wantSize: CGSize { CGSize(width: (bounds.width * scale).rounded(), height: (bounds.height * scale).rounded()) }
 
     override func layoutSubviews() {
+        // a floating keyboard: two rows a little above it; docked (or a hardware keyboard): one row on top of it
+        let k = keyboardLayoutGuide.layoutFrame
+        keys.compact = k.width < bounds.width - 1
+        keysGap.constant = keys.compact ? -8 : 0
+        let was = keys.frame
         super.layoutSubviews()
+        if keys.frame != was, !keys.isHidden { onKeysMoved() }
         place()
         if bounds.width > 0 { onWantSize(wantSize) }
     }
@@ -175,8 +193,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
             : zoom == nil ? CGRect(origin: CGPoint(x: r.rect.minX.rounded(.down), y: r.rect.minY.rounded(.down)), size: r.rect.size) : r.rect
         if keepLift { return draw(animated: animated, duration: duration) }
         lift = 0
-        if let keyboardFrame, let screen = window?.screen, let p = focus, remoteSize.width > 0 {
-            let keyboard = bounds.intersection(convert(keyboardFrame, from: screen.coordinateSpace))
+        if let keyboard = keyboardCover, let p = focus, remoteSize.width > 0 {
             let s = picture.width / remoteSize.width
             let x = picture.minX + p.x * s, y = picture.minY + p.y * s
             // A floating keyboard only hides the part of the picture it actually covers.
@@ -185,6 +202,17 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
             }
         }
         draw(animated: animated, duration: duration)
+    }
+
+    /// What the keyboard and the keys on it cover of this view, while typing.
+    var keyboardCover: CGRect? {
+        guard isTyping else { return nil }
+        var r = CGRect.null
+        if let keyboardFrame, let screen = window?.screen { r = bounds.intersection(convert(keyboardFrame, from: screen.coordinateSpace)) }
+        let k = keyboardLayoutGuide.layoutFrame
+        if k.height > safeAreaInsets.bottom + 1 { r = r.union(k) }
+        if !keys.isHidden { r = r.union(keys.frame) }
+        return r.isNull || r.isEmpty ? nil : r
     }
 
     private func draw(animated: Bool, duration: Double) {
@@ -509,7 +537,17 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     /// Bring up the on-screen keyboard, starting with nothing typed.
     @discardableResult func startTyping() -> Bool {
         typing.reset()
+        defer { showKeys() }
         return typing.becomeFirstResponder()
+    }
+
+    /// The keys while typing, else not.
+    private func showKeys() {
+        guard keys.isHidden == isTyping else { return }
+        keys.isHidden = !isTyping
+        if isTyping { bringSubviewToFront(keys) }
+        setNeedsLayout()
+        onKeysMoved()
     }
 
     /// Put the on-screen keyboard away; `onResign` follows.
