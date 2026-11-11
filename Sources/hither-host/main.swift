@@ -449,12 +449,21 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// The whole display `id` (0, or one that's gone: the main one), like Screen Sharing but through Hither's stream.
     func openDesktop(_ id: CGDirectDisplayID) async {
-        let main = CGMainDisplayID()
+        // one of our virtual displays (a viewer remembers the last one it was shown, which goes when the host does):
+        // the monitor it stood for (its serial number); one that's gone, or never was: the main display
+        var asked = id
+        if CGDisplayVendorNumber(asked) == Virtual.vendor { asked = CGDisplaySerialNumber(asked) }
+        if asked == 0 || CGDisplayIsOnline(asked) == 0 || CGDisplayBounds(asked).isEmpty { asked = CGMainDisplayID() }
+        // back after a hang-up (the iPad switched apps): the virtual display still standing in for its monitor
+        // (Virtual.linger), from the first frame, not the monitor at its own size until "adapt" makes another
+        let stand = await withCheckedContinuation { c in
+            DispatchQueue.main.async { c.resume(returning: Virtual.displays[monitor(behind: asked)]?.display.displayID) }
+        }
         q.sync {
             desktop = true
             opened = true
             codec = viewerCodec()
-            windowID = id != 0 && CGDisplayIsOnline(id) != 0 ? id : main
+            windowID = stand ?? asked
             home = monitor(behind: windowID)   // a virtual display standing in (Virtual): the monitor it stands for
             frame = CGDisplayBounds(windowID)
             if case .hostPort(_, let port) = wire.conn.endpoint { appName = "Desktop:\(port)" } else { appName = "Desktop" }
@@ -1150,11 +1159,27 @@ func isOurs(_ bundle: String) -> Bool { bundle.hasPrefix("dev.hither.") }
 /// (as with Native). Main queue.
 enum Virtual {
     static var displays: [CGDirectDisplayID: (display: CGVirtualDisplay, width: Int, height: Int, retina: Bool)] = [:]   // by monitor
+    /// Kept this long once nothing wants it: a viewer that hung up to switch apps comes back to it as it was, instead
+    /// of the monitor at its own size until a new one is made (and the Mac's windows moved off it and back).
+    static let linger = 60.0
+    static var unwantedSince: [CGDirectDisplayID: Double] = [:]
+    static let vendor: UInt32 = 0x4854   // "HT": its serial number is the monitor it stands for
+    static var failingSince: [CGDirectDisplayID: Double] = [:]   // monitor → since when it won't mirror its virtual display
 
     /// The virtual display standing in for monitor `d`, at `size` points: made, or changed to that size (`changed`).
     static func show(_ d: CGDirectDisplayID, _ size: (width: Int, height: Int), retina: Bool) -> (id: CGDirectDisplayID, changed: Bool)? {
         if let v = displays[d] {
-            mirror(d, to: v.display.displayID)
+            // macOS sometimes refuses to mirror it (error 1014) and never recovers, and the display isn't capturable
+            // meanwhile: after a few seconds of that, a new one
+            if mirror(d, to: v.display.displayID) { failingSince[d] = nil } else {
+                let now = CACurrentMediaTime(), since = failingSince[d] ?? now
+                failingSince[d] = since
+                if now - since >= 5 {
+                    log("display \(d) won't mirror virtual display \(v.display.displayID): making a new one")
+                    release(d)
+                    return show(d, size, retina: retina).map { ($0.id, true) }
+                }
+            }
             if (v.width, v.height, v.retina) == (size.width, size.height, retina) { return (v.display.displayID, false) }
             guard apply(v.display, size, retina) else { return nil }
             displays[d] = (v.display, size.width, size.height, retina)
@@ -1164,7 +1189,7 @@ enum Virtual {
         desc.name = "Hither Virtual"   // "virtual": Dark leaves it lit (it's what the viewer sees)
         desc.maxPixelsWide = 7680; desc.maxPixelsHigh = 7680   // room to resize in place, Retina, up to 3840 points
         desc.sizeInMillimeters = CGSize(width: Double(size.width) * 25.4 / 110, height: Double(size.height) * 25.4 / 110)
-        desc.vendorID = 0x4854; desc.productID = 1; desc.serialNum = d
+        desc.vendorID = vendor; desc.productID = 1; desc.serialNum = d
         desc.queue = .main
         desc.terminationHandler = { _, _ in log("virtual display for \(d) ended"); displays[d] = nil }
         guard let v = CGVirtualDisplay(descriptor: desc), apply(v, size, retina) else {
@@ -1186,21 +1211,28 @@ enum Virtual {
     }
 
     /// Monitor `d` shows `v` (nil: itself again). Only until the host quits, like a mode change.
-    static func mirror(_ d: CGDirectDisplayID, to v: CGDirectDisplayID?) {
+    /// Monitor `d` shows `v` (nil: itself again). Only until the host quits, like a mode change. False if it failed.
+    @discardableResult
+    static func mirror(_ d: CGDirectDisplayID, to v: CGDirectDisplayID?) -> Bool {
         let to = v ?? kCGNullDirectDisplay
-        guard CGDisplayMirrorsDisplay(d) != to else { return }
+        guard CGDisplayMirrorsDisplay(d) != to else { return true }
         var c: CGDisplayConfigRef?
         CGBeginDisplayConfiguration(&c)
         CGConfigureDisplayMirrorOfDisplay(c, d, to)
         let err = CGCompleteDisplayConfiguration(c, .forAppOnly)
-        log("display \(d) \(v.map { "mirrors virtual display \($0)" } ?? "shows itself again"): \(err == .success ? "ok" : "error \(err.rawValue)")")
+        if err == .success || failingSince[d] == nil {   // a failure once, not every second it's retried
+            log("display \(d) \(v.map { "mirrors virtual display \($0)" } ?? "shows itself again"): \(err == .success ? "ok" : "error \(err.rawValue)")")
+        }
         if Dark.dark { Dark.blackOut() }
+        return err == .success
     }
 
     static func release(_ d: CGDirectDisplayID) {
         guard displays[d] != nil else { return }
         mirror(d, to: nil)
         displays[d] = nil   // the last reference: the display goes
+        unwantedSince[d] = nil
+        failingSince[d] = nil
         log("virtual display for \(d) released")
     }
 }
@@ -1260,12 +1292,14 @@ enum Dark {
     /// so macOS undoes it if the host dies.
     static func fit() {
         enum Want { case snap(CGSize, CGSize, Double), retina }
-        var want: [CGDirectDisplayID: Want] = [:], native = Set<CGDirectDisplayID>()
+        var want: [CGDirectDisplayID: Want] = [:], native = Set<CGDirectDisplayID>(), held = Set<CGDirectDisplayID>()
         if enabled {
             let open = sessions.values.filter { $0.opened && !$0.ended }
-            // two Desktops of one monitor (an iPad's and a Mac's): the one on screen that asked last decides its size
-            let order = { (s: Session) in (s.visible ? 1 : 0, s.adaptAt) }
-            for s in open.sorted(by: { order($0) < order($1) }) where s.desktop {
+            // a Desktop on screen decides its monitor's size; two of them (an iPad's and a Mac's): the one that asked
+            // last. A hidden one (a Mac viewer's window minimized or covered) changes nothing: it keeps a virtual
+            // display that's there as it is (`held`), so the Mac's windows don't move for it
+            for s in open.sorted(by: { $0.adaptAt < $1.adaptAt }) where s.desktop {
+                if !s.visible { if s.adapt != nil { held.insert(s.home) }; continue }
                 if let a = s.adapt { want[s.home] = .snap(a.size, a.room, a.scale) }
                 else if s.nativeDesktop { native.insert(s.home) }
             }
@@ -1289,9 +1323,21 @@ enum Dark {
             guard case .snap(let size, let room, let scale) = w, let wh = virtualSize(for: size, within: room),
                   let v = Virtual.show(d, wh, retina: scale >= 2) else { continue }
             stand[d] = v.id
+            Virtual.unwantedSince[d] = nil
             if v.changed { changed.insert(d) }
         }
-        for d in Virtual.displays.keys where stand[d] == nil { Virtual.release(d) }
+        // no Adaptive Desktop on screen now: kept as it is while a hidden one has it, and a while for one coming back
+        // (Virtual.linger), unless something wants the monitor as itself (Native, app windows)
+        let now = CACurrentMediaTime()
+        for (d, v) in Virtual.displays where stand[d] == nil {
+            let since = held.contains(d) ? now : Virtual.unwantedSince[d] ?? now
+            if enabled, want[d] == nil, !native.contains(d), physical.contains(d), now - since < Virtual.linger {
+                Virtual.unwantedSince[d] = since
+                stand[d] = v.display.displayID
+            } else {
+                Virtual.release(d)
+            }
+        }
         for s in sessions.values where s.desktop && !s.ended {
             let id = stand[s.home] ?? s.home
             if s.windowID != id { s.q.async { s.show(id) }; changed.insert(s.home) }
