@@ -57,6 +57,10 @@ func testDisplayFit() throws {
     try expectEqual(snapMode(acer, to: CGSize(width: 1300, height: 750), within: room, scale: 2).map { acer[$0] }, ModeSize(width: 1280, height: 720, pixelWidth: 2560))
     try expectEqual(snapMode(acer, to: CGSize(width: 1590, height: 890), within: room, scale: 2).map { acer[$0] }, ModeSize(width: 1600, height: 900, pixelWidth: 3200))
     try expectEqual(snapMode(acer, to: CGSize(width: 2000, height: 1100), within: CGSize(width: 2560, height: 1400), scale: 2).map { acer[$0] }, ModeSize(width: 1920, height: 1080, pixelWidth: 3840))
+    // the iPad mini's view (1158×756) with more space: 1.25× and 1.5× the points, shown scaled down
+    try expectEqual(DesktopSpace.more.size(for: CGSize(width: 1158, height: 756)), CGSize(width: 1447, height: 945))
+    try expectEqual(DesktopSpace.most.size(for: CGSize(width: 1158, height: 756)), CGSize(width: 1737, height: 1134))
+    try expectEqual(DesktopSpace.standard.size(for: CGSize(width: 1158, height: 756)), CGSize(width: 1158, height: 756))
     // on a virtual display: the window's size exactly, within its room, not below what macOS lays out
     try expectEqual(virtualSize(for: CGSize(width: 1133, height: 744), within: CGSize(width: 1133, height: 744)).map { [$0.width, $0.height] }, [1133, 744])   // iPad mini
     try expectEqual(virtualSize(for: CGSize(width: 1700.6, height: 1200), within: room).map { [$0.width, $0.height] }, [1700, 1045])

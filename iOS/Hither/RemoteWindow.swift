@@ -47,7 +47,7 @@ final class RemoteWindow: ObservableObject, Identifiable {
     private var askedLTR = false             // this connection asked for H.264 long-term references
     private var opened = false               // this connection has its window; resizes can go out
     private var requested: CGSize?           // the window size last asked for on this connection
-    private var shaped: (size: CGSize, native: Bool)?   // a Desktop: what the host was last told
+    private var shaped: (size: CGSize, native: Bool)?   // a Desktop: what the host was last told (the Mac's points)
     private var shapeLater: DispatchWorkItem?
     private var retries = 0
     private var host = ""                    // the name this connection dialed (see Reach)
@@ -91,6 +91,16 @@ final class RemoteWindow: ObservableObject, Identifiable {
         set {
             UserDefaults.standard.set(newValue, forKey: "desktop.native.\(mac.id)")
             configureView()
+            view.setZoom(nil)
+            sendShape()
+        }
+    }
+
+    /// Adaptive's size: More Space (1.25× this view's points, shown scaled down) unless chosen otherwise. Per Mac.
+    var space: DesktopSpace {
+        get { (UserDefaults.standard.object(forKey: "desktop.space.\(mac.id)") as? Double).flatMap(DesktopSpace.init) ?? .more }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: "desktop.space.\(mac.id)")
             view.setZoom(nil)
             sendShape()
         }
@@ -305,11 +315,11 @@ final class RemoteWindow: ObservableObject, Identifiable {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
     }
 
-    /// A Desktop: Adaptive tells the host this view's size (all the room there is, at this screen's scale), and a
-    /// dark display there takes the mode nearest it; Native says to keep its own. The host answers with "size".
+    /// A Desktop: Adaptive tells the host this view's size, times its space (all the room there is, at this screen's
+    /// scale), and a dark display there takes that size exactly (a virtual display) or the mode nearest it; Native says to keep its own. The host answers with "size".
     func sendShape() {
         guard isDesktop, opened, place.shown, let w = wire else { return }
-        let s = CGSize(width: view.bounds.width.rounded(.down), height: view.bounds.height.rounded(.down))
+        let s = space.size(for: view.bounds.size)
         guard native || (s.width > 0 && s.height > 0) else { return }
         if let last = shaped, last.native == native, native || last.size == s { return }
         shaped = (s, native)

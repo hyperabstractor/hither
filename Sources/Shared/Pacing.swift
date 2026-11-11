@@ -42,6 +42,18 @@ public func snapMode(_ modes: [ModeSize], to window: CGSize, within room: CGSize
     return pool.min { (cost($0), -area($0)) < (cost($1), -area($1)) }
 }
 
+/// Adaptive Desktop sizes on the iPad: Default is the view's own points (1:1, Retina), More Space and Most Space give
+/// the Mac that many times more, which the viewer shows scaled down to fit (still Retina-rendered, like a Mac's own
+/// scaled modes, so text stays sharp, just smaller).
+public enum DesktopSpace: Double, CaseIterable, Sendable {
+    case standard = 1, more = 1.25, most = 1.5
+    public var name: String { switch self { case .standard: "Default"; case .more: "More Space"; case .most: "Most Space" } }
+    /// The Mac's screen, in points, for a view this size.
+    public func size(for view: CGSize) -> CGSize {
+        CGSize(width: (view.width * rawValue).rounded(.down), height: (view.height * rawValue).rounded(.down))
+    }
+}
+
 /// Adaptive Desktop on a virtual display, which can be any size: exactly the viewer's window (no bigger than its room),
 /// in whole points, never below the smallest size macOS lays a desktop out in (a smaller window shows it scaled down).
 public func virtualSize(for window: CGSize, within room: CGSize) -> (width: Int, height: Int)? {

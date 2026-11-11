@@ -447,14 +447,22 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
             UIAction(title: "Zoom In", image: symbol("plus.magnifyingglass")) { [weak v] _ in v?.zoomStep(1) },
             UIAction(title: "Zoom Out", image: symbol("minus.magnifyingglass")) { [weak v] _ in v?.zoomStep(-1) },
         ])
-        let dark = macs.dark[mac.id] ?? false
         let screen = UIMenu(title: "\(mac.name)'s Screen", options: .displayInline, children: [
-            UIAction(title: "Adaptive", subtitle: dark ? "Takes the resolution nearest this screen; its windows rearrange to fit"
-                                    : "Only while Keep Screen Dark is on: takes the resolution nearest this screen",
-                     state: window.native ? .off : .on) { [weak self] _ in self?.window.native = false },
+            UIAction(title: "Adaptive", state: window.native ? .off : .on) { [weak self] _ in self?.window.native = false },
             UIAction(title: "Native", subtitle: "Keeps its own resolution", state: window.native ? .on : .off) { [weak self] _ in self?.window.native = true },
         ])
-        return [UIMenu(title: info, options: .displayInline, children: [zoom, screen])]
+        // Adaptive's size: more of the Mac in the same view, smaller (picking one picks Adaptive)
+        let view = window.view.bounds.size
+        let space = UIMenu(title: "Adaptive Size", options: .displayInline, children: DesktopSpace.allCases.map { s in
+            let p = s.size(for: view)
+            return UIAction(title: s.name, subtitle: "\(Int(p.width))×\(Int(p.height))" + (s == .standard ? ", 1:1" : ""),
+                            state: !window.native && window.space == s ? .on : .off) { [weak self] _ in
+                guard let self else { return }
+                window.space = s
+                if window.native { window.native = false }
+            }
+        })
+        return [UIMenu(title: info, options: .displayInline, children: [zoom, screen, space])]
     }
 
     private func moreMenu() -> [UIMenuElement] {

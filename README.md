@@ -113,8 +113,9 @@ when you leave.
   that moved the cursor.
 - **Desktop:** pinch or drag with two fingers to zoom and move around (or Fit, Actual Size, Zoom In and Out in the
   🔍 menu); with a pointer, the zoomed picture follows it. That never changes the Mac. The same menu sets the Mac's
-  screen: **Native** (the default) keeps its resolution; **Adaptive** has it take the resolution nearest this screen,
-  only while Keep Screen Dark is on, and its windows rearrange to fit.
+  screen: **Native** (the default) keeps its resolution; **Adaptive** has it take exactly this screen's size, only
+  while Keep Screen Dark is on, and its windows rearrange to fit. **Adaptive Size** gives the Mac more room in the
+  same view, smaller: Default (1:1), More Space (1.25×, the default) or Most Space (1.5×).
 - **Window size:** Actual Size maps one Mac point to one viewer point when the window fits. More Space fits more
   in with smaller text.
 - **Sessions:** each Desktop or window you open is a session with its own connection, and several can be open at
