@@ -22,7 +22,7 @@ enum Keys {
 
 /// The keys the iPhone and iPad keyboards lack, on glass above the on-screen keyboard: one row along the top of a
 /// docked one (or at the bottom with a hardware keyboard), two rows above a floating one, the same width, moving
-/// with it (`compact`). Modifiers latch for the next key or click. StreamView places it by the keyboard layout guide:
+/// with it (`compact`), or folded away to a small tab on its top edge (`collapsed`). Modifiers latch for the next key or click. StreamView places it by the keyboard layout guide:
 /// iPadOS shows an input accessory view at the bottom of the screen, with nothing behind it, when the keyboard floats.
 final class KeyBar: UIView {
     var onKey: (Int) -> Void = { _ in }
@@ -33,7 +33,7 @@ final class KeyBar: UIView {
         didSet {
             guard compact != oldValue else { return }
             backdrop.layer.cornerRadius = compact ? 16 : 0
-            for b in first + second + [hide!] {   // narrow keys in the grid: less padding, so "esc" stays on one line
+            for b in first + second + [collapse!, hide!] {   // narrow keys in the grid: less padding, so "esc" stays on one line
                 b.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: compact ? 2 : 12, bottom: 6, trailing: compact ? 2 : 12)
             }
             invalidateIntrinsicContentSize()
@@ -43,7 +43,17 @@ final class KeyBar: UIView {
 
     private var modifierButtons: [(flag: UInt64, button: UIButton)] = []
     private var first: [UIButton] = [], second: [UIButton] = []   // esc tab ⌃ ⌥ ⌘ ⇧ | ← ↑ ↓ →
-    private var hide: UIButton!
+    private var hide: UIButton!, collapse: UIButton!, expand: UIButton!
+    /// Above a floating keyboard, folded away: only a small tab on its top edge, which unfolds them. Remembered.
+    private(set) var collapsed = UserDefaults.standard.bool(forKey: "keys.collapsed") {
+        didSet {
+            UserDefaults.standard.set(collapsed, forKey: "keys.collapsed")
+            invalidateIntrinsicContentSize()
+            setNeedsLayout()
+            superview?.setNeedsLayout()
+        }
+    }
+    var folded: Bool { compact && collapsed }
     private let backdrop: UIVisualEffectView = {
         if #available(iOS 26, *) { return UIVisualEffectView(effect: UIGlassEffect()) }
         return UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
@@ -69,24 +79,51 @@ final class KeyBar: UIView {
             second.append(key(symbol: symbol) { [weak self] in self?.onKey(code) })
         }
         hide = key(symbol: "keyboard.chevron.compact.down") { [weak self] in self?.onHide() }
-        (first + second).forEach(scroll.addSubview)
+        collapse = key(symbol: "chevron.down") { [weak self] in self?.collapsed = true }
+        collapse.accessibilityLabel = "Hide these keys"
+        (first + second + [collapse]).forEach(scroll.addSubview)
         backdrop.contentView.addSubview(hide)
+        var c = UIButton.Configuration.filled()
+        c.image = UIImage(systemName: "chevron.compact.up", withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
+        c.baseBackgroundColor = .tertiarySystemFill
+        c.baseForegroundColor = .label
+        c.cornerStyle = .small
+        c.contentInsets = .zero
+        expand = UIButton(configuration: c, primaryAction: UIAction { [weak self] _ in
+            UIDevice.current.playInputClick()
+            self?.collapsed = false
+        })
+        expand.backgroundColor = .secondarySystemBackground
+        expand.layer.cornerRadius = 6
+        expand.clipsToBounds = true
+        expand.accessibilityLabel = "Show esc, tab, modifier and arrow keys"
+        addSubview(expand)
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override var intrinsicContentSize: CGSize {
-        CGSize(width: UIView.noIntrinsicMetric, height: Self.pad + (compact ? 2 * (Self.keyHeight + Self.pad) : Self.keyHeight + Self.pad) + 6)
+        if folded { return CGSize(width: UIView.noIntrinsicMetric, height: 20) }
+        return CGSize(width: UIView.noIntrinsicMetric, height: Self.pad + (compact ? 2 * (Self.keyHeight + Self.pad) : Self.keyHeight + Self.pad) + 6)
+    }
+
+    /// Folded, only the tab takes touches: the rest of its width is the picture's.
+    override func point(inside p: CGPoint, with event: UIEvent?) -> Bool {
+        folded ? expand.frame.insetBy(dx: -8, dy: -6).contains(p) : super.point(inside: p, with: event)
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        backdrop.isHidden = folded
+        expand.isHidden = !folded
+        if folded { expand.frame = CGRect(x: bounds.midX - 32, y: bounds.maxY - 20, width: 64, height: 20); return }
         backdrop.frame = bounds
         let pad = Self.pad, h = Self.keyHeight, w = { (b: UIButton) in max(44, b.intrinsicContentSize.width) }
         if compact {   // a grid as wide as the keyboard: six keys, then the arrows and hide
             scroll.frame = backdrop.bounds
             scroll.contentSize = scroll.bounds.size
             let inner = bounds.insetBy(dx: pad, dy: pad + 3)
-            for (row, keys) in ([first, second + [hide]] as [[UIButton]]).enumerated() {
+            collapse.isHidden = false
+            for (row, keys) in ([first, second + [collapse, hide]] as [[UIButton]]).enumerated() {
                 let kw = (inner.width - pad * CGFloat(keys.count - 1)) / CGFloat(keys.count)
                 for (i, b) in keys.enumerated() {
                     if b === hide, hide.superview !== scroll { scroll.addSubview(hide) }
@@ -95,6 +132,7 @@ final class KeyBar: UIView {
             }
         } else {   // one row, scrolling if it's too long; hide stays at the end
             if hide.superview !== backdrop.contentView { backdrop.contentView.addSubview(hide) }
+            collapse.isHidden = true   // a docked keyboard's one row: nothing to fold
             let y = (bounds.height - h) / 2
             hide.frame = CGRect(x: bounds.maxX - safeAreaInsets.right - pad - w(hide), y: y, width: w(hide), height: h)
             scroll.frame = CGRect(x: safeAreaInsets.left + pad, y: 0, width: max(0, hide.frame.minX - pad - safeAreaInsets.left - pad), height: bounds.height)

@@ -172,7 +172,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         // a floating keyboard: two rows a little above it; docked (or a hardware keyboard): one row on top of it
         let k = keyboardLayoutGuide.layoutFrame
         keys.compact = k.width < bounds.width - 1
-        keysGap.constant = keys.compact ? -8 : 0
+        keysGap.constant = keys.folded ? -2 : keys.compact ? -8 : 0   // folded: a tab on its top edge
         let was = keys.frame
         super.layoutSubviews()
         if keys.frame != was, !keys.isHidden { onKeysMoved() }
