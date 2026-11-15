@@ -6,13 +6,15 @@ import UIKit
 ///   tap = click (tap again quickly for a double or triple click), two-finger tap = right click,
 ///   drag = scroll (flick and it glides on, as on a Mac trackpad; touch to stop it),
 ///   touch and hold then drag = press and drag (select text, move a divider).
+///   After a touch that likely selected text (that drag, a double or triple tap) the edit menu shows there, as iPadOS
+///   shows its own: Cut, Copy, Paste; after a touch and hold in one place, Paste, Select, Select All (EditMenu).
 ///   A Desktop also zooms and moves here: pinch, or drag with two fingers. That changes nothing on the Mac.
 /// A mouse or trackpad on an iPad points, clicks (secondary click = right click), drags and scrolls like one on a Mac.
 /// Typing goes to the Mac as text, through an invisible text view iOS can write into and revise (dictation from the
 /// keyboard's mic key; see TypingBuffer); the keys on the keyboard (KeyBar) send esc, tab, arrows and modifiers as Mac keys.
 /// A hardware keyboard sends Mac keys, modifiers and shortcuts included (those the iPad keeps for itself excepted).
 /// While the on-screen keyboard is up, the picture moves up just enough to keep the spot you last touched in view.
-final class StreamView: UIView, UIGestureRecognizerDelegate {
+final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
     let video = AVSampleBufferDisplayLayer()
     var depacketizer = Depacketizer()
     var remoteSize = CGSize.zero { didSet { if remoteSize != oldValue { setNeedsLayout() } } }
@@ -73,6 +75,12 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     private var repeatTimer: Timer?
     private var pointer: (button: Int, at: CGPoint)?      // a mouse or trackpad button held
     private var holding: CGPoint?                         // touch and hold, then drag
+    private var heldFrom = CGPoint.zero                   // where that touch and hold began
+
+    // the edit menu (Cut, Copy, Paste…) over the picture: see EditMenu
+    private lazy var editMenu = UIEditMenuInteraction(delegate: self)
+    private var editing: (context: EditMenu.Context, around: CGRect)?   // what it offers, and what it keeps clear of
+    private var editLater: DispatchWorkItem?                            // about to show
 
     // a flick's glide: momentum scrolls, one per frame, to where the drag scrolled (`scrollAt`)
     private var glide: Glide?
@@ -111,6 +119,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         wheel.allowedTouchTypes = []
         hover.addTarget(self, action: #selector(hovered(_:)))
         [tap, rightTap, drag, hold, pinch, twoFingers, wheel, hover].forEach(addGestureRecognizer)
+        addInteraction(editMenu)
 
         // the keys ride on the keyboard, floating or docked (KeyBar), by the guide that follows either
         keyboardLayoutGuide.followsUndockedKeyboard = true
@@ -362,6 +371,8 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         if let l = lastTap, now - l.at < 0.4, hypot(p.x - l.point.x, p.y - l.point.y) < 16 { count = l.count % 3 + 1 }
         lastTap = (now, p, count)
         click(p, button: 0, count: count)
+        // a word, or a line: after a moment for a double tap, which a third tap may follow
+        if count > 1 { offerEdit(.selection, around: EditMenu.target(p), after: count == 2 ? 0.4 : 0) }
     }
 
     @objc private func rightTapped(_ g: UITapGestureRecognizer) {
@@ -375,6 +386,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         guard remoteSize.width > 0, shown.width > 0 else { return }
         if g === drag, g.state == .began || g.state == .changed, anchor != nil { return }   // zooming
         if g.state == .began {
+            hideEditMenu()   // what it was about moves away
             stopGlide()
             endScroll()   // another one still going (a trackpad's and a finger's at once): it ends first
             guard live else { return }   // nothing new without a session; its moves and end are ignored too
@@ -466,6 +478,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
             focus = remote(p)
             resetTyping()
             holding = p
+            heldFrom = p
             mouse(0, p)
             mouse(1, p, flags: keys.take())
         case .changed:
@@ -476,8 +489,66 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
             guard holding != nil else { return }
             holding = nil
             mouse(2, p)
+            // dragged: a selection, likely, to cut or copy; in place: a click, where something may be pasted
+            if g.state == .ended {
+                let context = EditMenu.afterHold(from: heldFrom, to: p)
+                offerEdit(context, around: context == .selection ? EditMenu.target(heldFrom, p) : EditMenu.target(p))
+            }
         default: break
         }
+    }
+
+    // MARK: edit menu
+
+    /// Show the edit menu for what a touch just did, clear of `around` (this view's points).
+    private func offerEdit(_ context: EditMenu.Context, around: CGRect, after delay: Double = 0) {
+        editLater?.cancel()
+        let later = DispatchWorkItem { [weak self] in
+            guard let self, live, window != nil else { return }
+            editing = (context, around)
+            let c = UIEditMenuConfiguration(identifier: nil, sourcePoint: CGPoint(x: around.midX, y: around.midY))
+            c.preferredArrowDirection = .down   // above the text, as iPadOS has it, clear of the hand; below with no room
+            editMenu.presentEditMenu(with: c)
+        }
+        editLater = later
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: later)
+    }
+
+    /// The edit menu goes away, and one about to show doesn't: something else was touched or typed, or the picture
+    /// moved under it.
+    private func hideEditMenu() {
+        editLater?.cancel()
+        editLater = nil
+        guard editing != nil else { return }
+        editing = nil
+        editMenu.dismissMenu()
+    }
+
+    /// An item of the edit menu, on the Mac: its shortcut, as a Mac keyboard's (nothing latched or held joins in), or
+    /// for Select a double click where the menu is. Select and Select All bring the menu back, to cut or copy.
+    private func edit(_ item: EditMenu.Item) {
+        guard live, let at = editing else { return }
+        editing = nil   // it closes by itself
+        if let key = item.key {
+            _ = shortcut(key, modifiers: [Keymap.leftCommand])
+        } else {
+            let p = CGPoint(x: at.around.midX, y: at.around.midY)
+            click(p, button: 0, count: 1)
+            click(p, button: 0, count: 2)
+        }
+        if let next = item.next { offerEdit(next, around: at.around, after: 0.3) }
+    }
+
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
+                             suggestedActions: [UIMenuElement]) -> UIMenu? {
+        guard let editing else { return nil }
+        return UIMenu(children: EditMenu.items(editing.context).map { item in
+            UIAction(title: item.title) { [weak self] _ in self?.edit(item) }
+        })
+    }
+
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, targetRectFor configuration: UIEditMenuConfiguration) -> CGRect {
+        editing?.around ?? .null
     }
 
     // MARK: mouse and trackpad
@@ -499,6 +570,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if event?.allTouches?.count == touches.count { touchStoppedGlide = glide != nil }   // the first finger(s) down
         stopGlide()
+        hideEditMenu()
         guard let t = pointerTouch(touches), pointer == nil else { return super.touchesBegan(touches, with: event) }
         guard live else { return }
         let p = t.location(in: self), b = event?.buttonMask.contains(.secondary) == true ? 1 : 0
@@ -600,6 +672,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func text(_ text: String) {
+        hideEditMenu()
         keySeq += 1
         sentAt[keySeq] = CACurrentMediaTime()
         var m = Msg("text"); m.text = text; m.seq = keySeq
@@ -611,6 +684,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
 
     /// A Mac key, down and up, with just these modifiers.
     private func key(_ code: Int, flags: UInt64 = 0) {
+        hideEditMenu()
         let f = flags | Keymap.implicitFlags(code)
         keySeq += 1
         sentAt[keySeq] = CACurrentMediaTime()
@@ -621,6 +695,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     }
 
     @objc private func keyboardChanged(_ n: Notification) {
+        hideEditMenu()   // the picture may move for it
         keyboardFrame = isTyping ? n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect : nil
         place(animated: true, duration: n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25)
     }
@@ -652,6 +727,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
                 send(m)
             } else if down {
                 resetTyping()
+                hideEditMenu()
                 keyDown(code, repeating: heldKeys.contains(code), held: modifierFlags(key.modifierFlags))
             } else {
                 keyUp(code)
@@ -673,6 +749,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
         guard live else { return false }
         stopGlide()
         resetTyping()
+        hideEditMenu()
         let opening = !switcher.isOpen
         switcher.next(held: heldModifiers.sorted(), capsLock: capsLock).forEach(send)
         switcherTimer?.invalidate()
@@ -742,6 +819,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     func releaseInput() {
         lettingGo = true
         defer { lettingGo = false }
+        hideEditMenu()
         resetTyping()
         stopGlide()
         endScroll()
@@ -764,6 +842,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate {
     /// The session ended without a chance to let go (the connection dropped): forget what was held, sending nothing.
     private func forgetInput() {
         closeSwitcher(sending: false)
+        hideEditMenu()
         resetTyping()
         stopGlide(sending: false)
         endScroll(sending: false)

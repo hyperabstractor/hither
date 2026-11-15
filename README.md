@@ -104,6 +104,10 @@ when you leave.
   use it from here, and it locks 2 minutes after its last session closes or hangs up.
 - **Touch:** tap to click (tap again quickly for a double click), two-finger tap to right-click, drag to scroll
   (flick and it glides on; touch to stop it), touch and hold then drag to select or move things.
+- **Cut, copy, paste:** after you select text (double-tap a word, triple-tap a line, or touch and hold then drag)
+  the edit menu shows there, as on an iPad: Cut, Copy, Paste, Select All. Touch and hold in one place for Paste,
+  Select and Select All. They are the Mac's own ⌘X ⌘C ⌘V ⌘A, on the Mac's clipboard; touch anywhere else and the
+  menu goes away.
 - **Mouse and trackpad** on an iPad: point, click, secondary-click, drag and scroll as on a Mac.
 - **Typing:** the keyboard button types into the window. The bar above the keyboard has esc, tab, arrows and
   ⌃ ⌥ ⌘ ⇧, which apply to the next key or tap (⌘ then S saves). A hardware keyboard sends Mac keys, shortcuts
