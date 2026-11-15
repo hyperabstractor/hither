@@ -5,8 +5,9 @@ import UIKit
 
 /// This device as the keyboard of another showing Hither (KeyLink): its own keyboard along the bottom, with all it
 /// brings (other languages, dictation, swipe typing), and the rest of the screen for the keys it lacks, big: esc, tab,
-/// ⌘⇥, Delete, Return, the modifiers, the arrows, and Cut, Copy, Paste, Undo. Or, in their place, a trackpad (PadView)
-/// for the Mac's pointer, which the other device draws; with the keyboard put away it has the whole screen.
+/// ⌘⇥, Delete, Return, the modifiers, the arrows, and a strip of the Mac's shortcuts, swiped sideways for more of
+/// them (ShortcutStrip): Cut, Copy, Paste, Undo first. Or, in their place, a trackpad (PadView) for the Mac's
+/// pointer, which the other device draws; with the keyboard put away it has the whole screen.
 struct KeyboardScreen: View {
     @ObservedObject var keys: KeyLink
     @Environment(\.dismiss) private var dismiss
@@ -51,6 +52,10 @@ final class KeyboardController: UIViewController {
     private let pad = PadView()
     private var keyboardAway = false   // put away with its button: it stays away until that brings it back
     private var rows: [[UIButton]] = []
+    private let strip = StripScroll()   // the Mac's shortcuts (ShortcutStrip), a page of four at a time
+    private var stripKeys: [UIButton] = []
+    private var stripPage = UserDefaults.standard.integer(forKey: "keyboard.strip")   // the page it rests on: as left
+    private var holding: Timer?, heldFired = false   // a strip key touched and held for its other shortcut
     private var switchKey: UIButton!   // ⌘⇥: the Mac's app switcher, where the other device shows a Desktop
     private var modifierButtons: [(flag: UInt64, button: UIButton)] = []
     private var watching: Set<AnyCancellable> = []
@@ -157,11 +162,16 @@ final class KeyboardController: UIViewController {
                 .map { title, label, flag in modifier(title, label: label, flag) },
             [key(nil, "arrow.left", "Left", Keys.left, 0, true), key(nil, "arrow.up", "Up", Keys.up, 0, true),
              key(nil, "arrow.down", "Down", Keys.down, 0, true), key(nil, "arrow.right", "Right", Keys.right, 0, true)],
-            // ⌘X ⌘C ⌘V ⌘Z, by key position
-            [key("Cut", nil, "Cut", 0x07, Keys.command, false), key("Copy", nil, "Copy", 0x08, Keys.command, false),
-             key("Paste", nil, "Paste", 0x09, Keys.command, false), key("Undo", nil, "Undo", 0x06, Keys.command, false)],
         ]
         rows.joined().forEach(view.addSubview)
+        strip.showsHorizontalScrollIndicator = false
+        strip.delaysContentTouches = false   // a key lights up as it's touched; a swipe takes the touch from it
+        strip.decelerationRate = .fast
+        strip.alwaysBounceHorizontal = true
+        strip.delegate = self
+        stripKeys = ShortcutStrip.keys.map(stripKey)
+        stripKeys.forEach(strip.addSubview)
+        view.addSubview(strip)
 
         view.keyboardLayoutGuide.followsUndockedKeyboard = true
         aboveKeyboard.isHidden = true
@@ -211,6 +221,7 @@ final class KeyboardController: UIViewController {
         super.viewWillDisappear(animated)
         UIApplication.shared.isIdleTimerDisabled = false
         repeating?.invalidate()
+        holding?.invalidate()
         keys.onScreen = { _ in }
     }
 
@@ -244,8 +255,8 @@ final class KeyboardController: UIViewController {
 
     // MARK: layout
 
-    /// The keys, or the trackpad, fill what the keyboard leaves: four rows of four keys, or two of eight where
-    /// that's too low (a phone on its side).
+    /// The keys, or the trackpad, fill what the keyboard leaves: three rows of keys and the strip of shortcuts under
+    /// them, or two rows, the strip beside the arrows, where that's too low (a phone on its side).
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let safe = view.bounds.inset(by: view.safeAreaInsets), gap: CGFloat = 8
@@ -274,15 +285,36 @@ final class KeyboardController: UIViewController {
         pad.isHidden = !trackpad
         pad.frame = area
         rows.joined().forEach { $0.isHidden = trackpad }
+        strip.isHidden = trackpad
         let pad = gap
-        let grid: [[UIButton]] = low ? [rows[0] + rows[1], rows[2] + rows[3]] : rows
-        let h = (area.height - pad * CGFloat(grid.count - 1)) / CGFloat(grid.count)
+        let grid: [[UIButton]] = low ? [rows[0] + rows[1], rows[2]] : rows
+        let lines = low ? 2 : 4
+        let h = max(0, (area.height - pad * CGFloat(lines - 1)) / CGFloat(lines))
+        let half = (area.width - pad) / 2   // low: the arrows have the left half of their row, the strip the right
         for (r, row) in grid.enumerated() {
-            let w = (area.width - pad * CGFloat(row.count - 1)) / CGFloat(row.count)
+            let across = low && r == 1 ? half : area.width
+            let w = (across - pad * CGFloat(row.count - 1)) / CGFloat(row.count)
             for (c, b) in row.enumerated() {
-                b.frame = CGRect(x: area.minX + CGFloat(c) * (w + pad), y: area.minY + CGFloat(r) * (h + pad), width: w, height: max(0, h))
+                b.frame = CGRect(x: area.minX + CGFloat(c) * (w + pad), y: area.minY + CGFloat(r) * (h + pad), width: w, height: h)
             }
         }
+        // the strip runs on to the edge, where the next page's first key shows
+        let left = low ? area.minX + half + pad : area.minX
+        layoutStrip(CGRect(x: left, y: area.minY + CGFloat(lines - 1) * (h + pad), width: safe.maxX - left, height: h))
+    }
+
+    private var stripLayout: ShortcutStrip.Layout { ShortcutStrip.Layout(width: strip.bounds.width, gap: 8) }
+
+    /// The strip's keys, and the page it was left on: laid out again only when its size changes, not under a finger.
+    private func layoutStrip(_ frame: CGRect) {
+        guard strip.frame != frame else { return }
+        strip.frame = frame
+        let l = stripLayout
+        for (i, b) in stripKeys.enumerated() { b.frame = CGRect(x: l.x(ofKey: i), y: 0, width: l.keyWidth, height: frame.height) }
+        strip.contentSize = CGSize(width: l.contentWidth, height: frame.height)
+        strip.contentInset.right = l.gap
+        stripPage = min(max(stripPage, 0), l.pages - 1)
+        strip.contentOffset.x = l.offset(page: stripPage)
     }
 
     // MARK: keys
@@ -319,6 +351,56 @@ final class KeyboardController: UIViewController {
             }
         }, for: .touchDown)
         b.addAction(UIAction { [weak self] _ in self?.repeating?.invalidate() }, for: [.touchUpInside, .touchUpOutside, .touchCancel])
+        return b
+    }
+
+    /// A key of the strip: pressed as the finger lifts, since a touch there may be the start of a swipe to the next
+    /// page instead. One with a second shortcut (Screenshot) sends that when touched and held.
+    private func stripKey(_ k: ShortcutStrip.Key) -> UIButton {
+        let b = button(title: k.title, symbol: k.symbol, label: k.label)
+        if k.title?.contains("\n") == true {   // two short lines: smaller
+            b.configuration?.titleAlignment = .center
+            b.configuration?.titleLineBreakMode = .byWordWrapping
+            b.configuration?.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+                var a = $0
+                a.font = .systemFont(ofSize: 17, weight: .medium)
+                let p = NSMutableParagraphStyle()
+                p.alignment = .center
+                a.paragraphStyle = p
+                return a
+            }
+        }
+        if k.symbol != nil, k.title != nil {   // a symbol and what it's for, small, under it
+            b.configuration?.imagePlacement = .top
+            b.configuration?.imagePadding = 5
+            b.configuration?.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+                var a = $0
+                a.font = .systemFont(ofSize: 13, weight: .medium)
+                return a
+            }
+        }
+        b.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            heldFired = false
+            holding?.invalidate()
+            guard let other = k.heldCode else { return }
+            let t = Timer(timeInterval: 0.5, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                heldFired = true
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                press(other, k.flags)
+            }
+            RunLoop.main.add(t, forMode: .common)   // (a finger down in a scroll view: the run loop is tracking it)
+            holding = t
+        }, for: .touchDown)
+        b.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            holding?.invalidate()
+            guard !heldFired else { return }
+            UIDevice.current.playInputClick()
+            press(k.code, k.flags)
+        }, for: .touchUpInside)
+        b.addAction(UIAction { [weak self] _ in self?.holding?.invalidate() }, for: [.touchUpOutside, .touchCancel])
         return b
     }
 
@@ -415,6 +497,21 @@ final class KeyboardController: UIViewController {
         press(Keys.delete)
         return true
     }
+}
+
+/// The strip of shortcuts: it comes to rest on a page of four, and remembers which.
+extension KeyboardController: UIScrollViewDelegate {
+    func scrollViewWillEndDragging(_ s: UIScrollView, withVelocity v: CGPoint, targetContentOffset target: UnsafeMutablePointer<CGPoint>) {
+        let l = stripLayout
+        stripPage = l.page(letGoAt: s.contentOffset.x, velocity: v.x, from: stripPage)
+        UserDefaults.standard.set(stripPage, forKey: "keyboard.strip")
+        target.pointee.x = l.offset(page: stripPage)
+    }
+}
+
+/// A scroll view whose keys give up a touch that turns out to be a swipe (buttons keep theirs otherwise).
+private final class StripScroll: UIScrollView {
+    override func touchesShouldCancel(in view: UIView) -> Bool { true }
 }
 
 /// A trackpad for the Mac's pointer, which the device this one is the keyboard of draws and moves (StreamView): one

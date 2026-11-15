@@ -145,7 +145,9 @@ when you leave.
   it again for the next app, or tap an app in it. It switches to the one picked two seconds after your last tap.
 - **An iPhone as the iPad's keyboard:** on the iPhone, Home › Use as a Keyboard: its own keyboard (with its
   languages, dictation and swipe typing) and, filling the rest of the screen, big esc, tab, Delete, Return, ⌃ ⌥ ⌘ ⇧,
-  arrows, and Cut, Copy, Paste, Undo. On the iPad, Home shows **Pair with iPhone's Keyboard** the first time: check
+  arrows, and a strip of the Mac's shortcuts: Cut, Copy, Paste, Undo, and swiped sideways, Redo, Select All, Find,
+  Save, then two Screenshot keys (drag an area; touch and hold the key for the whole screen): Save puts it in a
+  file on the Mac, Copy on the Mac's clipboard. Then Spotlight, Close and ⌘` (the app's next window). On the iPad, Home shows **Pair with iPhone's Keyboard** the first time: check
   both show the same code. From then on the iPad connects to it by itself whenever the iPhone shows its keyboard
   and Hither is in front on both, on the same Wi-Fi or the iPhone's Personal Hotspot. What's typed goes into the
   session you're using on the iPad, whichever Mac and window that is; the Macs take no part. A modifier tapped on

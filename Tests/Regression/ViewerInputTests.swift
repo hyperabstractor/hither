@@ -225,6 +225,40 @@ func testTrackpad() throws {
     try expectEqual(Trackpad.move(CGPoint(x: 3, y: 4), in: 0), Trackpad.move(CGPoint(x: 3, y: 4), in: 1.0 / 240))   // no time between: as a frame apart
 }
 
+/// The iPhone keyboard's strip of shortcuts: the Mac's own, four to a page with the next page's first key showing,
+/// and it comes to rest on a page however it's let go.
+func testShortcutStrip() throws {
+    let keys = ShortcutStrip.keys
+    try expectEqual(keys.prefix(4).map(\.title), ["Cut", "Copy", "Paste", "Undo"])          // the first page: as it was
+    try expectEqual(keys.prefix(4).map(\.code), [0x07, 0x08, 0x09, 0x06])
+    try expectEqual(keys.prefix(4).allSatisfy { $0.flags == Keymap.command && $0.heldCode == nil }, true)
+    try expectEqual(Set(keys.map { [$0.code, Int($0.flags)] }).count, keys.count)             // no shortcut twice
+    let shots = keys.filter { $0.symbol == "camera.viewfinder" }                              // saved, and copied
+    try expectEqual(shots.map(\.title), ["Save", "Copy"])
+    try expectEqual(shots.map { [$0.code, $0.heldCode ?? -1] }, [[0x15, 0x14], [0x15, 0x14]])   // ⇧⌘4; held, ⇧⌘3
+    try expectEqual(shots.map(\.flags), [Keymap.command | Keymap.shift, Keymap.command | Keymap.shift | Keymap.control])
+
+    let l = ShortcutStrip.Layout(width: 385, gap: 8, count: 12)   // an iPhone 393 wide, from the left margin to the edge
+    try expectEqual(l.keyWidth, 83.75)
+    try expectEqual(l.x(ofKey: 4) - 385, -18)          // the fifth key shows by the peek
+    try expectEqual(l.pages, 3)
+    try expectEqual([0, 1, 2, 9].map { l.offset(page: $0) }, [0, 367, 716, 716])   // the last: its last key a gap from the end
+    try expectEqual(l.x(ofKey: 11) + l.keyWidth - 716, 385 - 8)
+    try expectEqual(l.page(letGoAt: 40, velocity: 0.8, from: 0), 1)      // a flick: the next page, however short
+    try expectEqual(l.page(letGoAt: 900, velocity: 2, from: 2), 2)       // …but not past the last
+    try expectEqual(l.page(letGoAt: 300, velocity: -0.8, from: 1), 0)
+    try expectEqual(l.page(letGoAt: 150, velocity: 0, from: 0), 0)       // a slow drag: the nearest
+    try expectEqual(l.page(letGoAt: 200, velocity: 0.1, from: 0), 1)
+    try expectEqual(l.page(letGoAt: 600, velocity: 0, from: 1), 2)
+    // a last page that isn't full: its keys end the strip, the ones before them filling it
+    let odd = ShortcutStrip.Layout(width: 385, gap: 8, count: 13)
+    try expectEqual(odd.pages, 4)
+    try expectEqual([2, 3].map { odd.offset(page: $0) }, [734, 807.75])
+    try expectEqual(odd.x(ofKey: 12) + odd.keyWidth - 807.75, 385 - 8)
+    try expectEqual(odd.page(letGoAt: 740, velocity: 0.8, from: 2), 3)
+    try expectEqual(odd.page(letGoAt: 760, velocity: 0, from: 3), 2)
+}
+
 /// The edit menu over the picture goes by the touch: a drag or a double tap likely selected something to cut or copy,
 /// a touch and hold in place put the cursor where something may be pasted; each item is the Mac's own shortcut.
 func testEditMenu() throws {
