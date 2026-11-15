@@ -174,6 +174,9 @@ final class KeyboardController: UIViewController {
         keys.onScreen = { _ in }
     }
 
+    // iPadOS's own three-finger gestures (undo, redo, copy, paste) stay out of the trackpad's, keyboard up or away
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+
     @objc private func showKeyboard() {
         guard viewIfLoaded?.window != nil, presentedViewController == nil, !typing.isFirstResponder, !keyboardAway else { return }
         typing.becomeFirstResponder()
@@ -367,14 +370,18 @@ final class KeyboardController: UIViewController {
 /// A trackpad for the Mac's pointer, which the device this one is the keyboard of draws and moves (StreamView): one
 /// finger moves it (faster the faster it goes: Trackpad), a tap clicks (again quickly for a double or triple click),
 /// a two-finger tap right-clicks, two fingers scroll, gliding on after a flick, and a touch and hold then moving
-/// drags. Modifiers latched beside it join the click, as they do a tap on the other device.
-final class PadView: UIView {
-    /// "padmove", "padclick", "paddown", "padup", "padscroll": to the other device (KeyLink).
+/// drags. Modifiers latched beside it join the click, as they do a tap on the other device. Three fingers swiped
+/// across it are three fingers swiped across a Desktop there: the Mac's next desktop that way, Mission Control
+/// upwards, the app's windows downwards (Keymap.desktopKey).
+final class PadView: UIView, UIGestureRecognizerDelegate {
+    /// "padmove", "padclick", "paddown", "padup", "padscroll", "padswipe": to the other device (KeyLink).
     var send: (Msg) -> Void = { _ in }
 
     private let hint = UILabel()
     private let tap = UITapGestureRecognizer(), rightTap = UITapGestureRecognizer()
     private let scroll = UIPanGestureRecognizer(), hold = UILongPressGestureRecognizer()
+    private let swipe = UIPanGestureRecognizer()
+    private var swiped = false   // that swipe did its one thing already
     private var finger: (touch: UITouch, at: CGPoint, time: TimeInterval, moving: Bool)?   // the one finger that moves the pointer
     private var lastTap: (at: CFTimeInterval, count: Int)?
     private var dragAt: CGPoint?   // touch and hold: the finger, as last seen
@@ -387,7 +394,7 @@ final class PadView: UIView {
         backgroundColor = .tertiarySystemFill
         layer.cornerRadius = 14
         isMultipleTouchEnabled = true
-        hint.text = "Trackpad\nTap to click · two fingers to scroll or right-click · hold, then move, to drag"
+        hint.text = "Trackpad\nTap to click · two fingers to scroll or right-click · hold, then move, to drag\nThree fingers: left or right for the next desktop, up for Mission Control"
         hint.numberOfLines = 0
         hint.textAlignment = .center
         hint.font = .preferredFont(forTextStyle: .footnote)
@@ -402,7 +409,11 @@ final class PadView: UIView {
         hold.addTarget(self, action: #selector(held(_:)))
         hold.minimumPressDuration = 0.35
         hold.allowableMovement = 8
-        [tap, rightTap, scroll, hold].forEach(addGestureRecognizer)
+        swipe.addTarget(self, action: #selector(swipedThree(_:)))
+        swipe.minimumNumberOfTouches = 3
+        swipe.maximumNumberOfTouches = 3
+        swipe.delegate = self
+        [tap, rightTap, scroll, hold, swipe].forEach(addGestureRecognizer)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -481,6 +492,31 @@ final class PadView: UIView {
         default: break
         }
     }
+
+    /// Three fingers swiped, once per swipe, as soon as it's clear which way. A scroll the first two began ends
+    /// there, cancelled.
+    @objc private func swipedThree(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began:
+            swiped = false
+            if scroll.state == .began || scroll.state == .changed { scroll.isEnabled = false; scroll.isEnabled = true }
+        case .changed:
+            guard !swiped, let key = Keymap.desktopKey(swiped: g.translation(in: self)) else { return }
+            swiped = true
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            var m = Msg("padswipe"); m.k = key
+            send(m)
+        default: break
+        }
+    }
+
+    /// A scroll two fingers began doesn't keep the third from starting a swipe.
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        g === swipe || other === swipe
+    }
+
+    // iPadOS's own three-finger gestures (undo, redo, copy, paste) stay out of it
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
     /// Two fingers scroll what's under the pointer, as a finger on the other device scrolls what's under it, with
     /// a scroll's phases (CGScrollPhase), and glide on after a flick.

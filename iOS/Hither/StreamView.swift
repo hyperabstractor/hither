@@ -735,6 +735,10 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
             typing.reset()   // the cursor may be anywhere now (that keyboard knows: it sent the key)
             key(k, flags: m.f ?? 0)
         case "padmove", "padclick", "paddown", "padup", "padscroll": pad(m)
+        case "padswipe":   // three fingers swiped across it: as three fingers here (a Desktop's desktops), by ⌃ and that arrow
+            guard zoomable, let k = m.k, (0x7B...0x7E).contains(k) else { return }
+            closeSwitcher()
+            _ = shortcut(k, modifiers: [Keymap.leftControl])
         default: break
         }
     }

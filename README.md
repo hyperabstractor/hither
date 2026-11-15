@@ -153,7 +153,8 @@ when you leave.
 - **…and its trackpad:** on that Keyboard screen, switch from Keys to **Trackpad** (put the keyboard away with the
   button at the top right and it has the whole screen). One finger moves a pointer the iPad draws over the picture,
   faster the faster you go; tap to click (twice quickly to double-click), two-finger tap to right-click, two fingers
-  to scroll, touch and hold then move to drag. The arrow is the iPad's own, drawn where it last told the Mac its
+  to scroll, touch and hold then move to drag, and on a Desktop three fingers swiped for the Mac's next desktop,
+  Mission Control or the app's windows, as on the iPad itself. The arrow is the iPad's own, drawn where it last told the Mac its
   pointer is, so it moves at once but is always an arrow; it goes a few seconds after you stop, or when you touch
   the iPad.
 - **Switch desktop:** on a Desktop, swipe left or right with three fingers for the Mac's next desktop (Space) that

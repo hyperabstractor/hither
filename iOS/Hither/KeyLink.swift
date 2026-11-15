@@ -16,7 +16,8 @@ import UIKit
 ///
 ///   keyboard → screen   "text" {text}, "key" {k, f} (a Mac key pressed and let go, with these modifiers),
 ///                       "kblatch" {f} (modifiers latched there: they join the screen's next click),
-///                       and its trackpad's "padmove", "padclick", "paddown", "padup", "padscroll" (PadView)
+///                       and its trackpad's "padmove", "padclick", "paddown", "padup", "padscroll", "padswipe"
+///                       (PadView)
 ///   screen → keyboard   "kbinfo" {title} (what it types into), "kbreset" (the Mac's cursor moved: what was typed
 ///                       can't be revised from there any more), "kbused" (a click took the latched modifiers)
 ///   both, first         "kbhello" {peer}
