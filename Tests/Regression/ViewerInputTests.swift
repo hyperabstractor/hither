@@ -198,6 +198,22 @@ func testShortcut() throws {
     }
 }
 
+/// Three fingers swiped across a Desktop do what they do on a Mac's trackpad, as the Mac's ⌃ arrow shortcuts: the
+/// desktop the fingers pull into view, Mission Control upwards, the app's windows downwards; once it's clear which.
+func testDesktopSwipe() throws {
+    try expectEqual(Keymap.desktopKey(swiped: CGPoint(x: -80, y: 5)), 0x7C)    // fingers left: the desktop to the right, ⌃→
+    try expectEqual(Keymap.desktopKey(swiped: CGPoint(x: 80, y: -10)), 0x7B)   // fingers right: the one to the left, ⌃←
+    try expectEqual(Keymap.desktopKey(swiped: CGPoint(x: 10, y: -70)), 0x7E)   // up: Mission Control, ⌃↑
+    try expectEqual(Keymap.desktopKey(swiped: CGPoint(x: 0, y: 90)), 0x7D)     // down: the app's windows, ⌃↓
+    try expectNil(Keymap.desktopKey(swiped: CGPoint(x: -40, y: 0)))            // not far enough yet
+    try expectNil(Keymap.desktopKey(swiped: CGPoint(x: -70, y: 60)))           // nor clearly one way
+    // ⌃→ as a Mac keyboard sends it: ⌃ down, → down and up (an arrow counts as keypad and fn), ⌃ up
+    let next = Keymap.shortcut(0x7C, modifiers: [Keymap.leftControl])
+    try expectEqual(next.map(\.t), ["flags", "key", "key", "flags"])
+    try expectEqual(next.map { $0.f ?? 0 }, [Keymap.control, Keymap.control | Keymap.numericPad | Keymap.function,
+                                             Keymap.control | Keymap.numericPad | Keymap.function, 0])
+}
+
 /// The edit menu over the picture goes by the touch: a drag or a double tap likely selected something to cut or copy,
 /// a touch and hold in place put the cursor where something may be pasted; each item is the Mac's own shortcut.
 func testEditMenu() throws {

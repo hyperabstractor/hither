@@ -312,6 +312,8 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
     /// doesn't (the picture takes them itself while the on-screen keyboard is up).
     override var canBecomeFirstResponder: Bool { true }
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
+    // nor iPadOS's three-finger undo, redo, copy and paste: three fingers are the Mac's (StreamView)
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
     private func takeKeys() {
         guard viewIfLoaded?.window != nil, !window.view.isTyping else { return }

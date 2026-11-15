@@ -8,7 +8,17 @@ public enum Keymap {
     public static let option: UInt64 = 1 << 19, command: UInt64 = 1 << 20, numericPad: UInt64 = 1 << 21, function: UInt64 = 1 << 23
 
     /// Mac key codes for the shortcuts sent on their own.
-    public static let leftCommand = 0x37, tab = 0x30
+    public static let leftCommand = 0x37, leftControl = 0x3B, tab = 0x30
+
+    /// Three fingers swiped by `t` across a Desktop, as on a Mac's trackpad: the arrow key that does the same with ⌃,
+    /// by the Mac's own Mission Control shortcuts. Left and right go to the desktop (Space) on that side of this one,
+    /// which like the trackpad is the one the fingers pull into view (swipe left: the one to the right, ⌃→); up is
+    /// Mission Control (⌃↑), down the front app's windows (⌃↓). Nil until it's gone `least` points, mostly one way.
+    public static func desktopKey(swiped t: CGPoint, least: CGFloat = 60) -> Int? {
+        let across = abs(t.x) > abs(t.y)
+        guard max(abs(t.x), abs(t.y)) >= least, max(abs(t.x), abs(t.y)) >= 2 * min(abs(t.x), abs(t.y)) else { return nil }
+        return across ? (t.x < 0 ? 0x7C : 0x7B) : (t.y < 0 ? 0x7E : 0x7D)
+    }
 
     /// A shortcut exactly as given (⌘⇥: `tab`, [`leftCommand`]), as the key and flags messages a Mac keyboard would
     /// send for it: modifiers down, the key down and up with only those flags (and what a Mac keyboard adds to that

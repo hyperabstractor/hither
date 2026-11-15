@@ -111,6 +111,8 @@ final class TypingBuffer: UITextView, UITextViewDelegate {
 
     // no edit menu shortcuts here (⌘C, ⌘V…): they go to the Mac as keys
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
+    // nor iPadOS's three-finger undo, redo, copy and paste: three fingers are the Mac's (StreamView)
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
     override func resignFirstResponder() -> Bool {
         let done = super.resignFirstResponder()

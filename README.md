@@ -139,6 +139,10 @@ when you leave.
 - **Menus:** the menu bar button shows the app's menus, read from the Mac when you open them.
 - **Switch app:** on a Desktop, the ⌘⇥ button shows the Mac's app switcher, as holding ⌘ and pressing Tab does: tap
   it again for the next app, or tap an app in it. It switches to the one picked two seconds after your last tap.
+- **Switch desktop:** on a Desktop, swipe left or right with three fingers for the Mac's next desktop (Space) that
+  way, up for Mission Control, down for the front app's windows, as on a Mac's trackpad. They are the Mac's own
+  ⌃← ⌃→ ⌃↑ ⌃↓, so they need those shortcuts on there (System Settings › Keyboard › Keyboard Shortcuts › Mission
+  Control).
 - **Clipboard and files:** Send Clipboard puts text, rich text or an image from here on the Mac (iOS asks once
   whether Hither may paste). Get Clipboard brings the Mac's back; files copied in Finder come too, into Files ›
   On My iPad (or iPhone) › Hither, with a button to share or save them elsewhere. Send Files puts files you pick in

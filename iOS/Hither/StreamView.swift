@@ -13,7 +13,10 @@ import UIKit
 /// Typing goes to the Mac as text, through an invisible text view iOS can write into and revise (dictation from the
 /// keyboard's mic key; see TypingBuffer); the keys on the keyboard (KeyBar) send esc, tab, arrows and modifiers as Mac keys.
 /// A hardware keyboard sends Mac keys, modifiers and shortcuts included (those the iPad keeps for itself excepted).
-/// While the on-screen keyboard is up, the picture moves up just enough to keep the spot you last touched in view.
+///   On a Desktop, three fingers swiped left or right go to the Mac's next desktop (Space) that way, up to Mission
+///   Control and down to the app's windows, as on a Mac's trackpad (by the Mac's own ⌃ arrow shortcuts).
+/// While a docked on-screen keyboard is up, the picture moves up just enough to keep the spot you last touched in view
+/// (a floating one is yours to move out of the way: the picture stays where it is).
 final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
     let video = AVSampleBufferDisplayLayer()
     var depacketizer = Depacketizer()
@@ -30,11 +33,13 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     /// up or repeats would go to the next session), and going without one forgets what was held: that session is gone.
     var live = false { didSet { if !live { forgetInput() } } }
 
-    /// A Desktop: pinch and two fingers zoom and move the picture here (one finger still scrolls).
+    /// A Desktop: pinch and two fingers zoom and move the picture here (one finger still scrolls), and three fingers
+    /// swiped switch the Mac's desktops.
     var zoomable = false {
         didSet {
             pinch.isEnabled = zoomable
             twoFingers.isEnabled = zoomable
+            threeFingers.isEnabled = zoomable
             drag.maximumNumberOfTouches = zoomable ? 1 : 2
             if !zoomable { zoom = nil }
             setNeedsLayout()
@@ -67,6 +72,8 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     private let pinch = UIPinchGestureRecognizer(), twoFingers = UIPanGestureRecognizer()
     private let wheel = UIPanGestureRecognizer(), hover = UIHoverGestureRecognizer()
     private var anchor: (spot: CGPoint, zoom: CGFloat)?   // a pinch or two-finger move: what stays under the fingers
+    private let threeFingers = UIPanGestureRecognizer()   // a Desktop: the Mac's desktops (Spaces), Mission Control
+    private var swiped = false                            // that swipe did its one thing already
 
     // what's held down on the Mac because of us, so it's always let go again (app switch, disconnect, another window)
     private var heldKeys: Set<Int> = []
@@ -109,16 +116,21 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
         twoFingers.addTarget(self, action: #selector(transformed(_:)))
         twoFingers.minimumNumberOfTouches = 2
         twoFingers.maximumNumberOfTouches = 2
-        for g in [tap, rightTap, drag, hold, twoFingers] { g.allowedTouchTypes = touch }
+        threeFingers.addTarget(self, action: #selector(swipedThree(_:)))
+        threeFingers.minimumNumberOfTouches = 3
+        threeFingers.maximumNumberOfTouches = 3
+        for g in [tap, rightTap, drag, hold, twoFingers, threeFingers] { g.allowedTouchTypes = touch }
         pinch.delegate = self
         twoFingers.delegate = self
+        threeFingers.delegate = self
         pinch.isEnabled = false
         twoFingers.isEnabled = false
+        threeFingers.isEnabled = false
         wheel.addTarget(self, action: #selector(dragged(_:)))
         wheel.allowedScrollTypesMask = .all   // trackpad and mouse wheel scrolls, no touches
         wheel.allowedTouchTypes = []
         hover.addTarget(self, action: #selector(hovered(_:)))
-        [tap, rightTap, drag, hold, pinch, twoFingers, wheel, hover].forEach(addGestureRecognizer)
+        [tap, rightTap, drag, hold, pinch, twoFingers, threeFingers, wheel, hover].forEach(addGestureRecognizer)
         addInteraction(editMenu)
 
         // the keys ride on the keyboard, floating or docked (KeyBar), by the guide that follows either
@@ -166,10 +178,17 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     }
 
     /// Pinch and two-finger drags go together; and a one-finger scroll that started a moment before the second finger
-    /// landed doesn't keep them from starting (it's cancelled once they do).
+    /// landed doesn't keep them from starting (it's cancelled once they do). Nor does whatever the first fingers of
+    /// three began keep a three-finger swipe from starting (it cancels them too).
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        if g === threeFingers || other === threeFingers { return true }
         let zooming = [pinch, twoFingers]
         return zooming.contains(g) && (zooming.contains(other) || other === drag)
+    }
+
+    /// Three fingers swiping: no zoom starts under them.
+    override func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+        g === threeFingers || (threeFingers.state != .began && threeFingers.state != .changed)
     }
 
     // MARK: picture
@@ -202,10 +221,13 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
             : zoom == nil ? CGRect(origin: CGPoint(x: r.rect.minX.rounded(.down), y: r.rect.minY.rounded(.down)), size: r.rect.size) : r.rect
         if keepLift { return draw(animated: animated, duration: duration) }
         lift = 0
-        if let keyboard = keyboardCover, let p = focus, remoteSize.width > 0 {
+        // A floating keyboard is moved out of the way by hand, as anywhere on an iPad: lifted for it, the picture
+        // would leave black below, more or less of it as the keyboard moves.
+        let floating = keyboardLayoutGuide.layoutFrame.width < bounds.width - 1
+        if !floating, let keyboard = keyboardCover, let p = focus, remoteSize.width > 0 {
             let s = picture.width / remoteSize.width
             let x = picture.minX + p.x * s, y = picture.minY + p.y * s
-            // A floating keyboard only hides the part of the picture it actually covers.
+            // A keyboard moved up from the bottom only hides the part of the picture it actually covers.
             if !keyboard.isEmpty, x >= keyboard.minX, x <= keyboard.maxX, y <= keyboard.maxY {
                 lift = min(max(0, y + 44 - keyboard.minY), max(0, picture.maxY - keyboard.minY))
             }
@@ -332,6 +354,31 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
         guard let start = anchor else { return }
         anchored(min(max(start.zoom * (active(pinch) ? pinch.scale : 1), fitScale), 4), spot: start.spot, at: a)
     }
+
+    // MARK: three fingers (Desktop)
+
+    /// Three fingers swiped across a Desktop, once per swipe, as soon as it's clear which way: the Mac's own shortcut
+    /// for what a trackpad's three-finger swipe does there (Keymap.desktopKey). What the first fingers down began
+    /// meanwhile (a scroll, a zoom, a touch and hold) ends there, cancelled.
+    @objc private func swipedThree(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began:
+            swiped = false
+            for r in [drag, pinch, twoFingers, hold] where r.state == .began || r.state == .changed {
+                r.isEnabled = false
+                r.isEnabled = true
+            }
+        case .changed:
+            guard !swiped, let key = Keymap.desktopKey(swiped: g.translation(in: self)) else { return }
+            swiped = true
+            closeSwitcher()
+            if shortcut(key, modifiers: [Keymap.leftControl]) { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        default: break
+        }
+    }
+
+    // iPadOS's own three-finger gestures (undo, redo, copy, paste) stay out of it: three fingers are the Mac's here
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
     /// Zoomed in past the view, a pointer leads: where it is across the view is where it is across the Mac's screen.
     private func follow(_ p: CGPoint) {
