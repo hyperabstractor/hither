@@ -409,7 +409,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     private func click(_ p: CGPoint, button: Int, count: Int) {
         focus = remote(p)
         resetTyping()
-        let f = keys.take()
+        let f = latchedModifiers()
         mouse(0, p)   // the pointer moves there first, as it would with a mouse (hover states, tooltips)
         mouse(1, p, button: button, count: count, flags: f)
         mouse(2, p, button: button, count: count, flags: f)
@@ -532,7 +532,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
             holding = p
             heldFrom = p
             mouse(0, p)
-            mouse(1, p, flags: keys.take() | moving)   // with a selection's menu up: Shift, which moves its end here
+            mouse(1, p, flags: latchedModifiers() | moving)   // with a selection's menu up: Shift, which moves its end here
         case .changed:
             guard holding != nil else { return }   // let go of already (releaseInput)
             holding = p
@@ -653,7 +653,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
         focus = remote(p)
         resetTyping()
         mouse(0, p)
-        mouse(1, p, button: b, count: max(1, t.tapCount), flags: modifierFlags(event?.modifierFlags ?? []) | keys.take())
+        mouse(1, p, button: b, count: max(1, t.tapCount), flags: modifierFlags(event?.modifierFlags ?? []) | latchedModifiers())
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -701,8 +701,40 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     @discardableResult func stopTyping() -> Bool { typing.resignFirstResponder() }
 
     /// Where the Mac's text cursor is no longer follows what was typed here (a click, a key that moves it, a menu
-    /// item): what's been typed can't be revised or deleted from here any more, only what's typed next.
-    func resetTyping() { typing.reset() }
+    /// item): what's been typed can't be revised or deleted from here any more, only what's typed next. Nor from
+    /// another device typing here (`onCursorMoved`).
+    func resetTyping() {
+        typing.reset()
+        onCursorMoved()
+    }
+
+    // MARK: another device's keyboard (KeyLink)
+
+    /// Modifiers latched on an iPhone that's this device's keyboard: they join the next click here, as the ones
+    /// latched on the keys here do; `onLentUsed` says a click took them.
+    var lent: () -> UInt64 = { 0 }
+    var onLentUsed: () -> Void = {}
+    var onCursorMoved: () -> Void = {}
+
+    /// The modifiers a click carries: latched here, or on that keyboard.
+    private func latchedModifiers() -> UInt64 {
+        let there = lent()
+        if there != 0 { onLentUsed() }
+        return keys.take() | there
+    }
+
+    /// Typed on that keyboard: text, or a Mac key with its modifiers, into this session as from the keys here.
+    func typed(_ m: Msg) {
+        guard live else { return }
+        switch m.t {
+        case "text": if let t = m.text, !t.isEmpty { text(t) }
+        case "key":
+            guard let k = m.k else { return }
+            typing.reset()   // the cursor may be anywhere now (that keyboard knows: it sent the key)
+            key(k, flags: m.f ?? 0)
+        default: break
+        }
+    }
 
     // no edit menu shortcuts here (⌘C, ⌘V…): they go to the Mac as keys
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }

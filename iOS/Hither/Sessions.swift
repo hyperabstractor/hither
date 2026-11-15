@@ -20,6 +20,19 @@ final class SceneModel: ObservableObject {
 final class Sessions: ObservableObject {
     @Published private(set) var all: [RemoteWindow] = []   // in the order they opened
     let macs: Macs
+    /// Another iPhone or iPad as this one's keyboard: what it types goes to the session in use.
+    var keyboard: KeyLink? {
+        didSet {
+            keyboard?.onInput = { [weak self] in self?.inUse?.view.typed($0) }
+            keyboard?.target = { [weak self] in
+                guard let w = self?.inUse else { return "" }
+                return w.isDesktop ? w.title : "\(w.title) · \(w.mac.name)"
+            }
+        }
+    }
+
+    /// The session on screen used last: the one sound comes from, and the one another device's keyboard types into.
+    var inUse: RemoteWindow? { book.audioOwner.flatMap { windows[$0] } }
 
     private var book = SessionBook()
     private var windows: [UUID: RemoteWindow] = [:]

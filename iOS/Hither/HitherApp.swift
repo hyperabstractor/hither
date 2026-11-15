@@ -10,6 +10,12 @@ import SwiftUI
 enum Hither {
     static let macs = Macs()
     static let sessions = Sessions(macs: macs)
+    /// This device as another's keyboard, or another as this one's.
+    static let keys: KeyLink = {
+        let k = KeyLink()
+        sessions.keyboard = k
+        return k
+    }()
 }
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
@@ -34,7 +40,7 @@ struct HitherApp: App {
         // a window's value: the session it shows (Open in New Window opens one with it; one showing it already
         // comes forward instead). Restored after a relaunch it names nothing open, and the window shows Home.
         WindowGroup(for: UUID.self) { $session in
-            SceneRoot(macs: Hither.macs, sessions: Hither.sessions, requested: $session)
+            SceneRoot(macs: Hither.macs, sessions: Hither.sessions, keys: Hither.keys, requested: $session)
                 .onChange(of: phase) { _, p in   // the whole app's: every window in the background, or one back
                     if p == .background { Hither.macs.suspend() } else if p == .active { Hither.macs.resume() }
                 }
@@ -46,12 +52,13 @@ struct HitherApp: App {
 struct SceneRoot: View {
     @ObservedObject var macs: Macs
     let sessions: Sessions
+    let keys: KeyLink
     @Binding var requested: UUID?
     @StateObject private var scene = SceneModel()
     @Environment(\.scenePhase) private var phase   // this window's
 
     var body: some View {
-        HomeView(macs: macs, sessions: sessions, scene: scene)
+        HomeView(macs: macs, sessions: sessions, scene: scene, keys: keys)
             .background(SceneProbe { sessions.attach(scene, to: $0) })
             .onAppear {
                 sessions.register(scene)

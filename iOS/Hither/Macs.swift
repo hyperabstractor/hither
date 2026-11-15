@@ -12,6 +12,7 @@ struct NearbyMac: Identifiable {
 struct CodePrompt: Identifiable {
     let id = UUID()
     let code: String, mac: String
+    var keyboard = false   // not a Mac: another iPhone or iPad, pairing as a keyboard (KeyLink)
     let answer: (Bool) -> Void
 }
 
@@ -27,7 +28,7 @@ struct Received: Identifiable {
 /// here runs on the main queue.
 final class Macs: ObservableObject {
     @Published var nearby: [NearbyMac] = []
-    @Published var paired: [Peer] = Pairings.load().peers
+    @Published var paired: [Peer] = Pairings.load().macs
     @Published var windows: [String: [Item]] = [:]   // by Mac (its peer ID)
     @Published var apps: [String: [Item]] = [:]
     @Published var state: [String: String] = [:]     // why a Mac has no list: "Connecting…", "Can't reach mini"
@@ -127,12 +128,12 @@ final class Macs: ObservableObject {
             // hold (each keeps the Mac as it was paired: its key, name and addresses); then hang up on the old entries
             // before connecting with the new one, whose reconnect timers then find them gone.
             var all = Pairings.load()
-            let replaced = all.peers.filter { $0.id == p.id || $0.name == p.name }
+            let replaced = all.macs.filter { $0.id == p.id || $0.name == p.name }
             replaced.forEach { self.sessions?.closeAll(of: $0) }
-            all.peers.removeAll { $0.id == p.id || $0.name == p.name }
+            all.peers.removeAll { $0.keys != true && ($0.id == p.id || $0.name == p.name) }
             all.peers.append(p)
             all.save()
-            paired = all.peers
+            paired = all.macs
             replaced.forEach(drop)
             drop(p)
             connect(p)
@@ -143,9 +144,9 @@ final class Macs: ObservableObject {
     func unpair(_ mac: Peer) {
         sessions?.closeAll(of: mac)   // first, while they can still let go of what they hold there
         var all = Pairings.load()
-        all.peers.removeAll { $0.id == mac.id }
+        all.peers.removeAll { $0.keys != true && $0.id == mac.id }
         all.save()
-        paired = all.peers
+        paired = all.macs
         drop(mac)
     }
 

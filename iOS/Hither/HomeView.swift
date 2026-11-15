@@ -3,11 +3,14 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// The sessions open (tap one to go back to it), each paired Mac (its Desktop, its open windows and its apps, to open
-/// as sessions, and its settings), and Macs nearby to pair with.
+/// as sessions, and its settings), this device as another's keyboard or another as this one's (KeyLink), and Macs
+/// nearby to pair with.
 struct HomeView: View {
     @ObservedObject var macs: Macs
     @ObservedObject var sessions: Sessions
     @ObservedObject var scene: SceneModel
+    @ObservedObject var keys: KeyLink
+    @State private var typing = false   // this device is a keyboard now (KeyboardScreen)
     @Environment(\.openWindow) private var openWindow
     @Environment(\.supportsMultipleWindows) private var multipleWindows
     @State private var askingAddress = false
@@ -28,6 +31,7 @@ struct HomeView: View {
             List {
                 if !sessions.all.isEmpty { openSessions }
                 ForEach(macs.paired, id: \.id) { mac in section(mac) }
+                keyboard
                 let unpaired = macs.nearby.filter { n in !macs.paired.contains { $0.id == n.id } }
                 if macs.paired.isEmpty || !unpaired.isEmpty || macs.noLocalNetwork {
                     Section {
@@ -62,10 +66,13 @@ struct HomeView: View {
             .toolbar {
                 Menu {
                     Button("Pair with Mac at Address…", systemImage: "network") { askingAddress = true }
-                    if !macs.paired.isEmpty {
+                    if !macs.paired.isEmpty || !keys.paired.isEmpty {
                         Divider()
                         ForEach(macs.paired, id: \.id) { mac in
                             Button("Unpair \(mac.name)", systemImage: "xmark.circle", role: .destructive) { macs.unpair(mac) }
+                        }
+                        ForEach(keys.paired, id: \.id) { p in
+                            Button("Unpair \(p.name) (Keyboard)", systemImage: "xmark.circle", role: .destructive) { keys.unpair(p) }
                         }
                     }
                 } label: {
@@ -76,6 +83,14 @@ struct HomeView: View {
             .safeAreaInset(edge: .bottom) { TransferBar(macs: macs) }
         }
         .sheet(item: $macs.prompt) { CodeSheet(prompt: $0) }
+        // (as a keyboard, the Keyboard screen shows its own)
+        .sheet(item: Binding(get: { typing ? nil : keys.prompt }, set: { keys.prompt = $0 })) { CodeSheet(prompt: $0) }
+        .alert("Couldn't Pair", isPresented: Binding(get: { !typing && keys.problem != nil }, set: { if !$0 { keys.problem = nil } })) {
+            Button("OK") {}
+        } message: {
+            Text(keys.problem ?? "")
+        }
+        .fullScreenCover(isPresented: $typing) { KeyboardScreen(keys: keys) }
         .alert("Couldn't Pair", isPresented: Binding(get: { macs.problem != nil }, set: { if !$0 { macs.problem = nil } })) {
             Button("OK") {}
         } message: {
@@ -159,6 +174,32 @@ struct HomeView: View {
             if dark {
                 Text("Keep Screen Dark is on: \(mac.name)'s own monitors show black while you use it from here, and it locks 2 minutes after its last session closes or hangs up.")
             }
+        }
+    }
+
+    /// This device as the keyboard of another showing Hither, and the other way round: the devices paired for it,
+    /// and keyboards showing nearby to pair with.
+    @ViewBuilder var keyboard: some View {
+        Section {
+            Button { typing = true } label: {
+                AppRow(item: Item(id: 0, app: "Use as a Keyboard", bundle: "", title: ""), icon: nil, symbol: "keyboard",
+                       detail: "Type here into what Hither shows on your other device")
+            }
+            ForEach(keys.paired, id: \.id) { p in
+                LabeledContent {
+                    Text(keys.keyboard?.id == p.id ? "Typing here" : "Paired")
+                } label: {
+                    Label(p.name, systemImage: p.name.hasPrefix("iPad") ? "ipad" : "iphone")
+                }
+                .swipeActions { Button("Unpair", role: .destructive) { keys.unpair(p) } }
+            }
+            ForEach(keys.nearby) { n in
+                Button("Pair with \(n.name)'s Keyboard", systemImage: "keyboard.badge.ellipsis") { keys.pair(with: n) }
+            }
+        } header: {
+            Text("Keyboard")
+        } footer: {
+            Text("Another iPhone or iPad can be this one's keyboard: open Hither there and tap Use as a Keyboard. Paired once, it connects by itself, on the same Wi-Fi or its hotspot, and types into the session you're using here.")
         }
     }
 
@@ -340,7 +381,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
     }
 }
 
-/// The 6-digit code, to compare with the Mac's.
+/// The 6-digit code, to compare with the Mac's (or the other iPhone's or iPad's, pairing as a keyboard).
 struct CodeSheet: View {
     let prompt: CodePrompt
     @State private var sent = false
@@ -349,7 +390,9 @@ struct CodeSheet: View {
         VStack(spacing: 18) {
             Text("Pair with \(prompt.mac)?").font(.title2.bold())
             Text(prompt.code).font(.system(size: 44, weight: .semibold, design: .rounded).monospacedDigit())
-            Text(sent ? "Now click Pair on \(prompt.mac)." : "Check that \(prompt.mac) shows the same code. Once paired, this device can open and control the Mac's apps.")
+            Text(sent ? "Now \(prompt.keyboard ? "tap" : "click") Pair on \(prompt.mac)."
+                 : prompt.keyboard ? "Check that \(prompt.mac) shows the same code. Once paired, either can be the other's keyboard: what's typed on one goes into the Mac session the other shows."
+                 : "Check that \(prompt.mac) shows the same code. Once paired, this device can open and control the Mac's apps.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
             if sent {

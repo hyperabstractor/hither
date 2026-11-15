@@ -142,6 +142,14 @@ when you leave.
 - **Menus:** the menu bar button shows the app's menus, read from the Mac when you open them.
 - **Switch app:** on a Desktop, the ⌘⇥ button shows the Mac's app switcher, as holding ⌘ and pressing Tab does: tap
   it again for the next app, or tap an app in it. It switches to the one picked two seconds after your last tap.
+- **An iPhone as the iPad's keyboard:** on the iPhone, Home › Use as a Keyboard: its own keyboard (with its
+  languages, dictation and swipe typing) and, filling the rest of the screen, big esc, tab, Delete, Return, ⌃ ⌥ ⌘ ⇧,
+  arrows, and Cut, Copy, Paste, Undo. On the iPad, Home shows **Pair with iPhone's Keyboard** the first time: check
+  both show the same code. From then on the iPad connects to it by itself whenever the iPhone shows its keyboard
+  and Hither is in front on both, on the same Wi-Fi or the iPhone's Personal Hotspot. What's typed goes into the
+  session you're using on the iPad, whichever Mac and window that is; the Macs take no part. A modifier tapped on
+  the iPhone latches for the next key there or the next tap on the iPad (⇧ then a tap extends a selection), or
+  hold it for several. It works the other way round too, and between two iPads.
 - **Switch desktop:** on a Desktop, swipe left or right with three fingers for the Mac's next desktop (Space) that
   way, up for Mission Control, down for the front app's windows, as on a Mac's trackpad. They are the Mac's own
   ⌃← ⌃→ ⌃↑ ⌃↓, so they need those shortcuts on there (System Settings › Keyboard › Keyboard Shortcuts › Mission

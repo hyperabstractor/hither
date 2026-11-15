@@ -67,6 +67,11 @@ final class RemoteWindow: ObservableObject, Identifiable {
         view.send = { [weak self] in self?.send($0) }
         view.onWantSize = { [weak self] in self?.resize($0) }
         view.onLatency = { [weak self] ms in self?.latency = "\(ms) ms" }
+        // an iPhone as this device's keyboard (KeyLink): its latched modifiers join clicks here, and it hears when
+        // the Mac's cursor moved under what it typed
+        view.lent = { [weak self] in self?.sessions?.keyboard?.latched ?? 0 }
+        view.onLentUsed = { [weak self] in self?.sessions?.keyboard?.tell(Msg("kbused")) }
+        view.onCursorMoved = { [weak self] in self?.sessions?.keyboard?.tell(Msg("kbreset")) }
         configureView()
         connect()
     }

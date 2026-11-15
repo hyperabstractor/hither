@@ -5,6 +5,8 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_hither._tcp</string>
+		<string>_hither-kb._tcp</string>
+		<string>_hither-kbpair._tcp</string>
 	</array>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>

@@ -97,10 +97,13 @@ public func localName() -> String {
 /// A device this one is paired with. Pairing between Macs is mutual: each can open the other's windows.
 /// A `viewer` (iPhone) only opens this Mac's windows; it shares none of its own.
 /// `addr`: the IP it paired from, a way back when its name doesn't resolve here (a Mac in someone else's tailnet).
+/// `keys`: not a Mac at all but another iPhone or iPad, paired so one can be the other's keyboard (the iOS app's
+/// KeyLink); a Mac never has one of these.
 public struct Peer: Codable {
     public var id: String, name: String, token: Data
     public var viewer: Bool?
     public var addr: String?
+    public var keys: Bool?
     public init(id: String, name: String, token: Data, viewer: Bool? = nil, addr: String? = nil) {
         self.id = id; self.name = name; self.token = token; self.viewer = viewer; self.addr = addr
     }
@@ -143,9 +146,13 @@ public struct Pairings: Codable {
     }
     #endif
 
-    /// The paired device `host` names: "mini.local", "mini" or the address it paired from.
+    /// The paired Macs (an iPhone or iPad also keeps the devices it shares a keyboard with: `keyboards`).
+    public var macs: [Peer] { peers.filter { $0.keys != true } }
+    public var keyboards: [Peer] { peers.filter { $0.keys == true } }
+
+    /// The paired Mac `host` names: "mini.local", "mini" or the address it paired from.
     public func peer(for host: String) -> Peer? {
-        peers.first { $0.name == host || "\($0.name).local" == host || $0.addr == host }
+        macs.first { $0.name == host || "\($0.name).local" == host || $0.addr == host }
     }
 
     /// Client side of a connection to `host`: our ID with that pair's key.
