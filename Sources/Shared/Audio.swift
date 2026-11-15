@@ -4,34 +4,63 @@ import Foundation
 /// Who plays, and how much of their sound is queued: AudioOut's bookkeeping, apart from the audio engine (and so
 /// testable). A handover starts an epoch: what the last owner queued no longer counts, its buffers' completions
 /// (when the player drops them) change nothing, and nothing is taken until the new owner is in.
+///
+/// How much is buffered stretches with the network: it starts at ~30 ms, and sound that ran dry mid-flow and came back
+/// moments later (a Wi-Fi spike, not a pause in the sound) adds that gap, up to ~200 ms, so the next spike like it
+/// plays through. After 15 s without one it comes back down 20 ms at a time, staying in step with the video when the
+/// network is good.
 public struct AudioQueue {
-    public static let most = 3_360    // ~70 ms: past this, drop incoming sound to stay in step with the video
-    public static let start = 1_440   // ~30 ms buffered before playing
+    public static let start = 1_440      // ~30 ms: the least buffered before playing
+    public static let deepest = 9_600    // ~200 ms: the most, however shaky the network
+    public static let headroom = 1_920   // ~40 ms over the target: past this, drop incoming sound to stay in step
+    static let hiccup = 0.3              // ran dry and back within this: the network, not a pause in the sound
+    static let flowing = 0.2             // …after playing at least this long (not a click)
+    static let steady = 15.0             // this long without one: 20 ms less
 
     public private(set) var owner: ObjectIdentifier?
     public private(set) var queued = 0   // frames scheduled, not yet played
     public private(set) var epoch = 0
+    public private(set) var target = start   // frames buffered before playing
+    public var limit: Int { target + Self.headroom }
     private var handing = false
+    private var dryAt: Double?, flowingSince: Double?, steadySince = 0.0
 
     public init() {}
 
-    /// `frames` from `id` to schedule: the epoch to report their completion with, or nil to drop them (not the
-    /// owner, a handover under way, or enough queued).
-    public mutating func accept(_ frames: Int, from id: ObjectIdentifier) -> Int? {
-        guard owner == id, !handing, queued < Self.most, frames > 0 else { return nil }
+    /// `frames` from `id` arriving at `now` (seconds) to schedule: the epoch to report their completion with, or nil
+    /// to drop them (not the owner, a handover under way, or enough queued).
+    public mutating func accept(_ frames: Int, from id: ObjectIdentifier, now: Double) -> Int? {
+        guard owner == id, !handing, frames > 0 else { return nil }
+        if let dry = dryAt {   // sound again after running dry
+            dryAt = nil
+            let gap = now - dry
+            if gap < Self.hiccup, let f = flowingSince, dry - f >= Self.flowing {
+                target = min(Self.deepest, target + Int(gap * 48_000) + 960)
+                steadySince = now
+            }
+            flowingSince = nil
+        }
+        if target > Self.start && now - steadySince >= Self.steady {
+            target = max(Self.start, target - 960)
+            steadySince = now
+        }
+        guard queued < limit else { return nil }
         queued += frames
+        if flowingSince == nil && queued >= target { flowingSince = now }   // it plays from here
         return epoch
     }
 
-    /// Scheduled frames played, or were dropped. True if that leaves nothing queued (pause, and buffer up again).
-    /// From an epoch before a handover: nothing changes.
-    public mutating func played(_ frames: Int, epoch e: Int) -> Bool {
+    /// Scheduled frames played, or were dropped, at `now`. True if that leaves nothing queued (pause, and buffer up
+    /// again). From an epoch before a handover: nothing changes.
+    public mutating func played(_ frames: Int, epoch e: Int, now: Double) -> Bool {
         guard e == epoch else { return false }
         queued -= frames
-        return queued == 0
+        guard queued == 0 else { return false }
+        dryAt = now
+        return true
     }
 
-    public var ready: Bool { queued >= Self.start }
+    public var ready: Bool { queued >= target }
 
     /// Start handing over to `id`: nothing more is taken, and what's queued is the last epoch's. False if `id` is the
     /// owner already, and nothing's to be done; else the player drops what it has, then `finishHandover`.
@@ -41,6 +70,8 @@ public struct AudioQueue {
         handing = true
         epoch += 1
         queued = 0
+        target = Self.start   // another Mac, maybe another network
+        dryAt = nil; flowingSince = nil
         return true
     }
 
@@ -93,15 +124,17 @@ public final class AudioOut {
         lock.unlock()
     }
 
-    /// Int16 interleaved stereo in. Start once ~30 ms is buffered (absorbs Wi-Fi jitter). Sound arrives and plays in
-    /// real time, so any surplus (a burst at start, the two Macs' clocks drifting) would never drain: past ~70 ms
-    /// buffered, drop the incoming ~20 ms chunk to stay in step with the video.
+    /// Int16 interleaved stereo in. Start once the target is buffered (~30 ms, more on a shaky network: AudioQueue).
+    /// Sound arrives and plays in real time, so any surplus (a burst at start, the two Macs' clocks drifting) would
+    /// never drain: ~40 ms past the target, drop the incoming ~20 ms chunk to stay in step with the video.
     public func play(_ pcm: Data, from id: ObjectIdentifier) {
         lock.lock(); defer { lock.unlock() }
-        let frames = pcm.count / 4
-        guard let epoch = q.accept(frames, from: id) else { return }
+        let frames = pcm.count / 4, now = ProcessInfo.processInfo.systemUptime, was = q.target
+        let accepted = q.accept(frames, from: id, now: now)
+        if q.target != was { log("audio: buffering \(q.target * 1000 / 48_000) ms (\(q.target > was ? "the network hiccuped" : "steady"))") }
+        guard let epoch = accepted else { return }
         guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)) else {
-            _ = q.played(frames, epoch: epoch)
+            _ = q.played(frames, epoch: epoch, now: now)
             return
         }
         buf.frameLength = AVAudioFrameCount(frames)
@@ -113,7 +146,7 @@ public final class AudioOut {
         node.scheduleBuffer(buf) { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            if self.q.played(frames, epoch: epoch) { self.node.pause() }   // ran dry: re-buffer before resuming
+            if self.q.played(frames, epoch: epoch, now: ProcessInfo.processInfo.systemUptime) { self.node.pause() }   // ran dry: re-buffer before resuming
             self.lock.unlock()
         }
         if !node.isPlaying && q.ready { node.play() }

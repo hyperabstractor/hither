@@ -222,30 +222,30 @@ func testAudioHandover() throws {
     var q = AudioQueue()
     q.claim(a)
     try expectEqual(q.owner, a)
-    let e0 = try expectSome(q.accept(960, from: a))
-    try expectNil(q.accept(960, from: b))                   // not the owner
-    _ = q.accept(960, from: a)
+    let e0 = try expectSome(q.accept(960, from: a, now: 0))
+    try expectNil(q.accept(960, from: b, now: 0))                   // not the owner
+    _ = q.accept(960, from: a, now: 0)
     try expectEqual(q.queued, 1920)
     try expectTrue(q.ready)
 
     try expectTrue(q.beginHandover(to: b))
-    try expectNil(q.accept(960, from: b))                   // mid-handover: nobody's sound is taken
-    try expectNil(q.accept(960, from: a))
+    try expectNil(q.accept(960, from: b, now: 0))                   // mid-handover: nobody's sound is taken
+    try expectNil(q.accept(960, from: a, now: 0))
     q.finishHandover(to: b)
     try expectEqual(q.owner, b)
     try expectEqual(q.queued, 0)
-    let e1 = try expectSome(q.accept(960, from: b))
-    try expectFalse(q.played(960, epoch: e0))               // a's dropped buffers completing: b's count untouched
-    try expectFalse(q.played(960, epoch: e0))
+    let e1 = try expectSome(q.accept(960, from: b, now: 0))
+    try expectFalse(q.played(960, epoch: e0, now: 0))               // a's dropped buffers completing: b's count untouched
+    try expectFalse(q.played(960, epoch: e0, now: 0))
     try expectEqual(q.queued, 960)
-    try expectTrue(q.played(960, epoch: e1))                // b's own: ran dry, pause and buffer up again
+    try expectTrue(q.played(960, epoch: e1, now: 0))                // b's own: ran dry, pause and buffer up again
     try expectEqual(q.queued, 0)
 
     try expectFalse(q.beginHandover(to: b))                 // already b's: nothing to drop
     try expectTrue(q.beginHandover(to: nil))                // the last session closed: its sound goes too
     q.finishHandover(to: nil)
     try expectNil(q.owner)
-    try expectNil(q.accept(960, from: b))
+    try expectNil(q.accept(960, from: b, now: 0))
 
     // a Mac's windows: the first claims, a later claim doesn't take it, release hands it on
     var m = AudioQueue()
@@ -256,8 +256,56 @@ func testAudioHandover() throws {
     m.release(a, next: b)
     try expectEqual(m.owner, b)
     // so many frames queued: the rest is dropped to stay in step with the video
-    _ = m.accept(AudioQueue.most, from: b)
-    try expectNil(m.accept(960, from: b))
+    _ = m.accept(m.limit, from: b, now: 0)
+    try expectNil(m.accept(960, from: b, now: 0))
+}
+
+/// The sound buffer stretches with the network: sound that runs dry mid-flow and comes back within moments (a Wi-Fi
+/// spike) buffers that much more next time, up to ~200 ms; a real pause in the sound, or a lone click, doesn't. After
+/// 15 s without a hiccup it comes back down, 20 ms at a time, to ~30 ms. A handover starts again from ~30 ms.
+func testAudioStretch() throws {
+    final class Window {}
+    let a = ObjectIdentifier(Window.self), b = ObjectIdentifier(NSObject.self)
+    var q = AudioQueue()
+    q.claim(a)
+    var t = 0.0, e = 0
+    /// 20 ms chunks arriving and playing in real time, for `seconds`
+    func flow(_ seconds: Double) throws {
+        for _ in 0..<Int(seconds / 0.02) {
+            if let x = q.accept(960, from: a, now: t) { e = x }   // nil: over the limit just after it came down
+            t += 0.02
+            if q.queued > q.target { _ = q.played(960, epoch: e, now: t) }
+        }
+    }
+    func runDry() { while q.queued > 0 { if q.played(960, epoch: e, now: t) { break } } }
+    try expectEqual(q.target, AudioQueue.start)
+
+    try flow(1); runDry(); t += 0.1                          // a 100 ms spike mid-flow
+    try flow(0.04)
+    try expectEqual(q.target, AudioQueue.start + 4_800 + 960)   // +100 ms, +20 ms to spare
+
+    let stretched = q.target
+    try flow(1); runDry(); t += 2                             // a pause in the sound: nothing to learn
+    try flow(0.04)
+    try expectEqual(q.target, stretched)
+    runDry(); t += 2; e = try expectSome(q.accept(960, from: a, now: t))
+    runDry(); t += 0.1                                        // a click, then quiet: no
+    try flow(0.04)
+    try expectEqual(q.target, stretched)
+
+    for _ in 0..<10 { try flow(0.5); runDry(); t += 0.29; try flow(0.02) }   // spike after spike: ~200 ms at most
+    try expectEqual(q.target, AudioQueue.deepest)
+
+    try flow(15.1)                                            // steady: 20 ms less every 15 s, down to ~30 ms
+    try expectEqual(q.target, AudioQueue.deepest - 960)
+    try flow(15 * 9)
+    try expectEqual(q.target, AudioQueue.start)
+
+    try flow(1); runDry(); t += 0.1; try flow(0.04)
+    try expectTrue(q.target > AudioQueue.start)
+    try expectTrue(q.beginHandover(to: b))                    // another Mac: from ~30 ms again
+    q.finishHandover(to: b)
+    try expectEqual(q.target, AudioQueue.start)
 }
 
 private func expectSome<T>(_ v: T?, file: StaticString = #filePath, line: UInt = #line) throws -> T {
