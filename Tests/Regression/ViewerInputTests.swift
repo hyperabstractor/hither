@@ -221,11 +221,15 @@ func testEditMenu() throws {
     try expectEqual(EditMenu.afterHold(from: at, to: CGPoint(x: 104, y: 203)), .cursor)       // a finger never holds still
     try expectEqual(EditMenu.afterHold(from: at, to: CGPoint(x: 180, y: 200)), .selection)
     try expectEqual(EditMenu.items(.cursor), [.paste, .select, .selectAll])
-    try expectEqual(EditMenu.items(.selection), [.cut, .copy, .paste, .selectAll])
-    try expectEqual(EditMenu.items(.everything), [.cut, .copy, .paste])
+    try expectEqual(EditMenu.items(.selection), [.cut, .copy, .paste, .delete, .selectAll])
+    try expectEqual(EditMenu.items(.everything), [.cut, .copy, .paste, .delete])
     // ⌘X ⌘C ⌘V ⌘A by key position; Select is a double click instead
     try expectEqual([EditMenu.Item.cut, .copy, .paste, .selectAll].map(\.key), "xcva".map { Keymap.usKey(for: $0)?.code })
     try expectNil(EditMenu.Item.select.key)
+    // Delete is the Delete key by itself, and the only one that goes without ⌘
+    try expectEqual(EditMenu.Item.delete.key, 0x33)
+    try expectEqual(EditMenu.items(.selection).filter(\.plain), [.delete])
+    try expectEqual(Keymap.shortcut(0x33, modifiers: []).map { "\($0.t) \($0.f ?? 0)" }, ["key 0", "key 0"])
     // selecting brings the menu back to cut or copy; the rest end it
     try expectEqual(EditMenu.Item.select.next, .selection)
     try expectEqual(EditMenu.Item.selectAll.next, .everything)
@@ -237,5 +241,7 @@ func testEditMenu() throws {
     // the menu keeps clear of the line touched, and of all a drag went over
     try expectEqual(EditMenu.target(at), CGRect(x: 92, y: 186, width: 16, height: 28))
     try expectEqual(EditMenu.target(CGPoint(x: 300, y: 260), at), CGRect(x: 92, y: 186, width: 216, height: 88))
+    // …and of a selection's old and new end, after a touch and hold moved it
+    try expectEqual(EditMenu.target(EditMenu.target(at), movedTo: CGPoint(x: 300, y: 260)), CGRect(x: 92, y: 186, width: 216, height: 88))
 }
 

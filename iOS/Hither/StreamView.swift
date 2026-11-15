@@ -7,7 +7,9 @@ import UIKit
 ///   drag = scroll (flick and it glides on, as on a Mac trackpad; touch to stop it),
 ///   touch and hold then drag = press and drag (select text, move a divider).
 ///   After a touch that likely selected text (that drag, a double or triple tap) the edit menu shows there, as iPadOS
-///   shows its own: Cut, Copy, Paste; after a touch and hold in one place, Paste, Select, Select All (EditMenu).
+///   shows its own: Cut, Copy, Paste, Delete; after a touch and hold in one place, Paste, Select, Select All (EditMenu).
+///   While a selection's menu shows, touch and hold (then drag) moves that selection's end to the finger, as a Shift-drag
+///   does on a Mac, in place of iPadOS's handles; a tap first starts over.
 ///   A Desktop also zooms and moves here: pinch, or drag with two fingers. That changes nothing on the Mac.
 /// A mouse or trackpad on an iPad points, clicks (secondary click = right click), drags and scrolls like one on a Mac.
 /// Typing goes to the Mac as text, through an invisible text view iOS can write into and revise (dictation from the
@@ -88,6 +90,9 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     private lazy var editMenu = UIEditMenuInteraction(delegate: self)
     private var editing: (context: EditMenu.Context, around: CGRect)?   // what it offers, and what it keeps clear of
     private var editLater: DispatchWorkItem?                            // about to show
+    private var selected: CGRect?    // a selection's menu is showing: what it keeps clear of. A touch and hold moves its end
+    private var grabbed: CGRect?     // …and it was when the touch now down began
+    private var menus = 0            // edit menus shown so far
 
     // a flick's glide: momentum scrolls, one per frame, to where the drag scrolled (`scrollAt`)
     private var glide: Glide?
@@ -527,23 +532,29 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
             holding = p
             heldFrom = p
             mouse(0, p)
-            mouse(1, p, flags: keys.take())
+            mouse(1, p, flags: keys.take() | moving)   // with a selection's menu up: Shift, which moves its end here
         case .changed:
             guard holding != nil else { return }   // let go of already (releaseInput)
             holding = p
-            mouse(3, p)
+            mouse(3, p, flags: moving)
         case .ended, .cancelled:
             guard holding != nil else { return }
             holding = nil
-            mouse(2, p)
-            // dragged: a selection, likely, to cut or copy; in place: a click, where something may be pasted
-            if g.state == .ended {
+            mouse(2, p, flags: moving)
+            guard g.state == .ended else { return }
+            if let was = grabbed {   // the selection, with its end where the finger left it
+                offerEdit(.selection, around: EditMenu.target(was, movedTo: p))
+            } else {   // dragged: a selection, likely, to cut or copy; in place: a click, where something may be pasted
                 let context = EditMenu.afterHold(from: heldFrom, to: p)
                 offerEdit(context, around: context == .selection ? EditMenu.target(heldFrom, p) : EditMenu.target(p))
             }
         default: break
         }
     }
+
+    /// Shift, for a touch and hold that began with a selection's menu showing: on the Mac it moves that selection's
+    /// end, as a Shift-click and a Shift-drag do, where without it a new selection would start.
+    private var moving: UInt64 { grabbed == nil ? 0 : Keymap.shift }
 
     // MARK: edit menu
 
@@ -553,6 +564,8 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
         let later = DispatchWorkItem { [weak self] in
             guard let self, live, window != nil else { return }
             editing = (context, around)
+            selected = context == .selection ? around : nil
+            menus += 1
             let c = UIEditMenuConfiguration(identifier: nil, sourcePoint: CGPoint(x: around.midX, y: around.midY))
             c.preferredArrowDirection = .down   // above the text, as iPadOS has it, clear of the hand; below with no room
             editMenu.presentEditMenu(with: c)
@@ -566,6 +579,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     private func hideEditMenu() {
         editLater?.cancel()
         editLater = nil
+        selected = nil
         guard editing != nil else { return }
         editing = nil
         editMenu.dismissMenu()
@@ -576,8 +590,9 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     private func edit(_ item: EditMenu.Item) {
         guard live, let at = editing else { return }
         editing = nil   // it closes by itself
+        selected = nil
         if let key = item.key {
-            _ = shortcut(key, modifiers: [Keymap.leftCommand])
+            _ = shortcut(key, modifiers: item.plain ? [] : [Keymap.leftCommand])
         } else {
             let p = CGPoint(x: at.around.midX, y: at.around.midY)
             click(p, button: 0, count: 1)
@@ -590,12 +605,22 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
                              suggestedActions: [UIMenuElement]) -> UIMenu? {
         guard let editing else { return nil }
         return UIMenu(children: EditMenu.items(editing.context).map { item in
-            UIAction(title: item.title) { [weak self] _ in self?.edit(item) }
+            UIAction(title: item.title, attributes: item.destructive ? .destructive : []) { [weak self] _ in self?.edit(item) }
         })
     }
 
     func editMenuInteraction(_ interaction: UIEditMenuInteraction, targetRectFor configuration: UIEditMenuConfiguration) -> CGRect {
         editing?.around ?? .null
+    }
+
+    /// The menu went away without the picture being touched (a control, the keyboard, an item of it): no selection
+    /// to move by the next touch and hold. A moment later, so the touch that sends it away still finds it (`grabbed`).
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, willDismissMenuFor configuration: UIEditMenuConfiguration,
+                             animator: any UIEditMenuInteractionAnimating) {
+        let shown = menus
+        DispatchQueue.main.async { [weak self] in
+            if let self, menus == shown { selected = nil }
+        }
     }
 
     // MARK: mouse and trackpad
@@ -615,7 +640,10 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
     private func pointerTouch(_ touches: Set<UITouch>) -> UITouch? { touches.first { $0.type == .indirectPointer } }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if event?.allTouches?.count == touches.count { touchStoppedGlide = glide != nil }   // the first finger(s) down
+        if event?.allTouches?.count == touches.count {   // the first finger(s) down
+            touchStoppedGlide = glide != nil
+            grabbed = selected
+        }
         stopGlide()
         hideEditMenu()
         guard let t = pointerTouch(touches), pointer == nil else { return super.touchesBegan(touches, with: event) }
