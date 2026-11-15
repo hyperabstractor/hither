@@ -5,7 +5,8 @@ import UIKit
 
 /// This device as the keyboard of another showing Hither (KeyLink): its own keyboard along the bottom, with all it
 /// brings (other languages, dictation, swipe typing), and the rest of the screen for the keys it lacks, big: esc, tab,
-/// Delete, Return, the modifiers, the arrows, and Cut, Copy, Paste, Undo.
+/// Delete, Return, the modifiers, the arrows, and Cut, Copy, Paste, Undo. Or, in their place, a trackpad (PadView)
+/// for the Mac's pointer, which the other device draws; with the keyboard put away it has the whole screen.
 struct KeyboardScreen: View {
     @ObservedObject var keys: KeyLink
     @Environment(\.dismiss) private var dismiss
@@ -45,7 +46,10 @@ final class KeyboardController: UIViewController {
     private let typing = TypingBuffer()
     private let status = UILabel(), detail = UILabel()
     private let aboveKeyboard = UIView()   // laid out down to the keyboard's top, so the keys are laid out again when it moves
-    private var closeButton: UIButton!
+    private var closeButton: UIButton!, keyboardButton: UIButton!
+    private let mode = UISegmentedControl(items: ["Keys", "Trackpad"])
+    private let pad = PadView()
+    private var keyboardAway = false   // put away with its button: it stays away until that brings it back
     private var rows: [[UIButton]] = []
     private var modifierButtons: [(flag: UInt64, button: UIButton)] = []
     private var watching: Set<AnyCancellable> = []
@@ -87,6 +91,23 @@ final class KeyboardController: UIViewController {
         closeButton.configuration?.cornerStyle = .capsule
         closeButton.accessibilityLabel = "Close keyboard"
         view.addSubview(closeButton)
+        keyboardButton = UIButton(configuration: .gray(), primaryAction: UIAction { [weak self] _ in
+            guard let self else { return }
+            keyboardAway = typing.isFirstResponder
+            _ = keyboardAway ? typing.resignFirstResponder() : typing.becomeFirstResponder()
+            view.setNeedsLayout()
+        })
+        keyboardButton.configuration?.cornerStyle = .capsule
+        view.addSubview(keyboardButton)
+        mode.selectedSegmentIndex = UserDefaults.standard.bool(forKey: "keyboard.pad") ? 1 : 0
+        mode.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            UserDefaults.standard.set(mode.selectedSegmentIndex == 1, forKey: "keyboard.pad")
+            view.setNeedsLayout()
+        }, for: .valueChanged)
+        view.addSubview(mode)
+        pad.send = { [weak self] in self?.keys.send($0) }
+        view.addSubview(pad)
 
         let key = { [unowned self] (title: String?, symbol: String?, label: String, code: Int, flags: UInt64, repeats: Bool) in
             plain(title: title, symbol: symbol, label: label, repeats: repeats) { [weak self] in self?.press(code, flags) }
@@ -116,7 +137,6 @@ final class KeyboardController: UIViewController {
         typing.onInsert = { [weak self] in self?.typedKey($0) ?? false }
         typing.onDelete = { [weak self] in self?.typedDelete(empty: $0) ?? false }
         view.addSubview(typing)
-        view.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(showKeyboard)))   // put away: back with a tap
 
         keys.onScreen = { [weak self] m in
             switch m.t {
@@ -155,7 +175,7 @@ final class KeyboardController: UIViewController {
     }
 
     @objc private func showKeyboard() {
-        guard viewIfLoaded?.window != nil, presentedViewController == nil, !typing.isFirstResponder else { return }
+        guard viewIfLoaded?.window != nil, presentedViewController == nil, !typing.isFirstResponder, !keyboardAway else { return }
         typing.becomeFirstResponder()
     }
 
@@ -176,20 +196,32 @@ final class KeyboardController: UIViewController {
 
     // MARK: layout
 
-    /// The keys fill what the keyboard leaves: four rows of four, or two of eight where that's too low (a phone
-    /// on its side).
+    /// The keys, or the trackpad, fill what the keyboard leaves: four rows of four keys, or two of eight where
+    /// that's too low (a phone on its side).
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        let safe = view.bounds.inset(by: view.safeAreaInsets), pad: CGFloat = 8
+        let safe = view.bounds.inset(by: view.safeAreaInsets), gap: CGFloat = 8
         let keyboardTop = min(aboveKeyboard.frame.maxY, safe.maxY)
-        closeButton.frame = CGRect(x: safe.minX + pad, y: safe.minY + pad, width: 36, height: 36)
         let low = keyboardTop - safe.minY < 300
-        let text = CGRect(x: closeButton.frame.maxX + pad, y: safe.minY + pad, width: safe.width - 2 * (closeButton.frame.maxX - safe.minX + pad), height: 36)
+        closeButton.frame = CGRect(x: safe.minX + gap, y: safe.minY + gap, width: 36, height: 36)
+        keyboardButton.frame = CGRect(x: safe.maxX - gap - 36, y: safe.minY + gap, width: 36, height: 36)
+        keyboardButton.configuration?.image = UIImage(systemName: typing.isFirstResponder ? "keyboard.chevron.compact.down" : "keyboard")
+        keyboardButton.accessibilityLabel = typing.isFirstResponder ? "Put the keyboard away" : "Show the keyboard"
+        // the switch between them: beside the close button with what it types into after it where it's low, else
+        // in the middle with that below
+        mode.frame = CGRect(x: low ? closeButton.frame.maxX + gap : safe.midX - 85, y: safe.minY + gap + 2, width: 170, height: 32)
         detail.isHidden = low
-        status.frame = low ? text : text.divided(atDistance: 20, from: .minYEdge).slice
-        detail.frame = CGRect(x: safe.minX + pad, y: status.frame.maxY + 2, width: safe.width - 2 * pad, height: 34)
-        let top = (low ? text.maxY : detail.frame.maxY) + pad
-        let area = CGRect(x: safe.minX + pad, y: top, width: safe.width - 2 * pad, height: max(0, keyboardTop - pad - top))
+        status.textAlignment = low ? .left : .center
+        status.frame = low ? CGRect(x: mode.frame.maxX + gap, y: safe.minY + gap, width: max(0, keyboardButton.frame.minX - mode.frame.maxX - 2 * gap), height: 36)
+                           : CGRect(x: safe.minX + gap, y: closeButton.frame.maxY + 6, width: safe.width - 2 * gap, height: 22)
+        detail.frame = CGRect(x: safe.minX + gap, y: status.frame.maxY + 2, width: safe.width - 2 * gap, height: 34)
+        let top = (low ? closeButton.frame.maxY : detail.frame.maxY) + gap
+        let area = CGRect(x: safe.minX + gap, y: top, width: safe.width - 2 * gap, height: max(0, keyboardTop - gap - top))
+        let trackpad = mode.selectedSegmentIndex == 1
+        pad.isHidden = !trackpad
+        pad.frame = area
+        rows.joined().forEach { $0.isHidden = trackpad }
+        let pad = gap
         let grid: [[UIButton]] = low ? [rows[0] + rows[1], rows[2] + rows[3]] : rows
         let h = (area.height - pad * CGFloat(grid.count - 1)) / CGFloat(grid.count)
         for (r, row) in grid.enumerated() {
@@ -329,5 +361,164 @@ final class KeyboardController: UIViewController {
         guard empty || latched != 0 else { return false }
         press(Keys.delete)
         return true
+    }
+}
+
+/// A trackpad for the Mac's pointer, which the device this one is the keyboard of draws and moves (StreamView): one
+/// finger moves it (faster the faster it goes: Trackpad), a tap clicks (again quickly for a double or triple click),
+/// a two-finger tap right-clicks, two fingers scroll, gliding on after a flick, and a touch and hold then moving
+/// drags. Modifiers latched beside it join the click, as they do a tap on the other device.
+final class PadView: UIView {
+    /// "padmove", "padclick", "paddown", "padup", "padscroll": to the other device (KeyLink).
+    var send: (Msg) -> Void = { _ in }
+
+    private let hint = UILabel()
+    private let tap = UITapGestureRecognizer(), rightTap = UITapGestureRecognizer()
+    private let scroll = UIPanGestureRecognizer(), hold = UILongPressGestureRecognizer()
+    private var finger: (touch: UITouch, at: CGPoint, time: TimeInterval, moving: Bool)?   // the one finger that moves the pointer
+    private var lastTap: (at: CFTimeInterval, count: Int)?
+    private var dragAt: CGPoint?   // touch and hold: the finger, as last seen
+    private var glide: Glide?
+    private var glideLink: CADisplayLink?
+    private static let scrollGain: CGFloat = 1.5   // a phone is a small trackpad
+
+    init() {
+        super.init(frame: .zero)
+        backgroundColor = .tertiarySystemFill
+        layer.cornerRadius = 14
+        isMultipleTouchEnabled = true
+        hint.text = "Trackpad\nTap to click · two fingers to scroll or right-click · hold, then move, to drag"
+        hint.numberOfLines = 0
+        hint.textAlignment = .center
+        hint.font = .preferredFont(forTextStyle: .footnote)
+        hint.textColor = .tertiaryLabel
+        addSubview(hint)
+        tap.addTarget(self, action: #selector(tapped))
+        rightTap.addTarget(self, action: #selector(rightTapped))
+        rightTap.numberOfTouchesRequired = 2
+        scroll.addTarget(self, action: #selector(scrolled(_:)))
+        scroll.minimumNumberOfTouches = 2
+        scroll.maximumNumberOfTouches = 2
+        hold.addTarget(self, action: #selector(held(_:)))
+        hold.minimumPressDuration = 0.35
+        hold.allowableMovement = 8
+        [tap, rightTap, scroll, hold].forEach(addGestureRecognizer)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        hint.frame = bounds.insetBy(dx: 16, dy: 8)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { stopGlide() }   // (the display link keeps this view until then)
+    }
+
+    // MARK: one finger: the pointer
+
+    // By touches, not a pan gesture: that one starts only after 10 points, a long way for a pointer. Here it's 4,
+    // so a tap's tremble doesn't move it.
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        stopGlide()
+        finger = event?.allTouches?.count == 1 ? touches.first.map { ($0, $0.location(in: self), $0.timestamp, false) } : nil
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let f = finger, touches.contains(f.touch), event?.allTouches?.count == 1 else { return }
+        let at = f.touch.location(in: self), d = CGPoint(x: at.x - f.at.x, y: at.y - f.at.y)
+        if !f.moving {
+            guard hypot(d.x, d.y) > 4 else { return }
+            finger = (f.touch, at, f.touch.timestamp, true)
+            return
+        }
+        move(Trackpad.move(d, in: f.touch.timestamp - f.time))
+        finger = (f.touch, at, f.touch.timestamp, true)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { finger = nil }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { finger = nil }
+
+    private func move(_ d: CGPoint) {
+        var m = Msg("padmove"); m.dx = d.x; m.dy = d.y
+        send(m)
+    }
+
+    // MARK: taps, touch and hold, two fingers
+
+    private func click(button: Int, count: Int) {
+        var m = Msg("padclick"); m.b = button; m.c = count
+        send(m)
+    }
+
+    @objc private func tapped() {
+        let now = CACurrentMediaTime()
+        var count = 1
+        if let l = lastTap, now - l.at < 0.4 { count = l.count % 3 + 1 }
+        lastTap = (now, count)
+        click(button: 0, count: count)
+    }
+
+    @objc private func rightTapped() { click(button: 1, count: 1) }
+
+    @objc private func held(_ g: UILongPressGestureRecognizer) {
+        let at = g.location(in: self)
+        switch g.state {
+        case .began:
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            dragAt = at
+            var m = Msg("paddown"); m.b = 0
+            send(m)
+        case .changed:
+            guard let was = dragAt else { return }
+            dragAt = at
+            move(CGPoint(x: (at.x - was.x) * 1.2, y: (at.y - was.y) * 1.2))   // a drag is careful work: no speeding up
+        case .ended, .cancelled, .failed:
+            guard dragAt != nil else { return }
+            dragAt = nil
+            send(Msg("padup"))
+        default: break
+        }
+    }
+
+    /// Two fingers scroll what's under the pointer, as a finger on the other device scrolls what's under it, with
+    /// a scroll's phases (CGScrollPhase), and glide on after a flick.
+    @objc private func scrolled(_ g: UIPanGestureRecognizer) {
+        if g.state == .began { stopGlide() }
+        let t = g.translation(in: self)
+        g.setTranslation(.zero, in: self)
+        let phase = g.state == .began ? 1 : g.state == .changed ? 2 : g.state == .ended ? 4 : 8
+        scroll(CGPoint(x: t.x * Self.scrollGain, y: t.y * Self.scrollGain), phase: phase, momentum: 0)
+        guard g.state == .ended else { return }
+        let v = g.velocity(in: self)
+        guard let glide = Glide(velocity: CGPoint(x: v.x * Self.scrollGain, y: v.y * Self.scrollGain), at: CACurrentMediaTime(),
+                                minimum: 250, stop: 20, maximum: 8000) else { return }
+        self.glide = glide
+        scroll(glide.start.delta, phase: 0, momentum: glide.start.phase.rawValue)
+        let link = CADisplayLink(target: self, selector: #selector(glideTick(_:)))
+        link.add(to: .main, forMode: .common)
+        glideLink = link
+    }
+
+    private func scroll(_ d: CGPoint, phase: Int, momentum: Int) {
+        var m = Msg("padscroll"); m.dx = d.x; m.dy = d.y; m.p = phase; m.mp = momentum
+        send(m)
+    }
+
+    @objc private func glideTick(_ link: CADisplayLink) {
+        guard var g = glide else { return stopGlide() }
+        let step = g.step(to: link.targetTimestamp)
+        glide = g
+        if let step { scroll(step.delta, phase: 0, momentum: step.phase.rawValue) }
+        if g.ended { glide = nil; stopGlide() }
+    }
+
+    /// Stop gliding, telling the other device the momentum ended unless it has already.
+    private func stopGlide() {
+        glideLink?.invalidate()
+        glideLink = nil
+        if var g = glide, let end = g.stop() { scroll(end.delta, phase: 0, momentum: end.phase.rawValue) }
+        glide = nil
     }
 }

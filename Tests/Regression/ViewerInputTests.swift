@@ -214,6 +214,17 @@ func testDesktopSwipe() throws {
                                              Keymap.control | Keymap.numericPad | Keymap.function, 0])
 }
 
+/// An iPhone as a trackpad: a slow finger moves the pointer point for point, a fast one several times as far, and
+/// never more than that however fast.
+func testTrackpad() throws {
+    try expectEqual(Trackpad.gain(speed: 50), 1)
+    try expectEqual(Trackpad.gain(speed: 700), 2.6)
+    try expectEqual(Trackpad.gain(speed: 5000), 4.5)
+    try expectEqual(Trackpad.move(CGPoint(x: 1, y: 0), in: 1.0 / 60), CGPoint(x: 1, y: 0))        // 60 points a second
+    try expectEqual(Trackpad.move(CGPoint(x: 0, y: -14), in: 0.01), CGPoint(x: 0, y: -14 * 4.5))   // 1400: the most
+    try expectEqual(Trackpad.move(CGPoint(x: 3, y: 4), in: 0), Trackpad.move(CGPoint(x: 3, y: 4), in: 1.0 / 240))   // no time between: as a frame apart
+}
+
 /// The edit menu over the picture goes by the touch: a drag or a double tap likely selected something to cut or copy,
 /// a touch and hold in place put the cursor where something may be pasted; each item is the Mac's own shortcut.
 func testEditMenu() throws {

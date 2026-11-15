@@ -646,6 +646,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
         }
         stopGlide()
         hideEditMenu()
+        dropPad()
         guard let t = pointerTouch(touches), pointer == nil else { return super.touchesBegan(touches, with: event) }
         guard live else { return }
         let p = t.location(in: self), b = event?.buttonMask.contains(.secondary) == true ? 1 : 0
@@ -723,7 +724,8 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
         return keys.take() | there
     }
 
-    /// Typed on that keyboard: text, or a Mac key with its modifiers, into this session as from the keys here.
+    /// Typed on that keyboard: text, or a Mac key with its modifiers, into this session as from the keys here. Or
+    /// done on its trackpad (`pad`).
     func typed(_ m: Msg) {
         guard live else { return }
         switch m.t {
@@ -732,8 +734,105 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
             guard let k = m.k else { return }
             typing.reset()   // the cursor may be anywhere now (that keyboard knows: it sent the key)
             key(k, flags: m.f ?? 0)
+        case "padmove", "padclick", "paddown", "padup", "padscroll": pad(m)
         default: break
         }
+    }
+
+    // MARK: another device's trackpad (KeyLink)
+
+    // The Mac's own pointer isn't in the picture (a finger needs none), so the one that trackpad moves is drawn here:
+    // an arrow, where this view last told the Mac its pointer is. It moves at once, not a video frame later.
+    private lazy var arrow: CAShapeLayer = {
+        let a = CAShapeLayer(), p = UIBezierPath()   // the Mac's arrow, its tip at the layer's origin
+        let outline: [(CGFloat, CGFloat)] = [(0, 0), (0, 17), (4, 13.2), (6.9, 19.6), (9.4, 18.5), (6.6, 12.3), (12, 12.3)]
+        p.move(to: .zero)
+        outline.dropFirst().forEach { p.addLine(to: CGPoint(x: $0.0, y: $0.1)) }
+        p.close()
+        a.path = p.cgPath
+        a.fillColor = UIColor.black.cgColor
+        a.strokeColor = UIColor.white.cgColor
+        a.lineWidth = 1.2
+        a.lineJoin = .round
+        a.shadowOpacity = 0.35; a.shadowRadius = 1.5; a.shadowOffset = CGSize(width: 0, height: 1)
+        a.isHidden = true
+        layer.insertSublayer(a, above: video)
+        return a
+    }()
+    private var padAt: CGPoint?          // where that pointer is, in this view (nil: wherever the last touch left the Mac's)
+    private var padHeld: Int?            // the button it holds down (touch and hold there, then move: a drag)
+    private var arrowAway: DispatchWorkItem?
+
+    /// The trackpad of an iPhone that's this device's keyboard: its finger moves the pointer by that much here
+    /// ("padmove", already sped up as a trackpad does), taps click where the pointer is ("padclick": button, count),
+    /// a touch and hold presses and lets go ("paddown", "padup": moves between are a drag), and two fingers scroll
+    /// what's under it ("padscroll": the distance in points here, with a scroll's phases). Clicks take the modifiers
+    /// latched on that keyboard, as taps here do.
+    private func pad(_ m: Msg) {
+        guard remoteSize.width > 0, shown.width > 0 else { return }
+        let area = shown.intersection(bounds)
+        var p = padAt ?? focus.map { CGPoint(x: shown.minX + $0.x * shown.width / remoteSize.width,
+                                             y: shown.minY + $0.y * shown.width / remoteSize.width) } ?? CGPoint(x: area.midX, y: area.midY)
+        p = CGPoint(x: min(max(p.x + (m.t == "padmove" ? m.dx ?? 0 : 0), area.minX), area.maxX - 1),
+                    y: min(max(p.y + (m.t == "padmove" ? m.dy ?? 0 : 0), area.minY), area.maxY - 1))
+        padAt = p
+        switch m.t {
+        case "padmove":
+            follow(p)
+            mouse(padHeld == nil ? 0 : 3, p, button: padHeld ?? 0)
+        case "padclick":
+            hideEditMenu()
+            click(p, button: m.b ?? 0, count: max(1, m.c ?? 1))
+        case "paddown":
+            guard padHeld == nil else { break }
+            hideEditMenu()
+            stopGlide()
+            focus = remote(p)
+            resetTyping()
+            padHeld = m.b ?? 0
+            mouse(0, p)
+            mouse(1, p, button: padHeld ?? 0, flags: latchedModifiers())
+        case "padup":
+            guard let b = padHeld else { break }
+            padHeld = nil
+            mouse(2, p, button: b)
+        case "padscroll":
+            hideEditMenu()
+            stopGlide()
+            let at = remote(p), s = shown.width / remoteSize.width
+            var scroll = Msg("scroll")
+            scroll.x = at.x; scroll.y = at.y; scroll.dx = (m.dx ?? 0) / s; scroll.dy = (m.dy ?? 0) / s
+            scroll.f = 0; scroll.b = 0; scroll.p = m.p ?? 0; scroll.mp = m.mp ?? 0
+            send(scroll)
+        default: break
+        }
+        showArrow(at: p)
+    }
+
+    /// The arrow at `p`, for as long as that trackpad is in use: it goes a few seconds after its last move.
+    private func showArrow(at p: CGPoint) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        arrow.position = p
+        arrow.isHidden = false
+        CATransaction.commit()
+        arrowAway?.cancel()
+        let away = DispatchWorkItem { [weak self] in
+            guard let self, padHeld == nil else { return }
+            arrow.isHidden = true
+        }
+        arrowAway = away
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: away)
+    }
+
+    /// A touch here (the Mac's pointer goes where it lands), or the session letting go: no arrow, and what it
+    /// held is let go of (`sending`: while there's a session to tell).
+    private func dropPad(sending: Bool = true) {
+        arrowAway?.cancel()
+        if padAt != nil { arrow.isHidden = true }
+        if let b = padHeld, let p = padAt, sending { mouse(2, p, button: b) }
+        padHeld = nil
+        padAt = nil
     }
 
     // no edit menu shortcuts here (⌘C, ⌘V…): they go to the Mac as keys
@@ -944,6 +1043,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
         heldModifiers = []
         if let held = pointer { pointer = nil; mouse(2, held.at, button: held.button) }
         if let p = holding { holding = nil; mouse(2, p) }
+        dropPad()
     }
 
     /// The session ended without a chance to let go (the connection dropped): forget what was held, sending nothing.
@@ -958,6 +1058,7 @@ final class StreamView: UIView, UIGestureRecognizerDelegate, UIEditMenuInteracti
         heldModifiers = []
         pointer = nil
         holding = nil
+        dropPad(sending: false)
     }
 
     @objc private func resignedActive(_ n: Notification) {
