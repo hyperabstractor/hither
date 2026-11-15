@@ -23,7 +23,15 @@ final class Sessions: ObservableObject {
     /// Another iPhone or iPad as this one's keyboard: what it types goes to the session in use.
     var keyboard: KeyLink? {
         didSet {
-            keyboard?.onInput = { [weak self] in self?.inUse?.view.typed($0) }
+            keyboard?.onInput = { [weak self] m in
+                switch m.t {
+                case "kbnext": self?.showNext()
+                case "kbswitch": if let w = self?.inUse, w.isDesktop { _ = w.view.switchApps() }   // as its ⌘⇥ button
+                default: self?.inUse?.view.typed(m)
+                }
+            }
+            keyboard?.targets = { [weak self] in self?.all.count ?? 0 }
+            keyboard?.targetIsDesktop = { [weak self] in self?.inUse?.isDesktop ?? false }
             keyboard?.target = { [weak self] in
                 guard let w = self?.inUse else { return "" }
                 return w.isDesktop ? w.title : "\(w.title) · \(w.mac.name)"
@@ -33,6 +41,17 @@ final class Sessions: ObservableObject {
 
     /// The session on screen used last: the one sound comes from, and the one another device's keyboard types into.
     var inUse: RemoteWindow? { book.audioOwner.flatMap { windows[$0] } }
+
+    /// The next open session after the one in use, in its place, round all that are open (that keyboard's switch
+    /// button). From Home, the first.
+    func showNext() {
+        guard !all.isEmpty else { return }
+        if let w = inUse, let key = book.scene(showing: w.id), let scene = scenes[key]?.model, let i = all.firstIndex(where: { $0 === w }) {
+            if all.count > 1 { show(all[(i + 1) % all.count], in: scene) }
+        } else if let scene = scenes.values.compactMap(\.model).first(where: { $0.shown == nil }) {
+            show(all[0], in: scene)
+        }
+    }
 
     private var book = SessionBook()
     private var windows: [UUID: RemoteWindow] = [:]

@@ -47,6 +47,17 @@ final class TypingBuffer: UITextView, UITextViewDelegate {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Autocorrection after all: for prose typed on a device that's another's keyboard (KeyboardScreen), where the
+    /// phone's own corrections are what its keyboard is for. They revise what was typed, as dictation does, and reach
+    /// the Mac the same way: only within what's been typed since the Mac's cursor last moved.
+    var corrects = false {
+        didSet {
+            guard corrects != oldValue else { return }
+            autocorrectionType = corrects ? .yes : .no
+            if isFirstResponder { reloadInputViews() }
+        }
+    }
+
     /// No help from iOS: the Mac app does its own completion and correction. (Corrections and predictions, if they're
     /// ever allowed here, are revisions like dictation's and would reach the Mac the same way.)
     private func noAssistance() {

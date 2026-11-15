@@ -18,7 +18,10 @@ import UIKit
 ///                       "kblatch" {f} (modifiers latched there: they join the screen's next click),
 ///                       and its trackpad's "padmove", "padclick", "paddown", "padup", "padscroll", "padswipe"
 ///                       (PadView)
-///   screen → keyboard   "kbinfo" {title} (what it types into), "kbreset" (the Mac's cursor moved: what was typed
+///                       "kbnext" (show the next session open there), "kbswitch" (the Mac's app switcher, as
+///                       the ⌘⇥ button there: again for the next app)
+///   screen → keyboard   "kbinfo" {title, c, down} (what it types into, of how many sessions open, and whether
+///                       that's a Desktop), "kbreset" (the Mac's cursor moved: what was typed
 ///                       can't be revised from there any more), "kbused" (a click took the latched modifiers)
 ///   both, first         "kbhello" {peer}
 ///
@@ -43,13 +46,18 @@ final class KeyLink: ObservableObject {
     private(set) var latched: UInt64 = 0           // modifiers latched on it, for the next click here
     /// What's typed there ("text", "key"): for the session in use.
     var onInput: (Msg) -> Void = { _ in }
-    /// What the session in use shows, for the keyboard to say what it types into ("" = nothing open).
+    /// What the session in use shows, for the keyboard to say what it types into ("" = nothing open), and how many
+    /// sessions are open (more than one: the keyboard offers to switch).
     var target: () -> String = { "" }
+    var targets: () -> Int = { 0 }
+    var targetIsDesktop: () -> Bool = { false }
 
     // as the keyboard
     @Published private(set) var serving = false
     @Published private(set) var screen: Peer?      // the device it types into now
     @Published private(set) var typingInto = ""    // …and what that shows
+    @Published private(set) var sessionsThere = 0  // …of this many sessions open there
+    @Published private(set) var desktopThere = false   // …and it's a Mac's Desktop (where its app switcher shows)
     /// "kbreset", "kbused": for the Keyboard screen.
     var onScreen: (Msg) -> Void = { _ in }
 
@@ -107,7 +115,7 @@ final class KeyLink: ObservableObject {
         wire = nil; dialing = nil
         w?.close(); d?.close()
         keyboard = nil; screen = nil
-        latched = 0; typingInto = ""; sentTarget = nil
+        latched = 0; typingInto = ""; sessionsThere = 0; desktopThere = false; sentTarget = nil
     }
 
     // MARK: pairing (either end)
@@ -245,10 +253,10 @@ final class KeyLink: ObservableObject {
     /// What the keyboard types into, whenever it changes.
     private func tellTarget() {
         guard keyboard != nil, let w = wire else { return }
-        let t = target()
-        guard t != sentTarget else { return }
-        sentTarget = t
-        var m = Msg("kbinfo"); m.title = t
+        let t = target(), n = targets(), desktop = targetIsDesktop(), all = "\(n) \(desktop) \(t)"
+        guard all != sentTarget else { return }
+        sentTarget = all
+        var m = Msg("kbinfo"); m.title = t; m.c = n; m.down = desktop
         w.send(m)
     }
 
@@ -296,7 +304,7 @@ final class KeyLink: ObservableObject {
             guard let self, let w, wire === w else { return }
             switch m.t {
             case "kbhello": screen = paired.first { $0.id == m.peer }
-            case "kbinfo": typingInto = m.title ?? ""
+            case "kbinfo": typingInto = m.title ?? ""; sessionsThere = m.c ?? 0; desktopThere = m.down ?? false
             default: onScreen(m)
             }
         }
@@ -305,6 +313,8 @@ final class KeyLink: ObservableObject {
             wire = nil
             screen = nil
             typingInto = ""
+            sessionsThere = 0
+            desktopThere = false
         }
         let old = wire
         wire = w

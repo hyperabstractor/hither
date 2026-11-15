@@ -5,7 +5,7 @@ import UIKit
 
 /// This device as the keyboard of another showing Hither (KeyLink): its own keyboard along the bottom, with all it
 /// brings (other languages, dictation, swipe typing), and the rest of the screen for the keys it lacks, big: esc, tab,
-/// Delete, Return, the modifiers, the arrows, and Cut, Copy, Paste, Undo. Or, in their place, a trackpad (PadView)
+/// ⌘⇥, Delete, Return, the modifiers, the arrows, and Cut, Copy, Paste, Undo. Or, in their place, a trackpad (PadView)
 /// for the Mac's pointer, which the other device draws; with the keyboard put away it has the whole screen.
 struct KeyboardScreen: View {
     @ObservedObject var keys: KeyLink
@@ -46,11 +46,12 @@ final class KeyboardController: UIViewController {
     private let typing = TypingBuffer()
     private let status = UILabel(), detail = UILabel()
     private let aboveKeyboard = UIView()   // laid out down to the keyboard's top, so the keys are laid out again when it moves
-    private var closeButton: UIButton!, keyboardButton: UIButton!
+    private var closeButton: UIButton!, keyboardButton: UIButton!, nextButton: UIButton!, correctButton: UIButton!
     private let mode = UISegmentedControl(items: ["Keys", "Trackpad"])
     private let pad = PadView()
     private var keyboardAway = false   // put away with its button: it stays away until that brings it back
     private var rows: [[UIButton]] = []
+    private var switchKey: UIButton!   // ⌘⇥: the Mac's app switcher, where the other device shows a Desktop
     private var modifierButtons: [(flag: UInt64, button: UIButton)] = []
     private var watching: Set<AnyCancellable> = []
     private var repeating: Timer?
@@ -99,6 +100,37 @@ final class KeyboardController: UIViewController {
         })
         keyboardButton.configuration?.cornerStyle = .capsule
         view.addSubview(keyboardButton)
+        // the next session open on the other device, round all of them: shown while it has more than one
+        nextButton = UIButton(configuration: .gray(), primaryAction: UIAction { [weak self] _ in
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            self?.keys.send(Msg("kbnext"))
+            self?.typing.reset()
+        })
+        nextButton.configuration?.image = UIImage(systemName: "rectangle.2.swap")
+        nextButton.configuration?.cornerStyle = .capsule
+        nextButton.accessibilityLabel = "Next session"
+        view.addSubview(nextButton)
+        // autocorrection: on unless turned off here (off for commands and code, which it would "correct")
+        typing.corrects = UserDefaults.standard.object(forKey: "keyboard.corrects") as? Bool ?? true
+        correctButton = UIButton(configuration: .gray(), primaryAction: UIAction { [weak self] _ in
+            guard let self else { return }
+            typing.corrects.toggle()
+            UserDefaults.standard.set(typing.corrects, forKey: "keyboard.corrects")
+            showCorrects()
+        })
+        correctButton.configuration?.image = UIImage(systemName: "textformat.abc.dottedunderline",
+                                                     withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold))
+        correctButton.configuration?.contentInsets = .zero
+        correctButton.configuration?.cornerStyle = .capsule
+        correctButton.changesSelectionAsPrimaryAction = false
+        correctButton.configurationUpdateHandler = { b in   // on: filled in
+            var c = b.configuration
+            c?.background.backgroundColor = b.isSelected ? .tintColor : .tertiarySystemFill
+            c?.baseForegroundColor = b.isSelected ? .white : .label
+            b.configuration = c
+        }
+        view.addSubview(correctButton)
+        showCorrects()
         mode.selectedSegmentIndex = UserDefaults.standard.bool(forKey: "keyboard.pad") ? 1 : 0
         mode.addAction(UIAction { [weak self] _ in
             guard let self else { return }
@@ -112,8 +144,14 @@ final class KeyboardController: UIViewController {
         let key = { [unowned self] (title: String?, symbol: String?, label: String, code: Int, flags: UInt64, repeats: Bool) in
             plain(title: title, symbol: symbol, label: label, repeats: repeats) { [weak self] in self?.press(code, flags) }
         }
+        // the Mac's app switcher, as the ⌘⇥ button on the other device: again for the next app; it switches a moment
+        // after the last press, or at once on a click
+        switchKey = plain(title: "⌘⇥", symbol: nil, label: "Switch app (Command-Tab)", repeats: false) { [weak self] in
+            self?.keys.send(Msg("kbswitch"))
+            self?.typing.reset()
+        }
         rows = [
-            [key("esc", nil, "Escape", Keys.escape, 0, false), key("tab", nil, "Tab", Keys.tab, 0, false),
+            [key("esc", nil, "Escape", Keys.escape, 0, false), key("tab", nil, "Tab", Keys.tab, 0, false), switchKey,
              key(nil, "delete.left", "Delete", Keys.delete, 0, true), key(nil, "return", "Return", Keys.returnKey, 0, false)],
             [("⌃", "Control", Keys.control), ("⌥", "Option", Keys.option), ("⌘", "Command", Keys.command), ("⇧", "Shift", Keys.shift)]
                 .map { title, label, flag in modifier(title, label: label, flag) },
@@ -147,6 +185,8 @@ final class KeyboardController: UIViewController {
         }
         keys.$screen.combineLatest(keys.$typingInto, keys.$paired).receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.say() }.store(in: &watching)
+        keys.$sessionsThere.combineLatest(keys.$desktopThere).receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.view.setNeedsLayout() }.store(in: &watching)
         // a sheet (the pairing code) takes the keyboard: back once it's gone; and what's latched goes with the link
         keys.$prompt.receive(on: DispatchQueue.main).sink { [weak self] p in if p == nil { self?.showKeyboard() } }.store(in: &watching)
         keys.$screen.receive(on: DispatchQueue.main).sink { [weak self] s in
@@ -182,6 +222,11 @@ final class KeyboardController: UIViewController {
         typing.becomeFirstResponder()
     }
 
+    private func showCorrects() {
+        correctButton.isSelected = typing.corrects
+        correctButton.accessibilityLabel = typing.corrects ? "Autocorrection is on" : "Autocorrection is off"
+    }
+
     /// What it types into, or what's missing for it to type anywhere.
     private func say() {
         let other = UIDevice.current.userInterfaceIdiom == .pad ? "iPhone or iPad" : "iPad"
@@ -210,12 +255,17 @@ final class KeyboardController: UIViewController {
         keyboardButton.frame = CGRect(x: safe.maxX - gap - 36, y: safe.minY + gap, width: 36, height: 36)
         keyboardButton.configuration?.image = UIImage(systemName: typing.isFirstResponder ? "keyboard.chevron.compact.down" : "keyboard")
         keyboardButton.accessibilityLabel = typing.isFirstResponder ? "Put the keyboard away" : "Show the keyboard"
-        // the switch between them: beside the close button with what it types into after it where it's low, else
-        // in the middle with that below
-        mode.frame = CGRect(x: low ? closeButton.frame.maxX + gap : safe.midX - 85, y: safe.minY + gap + 2, width: 170, height: 32)
+        correctButton.frame = closeButton.frame.offsetBy(dx: 36 + gap, dy: 0)
+        nextButton.frame = keyboardButton.frame.offsetBy(dx: -(36 + gap), dy: 0)
+        nextButton.isHidden = keys.sessionsThere < 2
+        switchKey.isEnabled = keys.desktopThere
+        // the switch between them: beside the buttons on the left with what it types into after it where it's low,
+        // else in the middle with that below
+        mode.frame = CGRect(x: low ? correctButton.frame.maxX + gap : safe.midX - 85, y: safe.minY + gap + 2, width: 170, height: 32)
         detail.isHidden = low
         status.textAlignment = low ? .left : .center
-        status.frame = low ? CGRect(x: mode.frame.maxX + gap, y: safe.minY + gap, width: max(0, keyboardButton.frame.minX - mode.frame.maxX - 2 * gap), height: 36)
+        let right = nextButton.isHidden ? keyboardButton.frame.minX : nextButton.frame.minX
+        status.frame = low ? CGRect(x: mode.frame.maxX + gap, y: safe.minY + gap, width: max(0, right - mode.frame.maxX - 2 * gap), height: 36)
                            : CGRect(x: safe.minX + gap, y: closeButton.frame.maxY + 6, width: safe.width - 2 * gap, height: 22)
         detail.frame = CGRect(x: safe.minX + gap, y: status.frame.maxY + 2, width: safe.width - 2 * gap, height: 34)
         let top = (low ? closeButton.frame.maxY : detail.frame.maxY) + gap
