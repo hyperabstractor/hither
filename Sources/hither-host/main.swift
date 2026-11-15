@@ -125,7 +125,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     var home: CGDirectDisplayID = 0  // desktop: the monitor asked for (windowID may be a virtual display standing in)
     var opened = false               // streaming something: keeps this Mac's screen dark (Dark)
     var adapt: (size: CGSize, room: CGSize, scale: Double)?   // desktop, Adaptive: the viewer's window and the most room it
-                                                 // has: a dark monitor shows a virtual display that size (Dark.fit)
+                                                 // has: its monitor shows a virtual display that size (Dark.fit)
     var adaptAsked = false                       // …and the viewer waits to hear the size it snaps to, even if unchanged
     var adaptAt: CFTimeInterval = 0              // …when it last asked: of two Desktops wanting a size, the newer wins
     var nativeDesktop = false                    // desktop, Native: the display keeps its own mode, whatever else wants it
@@ -1153,7 +1153,7 @@ func isOurs(_ bundle: String) -> Bool { bundle.hasPrefix("dev.hither.") }
 // MARK: dark screen
 
 /// Adaptive Desktop at exactly the viewer's size: a virtual display made that size (Retina for a Retina viewer), which
-/// the dark monitor mirrors, so every window moves onto it, and it's what the Desktop streams. One per monitor, resized
+/// the monitor mirrors (dark or lit), so every window moves onto it, and it's what the Desktop streams. One per monitor, resized
 /// in place as the window is; gone once nothing wants it, and with the host if it dies (as is the mirroring). Uses
 /// private CoreGraphics API (CGVirtualDisplay, see VirtualDisplay.h); if one can't be made, the monitor stays as it is
 /// (as with Native). Main queue.
@@ -1285,26 +1285,27 @@ enum Dark {
     static var fittedTo: [CGDirectDisplayID: CGDisplayMode] = [:] // …and the mode they were switched to (macOS reports the
                                                                    // old one for a moment after a switch)
 
-    /// A dark monitor nobody looks at can change for whoever streams it: an Adaptive Desktop gets a virtual display its
-    /// window's size, which the monitor mirrors (Virtual; shown 1:1, pixel for pixel), and app windows for a Retina
-    /// viewer the monitor's roomiest HiDPI mode (captured at 2x, their text stays sharp). A Native Desktop keeps the
-    /// display's own mode. Back to its own mode once nothing wants it; the change is the host's alone,
-    /// so macOS undoes it if the host dies.
+    /// A monitor can change for whoever streams it. An Adaptive Desktop gets a virtual display its window's size,
+    /// which the monitor mirrors (Virtual; shown 1:1, pixel for pixel): the viewer chose that, so it happens with the
+    /// monitor dark or lit (lit, it shows that desktop, scaled to fit). App windows for a Retina viewer get the
+    /// monitor's roomiest HiDPI mode (captured at 2x, their text stays sharp), but only a dark monitor's mode changes
+    /// for them: nobody asked for that, and nobody sees it. A Native Desktop keeps the display's own mode. Back to
+    /// its own mode once nothing wants it; the change is the host's alone, so macOS undoes it if the host dies.
     static func fit() {
         enum Want { case snap(CGSize, CGSize, Double), retina }
         var want: [CGDirectDisplayID: Want] = [:], native = Set<CGDirectDisplayID>(), held = Set<CGDirectDisplayID>()
+        let open = sessions.values.filter { $0.opened && !$0.ended }
+        // a Desktop on screen decides its monitor's size; two of them (an iPad's and a Mac's): the one that asked
+        // last. A hidden one (a Mac viewer's window minimized or covered) changes nothing: it keeps a virtual
+        // display that's there as it is (`held`), so the Mac's windows don't move for it
+        for s in open.sorted(by: { $0.adaptAt < $1.adaptAt }) where s.desktop {
+            if !s.visible { if s.adapt != nil { held.insert(s.home) }; continue }
+            if let a = s.adapt { want[s.home] = .snap(a.size, a.room, a.scale) }
+            else if s.nativeDesktop { native.insert(s.home) }
+        }
+        // app windows for a Retina viewer, while the screen is kept dark: a HiDPI mode, so their text is as sharp
+        // there as here (unless a Desktop on that display wants something else, or wants it left alone)
         if enabled {
-            let open = sessions.values.filter { $0.opened && !$0.ended }
-            // a Desktop on screen decides its monitor's size; two of them (an iPad's and a Mac's): the one that asked
-            // last. A hidden one (a Mac viewer's window minimized or covered) changes nothing: it keeps a virtual
-            // display that's there as it is (`held`), so the Mac's windows don't move for it
-            for s in open.sorted(by: { $0.adaptAt < $1.adaptAt }) where s.desktop {
-                if !s.visible { if s.adapt != nil { held.insert(s.home) }; continue }
-                if let a = s.adapt { want[s.home] = .snap(a.size, a.room, a.scale) }
-                else if s.nativeDesktop { native.insert(s.home) }
-            }
-            // app windows for a Retina viewer: a HiDPI mode, so their text is as sharp there as here (unless a Desktop
-            // on that display wants something else, or wants it left alone)
             for s in open where !s.desktop && s.viewerScale >= 2 {
                 if let d = s.display?.displayID, want[d] == nil, !native.contains(d) { want[d] = .retina }
             }
@@ -1331,7 +1332,7 @@ enum Dark {
         let now = CACurrentMediaTime()
         for (d, v) in Virtual.displays where stand[d] == nil {
             let since = held.contains(d) ? now : Virtual.unwantedSince[d] ?? now
-            if enabled, want[d] == nil, !native.contains(d), physical.contains(d), now - since < Virtual.linger {
+            if want[d] == nil, !native.contains(d), physical.contains(d), now - since < Virtual.linger {
                 Virtual.unwantedSince[d] = since
                 stand[d] = v.display.displayID
             } else {
@@ -1354,7 +1355,7 @@ enum Dark {
             changed.insert(d)
         }
         // an Adaptive viewer that let go of its window snaps to the display's size: a mode change sends it (the session
-        // sees its frame change), so tell the others now, mode unchanged or the screen not dark
+        // sees its frame change), so tell the others now (the size unchanged, or no virtual display to be had)
         for s in sessions.values where s.desktop && s.adaptAsked {
             s.adaptAsked = false
             if !changed.contains(s.home) { s.q.async { var m = Msg("size"); m.w = s.frame.width; m.h = s.frame.height; s.wire.send(m) } }

@@ -88,8 +88,8 @@ final class RemoteWindow: ObservableObject, Identifiable {
 
     // MARK: Desktop: Adaptive or Native
 
-    /// Native keeps the Mac's screen at its own resolution; Adaptive gives a dark one this view's size (`space`)
-    /// (only while Keep Screen Dark is on there: nobody sees its monitors change). Native unless chosen otherwise:
+    /// Native keeps the Mac's screen at its own resolution; Adaptive gives it this view's size (`space`), whether
+    /// Keep Screen Dark is on there or not (off, its monitor shows that desktop). Native unless chosen otherwise:
     /// a screen the size of a phone or tablet would crowd every window on the Mac. Remembered per Mac.
     var native: Bool {
         get { UserDefaults.standard.object(forKey: "desktop.native.\(mac.id)") as? Bool ?? true }
@@ -329,7 +329,7 @@ final class RemoteWindow: ObservableObject, Identifiable {
     }
 
     /// A Desktop: Adaptive tells the host this view's size, times its space (all the room there is, at this screen's
-    /// scale), and a dark display there shows a virtual display that size; Native says to keep its own. The host
+    /// scale), and its monitor there shows a virtual display that size; Native says to keep its own. The host
     /// answers with "size".
     func sendShape() {
         guard isDesktop, opened, place.shown, let w = wire else { return }

@@ -438,7 +438,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
     var appName = "", remoteTitle = "", latency = ""
     var note: String?   // a passing status ("Sent text to mini-pb") shown in place of the latency
     var remoteSize = CGSize.zero { didSet { view.remoteSize = remoteSize } }
-    /// Desktop: Native keeps the host's screen at its own resolution (zoom and scroll here); Adaptive has a dark one
+    /// Desktop: Native keeps the host's screen at its own resolution (zoom and scroll here); Adaptive has it
     /// take this window's size (a virtual display there), shown pixel for pixel. Remembered per Mac.
     var native: Bool {
         get { UserDefaults.standard.bool(forKey: "desktop.native.\(short(host))") }
@@ -601,8 +601,8 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
                 guard !native, let w = window, !w.styleMask.contains(.fullScreen), !w.inLiveResize, remoteSize.width > 0 else { return }
                 let room = self.room(w)
                 if remoteSize.width <= room.width && remoteSize.height <= room.height { return snap(w, to: remoteSize) }   // 1:1
-                // bigger than this screen has room for (no mode fit well, or the screen there isn't dark and keeps its
-                // own): scaled down, its shape, no bigger than the window
+                // bigger than this screen has room for (no virtual display could be made there, and the screen keeps
+                // its own): scaled down, its shape, no bigger than the window
                 let cur = w.contentLayoutRect.size, k = min(cur.width / remoteSize.width, cur.height / remoteSize.height)
                 let shape = CGSize(width: (remoteSize.width * k).rounded(.down), height: (remoteSize.height * k).rounded(.down))
                 if abs(shape.width - cur.width) > 1 || abs(shape.height - cur.height) > 1 { snap(w, to: shape) }
@@ -710,7 +710,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         window.subtitle = "\(appName) on \(short(host))" + (extra.isEmpty ? "" : " · \(extra)")
     }
 
-    /// A desktop: Adaptive tells the host this window's size and the most room it could have (x, y), and a dark display
+    /// A desktop: Adaptive tells the host this window's size and the most room it could have (x, y), and the display
     /// there takes that size, at this screen's scale (a virtual display); the host answers with "size" and the window
     /// snaps to it. Native says to keep its own.
     func sendShape() {
@@ -786,7 +786,7 @@ final class ProxyWindow: NSObject, NSWindowDelegate {
         let fit = NSButton(image: symbol("arrow.up.left.and.down.right.magnifyingglass", "Fit in Window"), target: self, action: #selector(zoomFit))
         fit.toolTip = "Fit in Window (⌃⌥⌘9)"
         let mode = NSSegmentedControl(labels: ["Adaptive", "Native"], trackingMode: .selectOne, target: self, action: #selector(modeChosen(_:)))
-        mode.setToolTip("\(name)'s screen takes this window's size, pixel for pixel (while Keep Screen Dark is on)", forSegment: 0)
+        mode.setToolTip("\(name)'s screen takes this window's size, pixel for pixel", forSegment: 0)
         mode.setToolTip("\(name)'s screen keeps its own resolution: zoom here; zoomed in, the picture follows the pointer", forSegment: 1)
         for c in [zoom, fit, mode] as [NSControl] { c.controlSize = .small; c.font = .systemFont(ofSize: NSFont.smallSystemFontSize) }
         fit.bezelStyle = .accessoryBarAction

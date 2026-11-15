@@ -449,7 +449,7 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
     }
 
     /// Zoom here (Fit, 1:1, in and out; pinch does it too), and what the Mac's screen does: Adaptive has it take the
-    /// size of this screen (Adaptive Size) while Keep Screen Dark is on; Native keeps its own.
+    /// size of this screen (Adaptive Size); Native keeps its own.
     private func desktopMenu(_ info: String) -> [UIMenuElement] {
         let v = window.view, z = v.zoom, pct = Int((v.scaleNow * 100).rounded())
         let zoom = UIMenu(title: "Zoom · \(pct)%", options: .displayInline, children: [
@@ -460,7 +460,7 @@ final class StreamController: UIViewController, UIDocumentPickerDelegate {
             UIAction(title: "Zoom Out", image: symbol("minus.magnifyingglass")) { [weak v] _ in v?.zoomStep(-1) },
         ])
         let screen = UIMenu(title: "\(mac.name)'s Screen", options: .displayInline, children: [
-            UIAction(title: "Adaptive", state: window.native ? .off : .on) { [weak self] _ in self?.window.native = false },
+            UIAction(title: "Adaptive", subtitle: "Takes this screen's size", state: window.native ? .off : .on) { [weak self] _ in self?.window.native = false },
             UIAction(title: "Native", subtitle: "Keeps its own resolution", state: window.native ? .on : .off) { [weak self] _ in self?.window.native = true },
         ])
         // Adaptive's size: more of the Mac in the same view, smaller (picking one picks Adaptive)

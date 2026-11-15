@@ -23,9 +23,10 @@ local network.
 - **Both directions.** Every Mac runs the same app: it shares its own windows and shows the other Mac's.
 - **Whole desktop.** Desktop, at the top of each Mac's section, streams its whole screen the same smooth way:
   menu bar, Dock and every window. You can unlock a locked Mac from there too. Its toolbar picks how:
-  **Adaptive** gives the other Mac's dark screen exactly this window's size (Retina on a Retina screen), so it
+  **Adaptive** gives the other Mac's screen exactly this window's size (Retina on a Retina screen), so it
   shows 1:1; resize the window and it re-fits when you let go. That Mac makes a virtual display just the window's
-  size, which its dark monitor mirrors until you're done (private macOS API). **Native** leaves its resolution
+  size, which its monitor mirrors until you're done (private macOS API): with Keep Screen Dark on nobody sees
+  that, without it the monitor shows that desktop, scaled to fit. **Native** leaves its resolution
   alone: zoom out, 1:1 and in (⌃⌥⌘−, ⌃⌥⌘0, ⌃⌥⌘=) or fit (⌃⌥⌘9), and when it's bigger than the window, the picture
   follows the pointer: where it is across the window is where it is across that screen.
 - **Sharp text.** While its screen is dark, the other Mac switches to its roomiest Retina mode as long as you're
@@ -119,8 +120,8 @@ when you leave.
   that moved the cursor.
 - **Desktop:** pinch or drag with two fingers to zoom and move around (or Fit, Actual Size, Zoom In and Out in the
   🔍 menu); with a pointer, the zoomed picture follows it. That never changes the Mac. The same menu sets the Mac's
-  screen: **Native** (the default) keeps its resolution; **Adaptive** has it take exactly this screen's size, only
-  while Keep Screen Dark is on, and its windows rearrange to fit. **Adaptive Size** gives the Mac more room in the
+  screen: **Native** (the default) keeps its resolution; **Adaptive** has it take exactly this screen's size,
+  with Keep Screen Dark on or off, and its windows rearrange to fit. **Adaptive Size** gives the Mac more room in the
   same view, smaller: Default (1:1), More Space (1.25×, the default) or Most Space (1.5×).
 - **Window size:** Actual Size maps one Mac point to one viewer point when the window fits. More Space fits more
   in with smaller text.
